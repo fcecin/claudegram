@@ -236,6 +236,27 @@ IDLE_SHELLS_NUDGE = (
     "You seem to be idle for a long time but with running shells. If you have work, "
     "continue your work and check for stuck shells. Otherwise clean up your shells."
 )
+# Anthropic-side throttling (overloaded / 429 — NOT the user's quota): report + auto-retry.
+RATE_LIMIT_RETRY_SECS = 300   # wait this long before retrying a rate-limited turn
+RATE_LIMIT_MAX_RETRIES = 5    # give up (report) after this many retries
+# Detection order: (1) the structured RateLimitEvent message (clear marker), (2) failing
+# THAT, an ipsis-literis match of DISTINCTIVE phrases that only appear in the real wire
+# error — NOT loose keywords like "rate limit" / "overloaded" that the model itself might
+# write in a normal answer. Only ever checked against an EXCEPTION or an error result,
+# never a successful answer.
+_RATE_LIMIT_MARKERS = (
+    "overloaded_error",               # Anthropic API error type (HTTP 529)
+    "rate_limit_error",               # Anthropic API error type (HTTP 429)
+    "temporarily limiting requests",  # the CLI's exact wording
+    "not your usage limit",           # the CLI's exact wording (very distinctive)
+)
+
+
+def is_rate_limited(text) -> bool:
+    if not text:
+        return False
+    t = str(text).lower()
+    return any(m in t for m in _RATE_LIMIT_MARKERS)
 _pending: list[dict] = []
 _pending_event = asyncio.Event()
 _app = None  # the telegram Application; set in on_startup so the worker can send
@@ -885,6 +906,8 @@ class SegmentRenderer:
         self.tools: dict = {}
         self.problems: list[str] = []
         self.result = None
+        self.rate_limited = False  # saw a RateLimitEvent (structured wire signal) this turn
+        self._rate_noted = False   # surfaced it on the board already?
 
     async def start(self) -> None:
         await self.board.start()
@@ -931,6 +954,13 @@ class SegmentRenderer:
     async def handle(self, message) -> None:
         """Render one stream message. Fed for every message of this segment."""
         if self.tripped:
+            return
+        if type(message).__name__ == "RateLimitEvent":
+            self.rate_limited = True  # clear structured marker (used only on a failed turn)
+            if not self._rate_noted:
+                self._rate_noted = True
+                # Log the raw wire shape ONCE so we can confirm/tighten detection later.
+                log.info("RateLimitEvent (wire): %r", getattr(message, "data", None) or vars(message))
             return
         if isinstance(message, StreamEvent):
             ev = message.event
@@ -1114,6 +1144,9 @@ class SegmentRenderer:
                  res.get("subtype"), controller.session_id)
 
     async def crashed(self, exc: Exception) -> None:
+        await self.crashed_text(f"{type(exc).__name__}: {exc}")
+
+    async def crashed_text(self, err: str) -> None:
         if self.tripped:
             return
         if not self.board.sealed:
@@ -1122,8 +1155,20 @@ class SegmentRenderer:
             except Exception:
                 pass
         await self.alert(
-            f"⚠️ That turn crashed: {_oneline(f'{type(exc).__name__}: {exc}', 300)}\n"
+            f"⚠️ That turn crashed: {_oneline(err, 300)}\n"
             "The session is intact — just resend to continue."
+        )
+
+    async def rate_limited_notice(self, attempt: int, max_retries: int, mins: int) -> None:
+        """Seal the board and tell the user we hit Anthropic throttling and will retry."""
+        if not self.board.sealed:
+            try:
+                await self.board.finish("⏳ rate-limited — will retry")
+            except Exception:
+                pass
+        await self.alert(
+            f"⏳ Anthropic is rate-limiting/overloaded (NOT your usage limit). "
+            f"Retrying in {mins} min… (attempt {attempt}/{max_retries})"
         )
 
 
@@ -1141,16 +1186,40 @@ async def dispatch_to_claude(
         await bot.send_message(chat_id, "⏳ Still on the previous request — queuing this one.")
     if voiceback:
         header += " · 🔊 voiceback"
-    r = SegmentRenderer(bot, chat_id, reply_to, header, user_text=user_text, voiceback=voiceback)
-    await r.start()
     prompt = user_text if raw else build_prompt(user_text, source, voiceback=voiceback)
-    try:
-        await controller.ask(prompt, r.handle, on_system=r.on_system)
-    except Exception as e:
-        log.exception("Claude turn failed")
-        await r.crashed(e)
+
+    # Retry loop for Anthropic-side throttling (overloaded / 429): report + wait + retry.
+    # A rate-limit is recognized ONLY from the structured RateLimitEvent (r.rate_limited)
+    # or an ipsis-literis match on the EXCEPTION / error result — never a successful answer.
+    attempt = 0
+    while True:
+        attempt += 1
+        r = SegmentRenderer(bot, chat_id, reply_to, header, user_text=user_text, voiceback=voiceback)
+        await r.start()
+        err = None
+        try:
+            await controller.ask(prompt, r.handle, on_system=r.on_system)
+        except Exception as e:
+            log.exception("Claude turn failed")
+            err = f"{type(e).__name__}: {e}"
+        else:
+            res = r.result or {}
+            if res.get("is_error"):
+                err = res.get("text") or f"ended: {res.get('subtype')}"
+                log.warning("turn errored: subtype=%s rate_event=%s text=%s",
+                            res.get("subtype"), r.rate_limited, _oneline(err, 200))
+            else:
+                await r.finalize()
+                return
+
+        # An error occurred. Is it throttling? (clear marker OR verbatim — not the answer.)
+        throttled = r.rate_limited or is_rate_limited(err)
+        if throttled and attempt <= RATE_LIMIT_MAX_RETRIES:
+            await r.rate_limited_notice(attempt, RATE_LIMIT_MAX_RETRIES, RATE_LIMIT_RETRY_SECS // 60)
+            await asyncio.sleep(RATE_LIMIT_RETRY_SECS)
+            continue
+        await r.crashed_text(err)
         return
-    await r.finalize()
 
 
 class SpontaneousRelay:
