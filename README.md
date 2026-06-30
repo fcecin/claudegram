@@ -63,6 +63,9 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   `×N` counter and refreshes the leading **datetime** (a moving clock = proof of life); a
   changed status starts a fresh message. So you always know whether to **wait** (idle +
   shells will wake it) or it's **done** (idle + no shells → nothing pending), without spam.
+  After ~30 identical **idle + shells** ticks (`×30`, ~30 min), it **auto-nudges Claude**
+  to continue, check for stuck shells, or clean them up — so a forgotten shell can't park
+  the session forever.
 - **Reports its own background work**: when Claude finishes a turn with a background
   shell still running and then **wakes itself** as the task lands, that follow-up turn is
   relayed to your phone too (`🔔 Claude picked back up…`) — not just lost on the machine.

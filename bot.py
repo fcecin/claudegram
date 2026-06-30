@@ -195,6 +195,13 @@ def mark_sent() -> None:
 # If you fire several messages, a single worker drains the whole queue and sends them to
 # Claude as one combined prompt — so it answers them together, not as N separate turns.
 BATCH_DEBOUNCE = 1.2  # s: after the first queued message, wait this long for more
+# After this many identical "idle + shells" watchdog ticks (~1/min => ~30 min), nudge
+# Claude to continue / check for stuck shells / clean up.
+IDLE_SHELLS_NUDGE_AT = 30
+IDLE_SHELLS_NUDGE = (
+    "You seem to be idle for a long time but with running shells. If you have work, "
+    "continue your work and check for stuck shells. Otherwise clean up your shells."
+)
 _pending: list[dict] = []
 _pending_event = asyncio.Event()
 _app = None  # the telegram Application; set in on_startup so the worker can send
@@ -1110,9 +1117,29 @@ class Watchdog:
                                      "will wake me. Say hi to continue.")
                     continue
                 self.dead_declared = False
+                idle_with_shells = (not st["active"]) and bool(st["shells"])
                 await self._show(self._status_body(st))
+                # Idle with shells for a long stretch (×N) -> nudge Claude to act.
+                if idle_with_shells and self.count == IDLE_SHELLS_NUDGE_AT:
+                    await self._nudge_idle_shells()
             except Exception:
                 log.exception("watchdog error")
+
+    async def _nudge_idle_shells(self):
+        """~30 min idle with shells still running: ask Claude to continue, check for stuck
+        shells, or clean up. Goes through the normal queue so the reply reaches the phone."""
+        log.warning("watchdog: idle+shells ×%d — auto-nudging Claude", IDLE_SHELLS_NUDGE_AT)
+        chat = self._chat()
+        if chat is None:
+            return
+        try:
+            await self.app.bot.send_message(
+                chat, "🐕 Idle a long time with shells still running — nudging Claude to "
+                "continue, check for stuck shells, or clean up.")
+            mark_sent()
+        except Exception:
+            log.exception("nudge notice failed")
+        enqueue_for_claude(chat, None, IDLE_SHELLS_NUDGE, "text", False)
 
     async def _show(self, body):
         chat = self._chat()

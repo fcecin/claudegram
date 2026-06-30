@@ -43,7 +43,9 @@ continuous reader relays them.
   message in place** with a `×N` counter + a refreshing datetime instead of re-posting the
   same status; a changed status (or `mark_sent()` flagging that other content was sent
   below it via `is_latest=False`) starts a fresh message. Dead-idle declared once. Silence
-  tracked by `mark_sent()` on every NEW message (edits don't count).
+  tracked by `mark_sent()` on every NEW message (edits don't count). At `×IDLE_SHELLS_NUDGE_AT`
+  (30) identical idle+shells ticks it `enqueue_for_claude(IDLE_SHELLS_NUDGE)` to auto-nudge
+  Claude to continue / check stuck shells / clean up.
 
 ## Voiceback (spoken replies)
 A message starting with the word `voice` (`parse_voiceback`) sets `voiceback=True` for
