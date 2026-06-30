@@ -542,6 +542,59 @@ def engage_block(reason: str) -> None:
     log.warning("🔒 BLOCKED — %s", reason)
 
 
+INTRUSION_OFF_FILE = HERE / "INTRUSION_OFF.flag"  # presence = paranoid gate DISABLED (default ON)
+
+
+def intrusion_gate_on() -> bool:
+    """Paranoid intrusion gate: ON by default. The GUI toggle creates INTRUSION_OFF_FILE to
+    disable it — at the machine only, never via a remote command (same principle as the
+    physical-unlock-only hard-lock)."""
+    return not INTRUSION_OFF_FILE.exists()
+
+
+async def handle_intrusion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """An unauthorized user touched the bot → treat it as an intrusion: log it, HARD-LOCK the
+    bridge (kill Claude + engage the block flag → physical-unlock-only at the tray), and alert
+    the owner on Telegram. Idempotent: if already locked, just log (no re-kill / no alert
+    spam). The intruder gets no reply."""
+    user = update.effective_user
+    uid = user.id if user else "?"
+    name = user.full_name if user else "?"
+    uname = f" @{user.username}" if (user and user.username) else ""
+    m = update.effective_message
+    content = ""
+    if m is not None:
+        content = (m.text or m.caption
+                   or ("<voice>" if m.voice else "")
+                   or ("<photo>" if m.photo else "")
+                   or "<message>")
+    log.warning("🚨 INTRUSION: unauthorized id=%s name=%r%s content=%r",
+                uid, name, uname, _oneline(content, 200))
+    if not intrusion_gate_on():
+        return  # paranoid gate toggled OFF at the machine — logged only, no lock
+    if is_blocked():
+        return  # already locked — don't re-kill or re-alert
+    reason = f"intrusion: unauthorized telegram id {uid} ({name}{uname})"
+    try:
+        await controller.kill()
+    except Exception:
+        log.exception("intrusion: kill failed")
+    engage_block(reason)
+    for owner in ALLOWED_USER_IDS:  # alert the owner — the bot can still send while locked
+        try:
+            await context.bot.send_message(
+                owner,
+                "🚨 LOCKED — someone who isn't you tried to use the bot.\n"
+                f"From: id {uid} {name}{uname}\n"
+                f"Sent: “{_oneline(content, 200)}”\n\n"
+                "Claude was killed and the bridge is hard-locked. "
+                "Unlock at the tray on the machine."
+            )
+            mark_sent()
+        except Exception:
+            log.exception("intrusion: owner alert failed")
+
+
 # --- sleep mode: pause Telegram input while keeping Claude running ------------
 # Distinct from lock (firewall/security, kills Claude) and kill (SIGKILL): sleep just
 # ignores incoming Telegram messages. Claude keeps running (any background work too);
@@ -592,10 +645,7 @@ WELCOME = (
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id if update.effective_user else "?"
     if not is_authorized(update):
-        log.warning("Unauthorized /start from user id=%s", uid)
-        await update.message.reply_text(
-            f"🚫 This is a private bot.\nYour Telegram user id is {uid}."
-        )
+        await handle_intrusion(update, context)
         return
     text = WELCOME
     if not ALLOWED_USER_IDS:
@@ -609,9 +659,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not is_authorized(update):
-        uid = update.effective_user.id if update.effective_user else "?"
-        log.warning("Ignoring audio from unauthorized user id=%s", uid)
-        await msg.reply_text("🚫 This is a private bot.")
+        await handle_intrusion(update, context)
         return
 
     media = msg.voice or msg.audio or msg.video_note or msg.video
@@ -1952,9 +2000,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message, that's fine."""
     msg = update.message
     if not is_authorized(update):
-        uid = update.effective_user.id if update.effective_user else "?"
-        log.warning("Ignoring image from unauthorized user id=%s", uid)
-        await msg.reply_text("🚫 This is a private bot.")
+        await handle_intrusion(update, context)
         return
     # Largest rendition of a sent photo, or an image sent as a file (document).
     media = None
@@ -2008,9 +2054,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not is_authorized(update):
-        uid = update.effective_user.id if update.effective_user else "?"
-        log.warning("Ignoring text from unauthorized user id=%s", uid)
-        await msg.reply_text("🚫 This is a private bot.")
+        await handle_intrusion(update, context)
         return
     text = (msg.text or "").strip()
     if not text:
@@ -2033,7 +2077,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
-        await update.message.reply_text("🚫 This is a private bot.")
+        await handle_intrusion(update, context)
         return
     await controller.reset()
     await update.message.reply_text("🆕 Fresh conversation (new session).")
@@ -2041,7 +2085,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
-        await update.message.reply_text("🚫 This is a private bot.")
+        await handle_intrusion(update, context)
         return
     await controller.stop()
     ensure_worker()
@@ -2051,7 +2095,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
-        await update.message.reply_text("🚫 This is a private bot.")
+        await handle_intrusion(update, context)
         return
     await update.message.reply_text(await _status_text())
 

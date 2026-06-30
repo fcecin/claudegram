@@ -10,6 +10,7 @@ compute.type
 voice.mode
 BLOCKED.flag
 SLEEP.flag
+INTRUSION_OFF.flag
 
 # --- logs ---
 claudegram.log*

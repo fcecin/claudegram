@@ -40,6 +40,7 @@ APP_ID = "claudegram-gui"  # single-instance key (one instance per user session)
 LOG_FILE = HERE / "claudegram.log"   # persistent copy of the bot's output
 BLOCK_FILE = HERE / "BLOCKED.flag"   # presence = bridge is locked (firewall trip)
 SLEEP_FILE = HERE / "SLEEP.flag"     # presence = sleep mode (Telegram input paused)
+INTRUSION_OFF_FILE = HERE / "INTRUSION_OFF.flag"  # presence = paranoid intrusion gate OFF (default ON)
 REGRESSIONS_FILE = HERE / "HACKING_REGRESSIONS.md"  # false-positive list to append to
 
 MAX_FAST_FAILS = 6      # give up auto-restart after this many quick crashes
@@ -110,6 +111,13 @@ class Supervisor(QMainWindow):
         self.act_wake.triggered.connect(self.wake)
         self.act_wake.setVisible(False)
         tb.addAction(self.act_wake)
+        self.act_intrusion = QAction("🛡 Intrusion lock: ON", self)
+        self.act_intrusion.setCheckable(True)
+        self.act_intrusion.setToolTip(
+            "ON: a message from any non-allowed Telegram user hard-locks the bridge "
+            "(kills Claude + locks) and alerts you. Toggle here only — never remotely.")
+        self.act_intrusion.triggered.connect(self.toggle_intrusion)
+        tb.addAction(self.act_intrusion)
         act_clear = QAction("Clear logs", self)
         act_clear.triggered.connect(self.clear_logs)
         tb.addAction(act_clear)
@@ -133,6 +141,8 @@ class Supervisor(QMainWindow):
         self.tray_regress.setVisible(False)
         self.tray_wake = menu.addAction("☀️ Wake up (exit sleep)", self.wake)
         self.tray_wake.setVisible(False)
+        self.tray_intrusion = menu.addAction("🛡 Intrusion lock: ON", self.toggle_intrusion)
+        self.tray_intrusion.setCheckable(True)
         menu.addSeparator()
         menu.addAction("Quit", self.quit_app)
         self.tray.setContextMenu(menu)
@@ -145,9 +155,11 @@ class Supervisor(QMainWindow):
         self._block_timer = QTimer(self)
         self._block_timer.timeout.connect(self._check_block)
         self._block_timer.timeout.connect(self._check_sleep)
+        self._block_timer.timeout.connect(self._refresh_intrusion)
         self._block_timer.start(2000)
         self._check_block()
         self._check_sleep()
+        self._refresh_intrusion()
 
         self.start_bot()
 
@@ -219,6 +231,29 @@ class Supervisor(QMainWindow):
             self.icon,
             5000,
         )
+
+    # --- paranoid intrusion gate (toggle; default ON, disabled here only) -----
+    def toggle_intrusion(self, *args) -> None:
+        on = not INTRUSION_OFF_FILE.exists()  # current state
+        try:
+            if on:                                    # ON -> turn OFF
+                INTRUSION_OFF_FILE.write_text("off\n", encoding="utf-8")
+            else:                                     # OFF -> turn ON
+                INTRUSION_OFF_FILE.unlink(missing_ok=True)
+        except OSError:
+            self.append("\n[supervisor] ⚠️ Could not toggle the intrusion-lock flag.\n")
+        self._refresh_intrusion()
+        now_on = not INTRUSION_OFF_FILE.exists()
+        self.append(f"\n[supervisor] 🛡 Intrusion lock {'ON' if now_on else 'OFF'} "
+                    "(set at the machine).\n")
+        self.tray.showMessage(
+            "claudegram", f"Intrusion lock {'ON' if now_on else 'OFF'}.", self.icon, 4000)
+
+    def _refresh_intrusion(self) -> None:
+        on = not INTRUSION_OFF_FILE.exists()
+        for act in (self.act_intrusion, self.tray_intrusion):
+            act.setChecked(on)
+            act.setText(f"🛡 Intrusion lock: {'ON' if on else 'OFF'}")
 
     # --- sleep state (Telegram input paused; Claude keeps running) ------------
     def _check_sleep(self) -> None:
