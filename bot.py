@@ -144,7 +144,8 @@ def get_model() -> WhisperModel:
     return _model
 
 
-PROGRESS_INTERVAL = 30.0  # seconds between transcription progress callbacks
+PROGRESS_INTERVAL = 10.0     # min seconds between %/ETA recomputes (gated by segment yields)
+TRANSCRIBE_HEARTBEAT = 10.0  # fixed cadence to re-edit the bubble (moving datetime = alive)
 
 
 def transcribe(path: str, progress_cb=None) -> dict:
@@ -563,24 +564,32 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         tg_file = await context.bot.get_file(media.file_id)
         await tg_file.download_to_drive(tmp_path)
         # Transcription is CPU-bound and blocking — keep the event loop free, and post a
-        # live progress bubble (% + ETA, refreshed ~every 30s) since large-v3 on CPU is slow.
-        loop = asyncio.get_running_loop()
+        # live progress bubble. DECOUPLE the display from faster-whisper's choppy segment
+        # yields: a heartbeat re-edits the bubble on a FIXED clock (moving datetime + the
+        # latest %/ETA) so it always looks alive even while whisper grinds one long segment.
+        # If the clock moves but % is frozen, the chop is whisper, not us.
         prog = await context.bot.send_message(
             msg.chat_id, "🎙 Transcribing…", reply_to_message_id=msg.message_id)
         mark_sent()
+        prog_state = {"pct": 0.0, "eta": None}
 
         def progress_cb(pct, eta, elapsed):
-            # Called from the worker thread — marshal the edit onto the event loop.
-            eta_str = f" · ~{int(eta)}s left" if (eta and eta > 1) else ""
-            text = f"🎙 Transcribing… {pct:.0f}%{eta_str}"
-            try:
-                fut = asyncio.run_coroutine_threadsafe(
-                    context.bot.edit_message_text(
-                        text, chat_id=msg.chat_id, message_id=prog.message_id), loop)
-                fut.result(timeout=10)
-            except Exception:
-                pass  # "message is not modified" / transient — ignore
+            prog_state["pct"], prog_state["eta"] = pct, eta  # set from the worker thread
 
+        async def _transcribe_heartbeat():
+            while True:
+                await asyncio.sleep(TRANSCRIBE_HEARTBEAT)
+                pct, eta = prog_state["pct"], prog_state["eta"]
+                pct_str = f" {pct:.0f}%" if pct > 0 else ""
+                eta_str = f" · ~{int(eta)}s left" if (eta and eta > 1) else ""
+                text = f"🕐 {time.strftime('%H:%M:%S')} · 🎙 Transcribing…{pct_str}{eta_str}"
+                try:
+                    await context.bot.edit_message_text(
+                        text, chat_id=msg.chat_id, message_id=prog.message_id)
+                except Exception:
+                    pass  # transient ("not modified" won't happen — the clock always moves)
+
+        hb = asyncio.create_task(_transcribe_heartbeat())
         try:
             result = await asyncio.to_thread(transcribe, tmp_path, progress_cb)
         except Exception:
@@ -588,6 +597,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await msg.reply_text("⚠️ Sorry, I couldn't transcribe that.")
             return
         finally:
+            hb.cancel()
+            try:
+                await hb
+            except Exception:
+                pass
             try:
                 await context.bot.delete_message(msg.chat_id, prog.message_id)
             except Exception:
