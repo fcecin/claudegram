@@ -70,11 +70,11 @@ QPushButton:hover { background: #34b259; }
 """
 INTRUSION_OFF_CSS = """
 QPushButton {
-    background: #e6e8eb; color: #5a5f66;
-    border: 3px outset #c0c4cb; border-radius: 6px;
+    background: #e0a106; color: #3a2c00;
+    border: 3px outset #b5820a; border-radius: 6px;
     padding: 6px 18px; font-weight: 700;
 }
-QPushButton:hover { background: #eef0f3; }
+QPushButton:hover { background: #efb422; }
 """
 
 MAX_FAST_FAILS = 6      # give up auto-restart after this many quick crashes
@@ -182,7 +182,7 @@ class Supervisor(QMainWindow):
         self.tray_regress.setVisible(False)
         self.tray_wake = menu.addAction("☀️ Wake up (exit sleep)", self.wake)
         self.tray_wake.setVisible(False)
-        self.tray_intrusion = menu.addAction("🛡 Intrusion lock: ON", self.toggle_intrusion)
+        self.tray_intrusion = menu.addAction("🛡 Intrusion Lock", self.toggle_intrusion)
         self.tray_intrusion.setCheckable(True)
         menu.addSeparator()
         menu.addAction("Quit", self.quit_app)
