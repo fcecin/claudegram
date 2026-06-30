@@ -76,6 +76,16 @@ running (background work continues). The ONLY exit is the tray's **WAKE UP** but
 (`gui.py` deletes `SLEEP.flag`, watched on the 2s timer). Not a security state (unlike
 the firewall lock) and doesn't kill anything (unlike `bot kill`).
 
+## Harness (external operator — maybe that's you)
+`run-harness.sh` opens a visible terminal running a Claude Code instance pre-prompted by
+`harness-charter.md` to operate/improve claudegram and serve the `bot harness` inbox
+(loop: `cg-inbox --wait` → `cg-notify` ack → act → repeat). It is **decoupled**: `bot.py`
+has no knowledge of it; it's just an external Claude that understands this directory and
+talks through the `outbox/`+`inbox/` files. Not autostarted, unsupervised (closing it
+stops it; inbox accumulates harmlessly). Charter rules: bypass + confirm-before-destructive,
+never weaken the firewall/allowlist/hard-lock, one harness at a time. If you're reading this
+as the harness, follow `harness-charter.md`.
+
 ## Firewall
 Lean guard preamble per prompt; a genuine malicious request makes Claude reply leading
 with `HACKING ATTEMPT BLOCKED` + reason → bridge writes `BLOCKED.flag` (hard lock) until

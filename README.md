@@ -169,6 +169,8 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `gui.py` | tray app: supervises `bot.py`, console, Unblock/Regress/Clear buttons | yes |
 | `cg-notify` | push a `[HARNESS]` message from this machine to your phone | yes |
 | `cg-inbox` | read messages you sent via `bot harness` (`--peek` / `--wait`) | yes |
+| `run-harness.sh` | open a visible terminal running a Claude "harness" that operates claudegram | yes |
+| `harness-charter.md` | the standing prompt that turns that Claude into the harness | yes |
 | `run-gui.sh` / `run.sh` | launchers (`run.sh` runs the bot without the tray) | yes |
 | `install-autostart.sh` / `uninstall-autostart.sh` | login autostart | yes |
 | `install-manual.md` | step-by-step secure install guide (for an AI assistant) | yes |
@@ -179,6 +181,21 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `session.id`, `effort.level`, `cwd.path`, `BLOCKED.flag`, `SLEEP.flag` | runtime state | no |
 | `outbox/`, `inbox/` | `[HARNESS]` message drop dirs (transient) | no |
 | `claudegram.log` | full per-turn transcript (Clear-logs button truncates) | no |
+
+## Harness (optional)
+
+`./run-harness.sh` opens a **visible terminal** running a Claude Code instance pre-prompted
+(`harness-charter.md`) to **operate and improve claudegram itself** and to serve your phone
+over the `[HARNESS]` channel: it loops on `cg-inbox --wait`, acks every `bot harness` message
+via `cg-notify`, and can investigate issues, deploy fixes, and answer meta-questions.
+
+It's deliberately **decoupled and unsupervised**: `bot.py` doesn't know it exists — it's just
+"a Claude that understands this install dir", living outside the bridge. Not autostarted; you
+run it when you want it. Close the window and it stops (inbox messages safely accumulate until
+a harness runs again). Run only **one** at a time. Security posture: it inherits the firewall,
+runs with autonomy but **confirms before destructive/security-affecting actions**, and **never
+weakens claudegram's own safety controls** (the hard-lock stays physical-unlock only) — and you
+can watch it the whole time, which is the point of the visible terminal.
 
 ## Operating notes
 
