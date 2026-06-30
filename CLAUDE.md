@@ -63,6 +63,16 @@ OR'd across the batch. This also serializes user turns (one at a time); messages
 mid-turn batch into the next. `bot compact` still dispatches directly (serialized by the
 controller lock).
 
+**Dispatcher robustness (hard-won):** the worker can wedge/vanish after `bot stop`
+(interrupt) — py-spy showed the loop healthy but the `dispatch_worker` task gone. Defenses:
+(1) `bot stop` / `/stop` call `controller.stop()` = interrupt + `_reset_live_state` (frees a
+waiting `ask`) + drop client (reconnect+resume on next ask) — mirrors `kill()`, which works;
+(2) `ensure_worker()` revives the worker immediately on stop/startup; (3) `worker_guard`
+recreates it if messages sit queued with Claude idle >40s; (4) `ask()` has a 900s no-activity
+safety net. Diagnose live with `kill -USR1 <bot-pid>` → logs all asyncio task names (is
+`dispatch_worker` present?). Root cause of the cancellation still TBD — capture it next time
+via the USR1 dump + the "dispatch_worker got CancelledError" log.
+
 ## `[HARNESS]` channels (IPC, both directions)
 - **machine → phone**: drop a file in `outbox/` (atomic rename) → `harness_outbox_loop`
   relays it as `🤖 [HARNESS] …`. Helper: `./cg-notify "msg"`.

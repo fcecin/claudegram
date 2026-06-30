@@ -205,9 +205,14 @@ IDLE_SHELLS_NUDGE = (
 _pending: list[dict] = []
 _pending_event = asyncio.Event()
 _app = None  # the telegram Application; set in on_startup so the worker can send
+_worker_task = None     # the dispatch_worker task (the guard recreates it if it wedges)
+_pending_since = 0.0    # monotonic ts the queue became non-empty (0 = empty)
 
 
 def enqueue_for_claude(chat_id, reply_to, text: str, source: str, voiceback: bool) -> None:
+    global _pending_since
+    if not _pending:
+        _pending_since = time.monotonic()
     _pending.append({
         "chat_id": chat_id, "reply_to": reply_to, "text": text,
         "source": source, "voiceback": voiceback,
@@ -223,6 +228,7 @@ async def dispatch_worker() -> None:
     The ENTIRE loop body is guarded: an exception in any iteration is logged and the worker
     keeps going. It must never die silently — a dead worker = messages received but never
     dispatched (the queue stalls forever)."""
+    global _pending_since
     ctx = types.SimpleNamespace(bot=_app.bot)
     while True:
         try:
@@ -232,6 +238,7 @@ async def dispatch_worker() -> None:
             if not _pending:
                 continue
             batch, _pending[:] = _pending[:], []
+            _pending_since = 0.0
             parts = [m["text"].strip() for m in batch if m["text"].strip()]
             if not parts:
                 continue
@@ -246,10 +253,44 @@ async def dispatch_worker() -> None:
             await dispatch_to_claude(ctx, chat_id, reply_to, combined, source,
                                      header=header, voiceback=voiceback)
         except asyncio.CancelledError:
+            log.warning("dispatch_worker got CancelledError — exiting (guard/ensure_worker will revive)")
             raise  # genuine shutdown — let it propagate
         except Exception:
             log.exception("dispatch_worker iteration failed — continuing (worker stays alive)")
             await asyncio.sleep(1)  # avoid a tight error loop
+
+
+def ensure_worker() -> None:
+    """(Re)create the dispatch worker if it's not running. Idempotent and cheap. Called at
+    startup, by `bot stop`, and by the guard — so a dead/cancelled worker is revived
+    immediately rather than waiting for the guard's next tick."""
+    global _worker_task
+    if _worker_task is None or _worker_task.done():
+        _worker_task = asyncio.create_task(dispatch_worker(), name="dispatch_worker")
+        log.info("dispatch worker (re)started")
+
+
+async def worker_guard() -> None:
+    """Self-heal the dispatcher. If messages sit queued while Claude is idle (no turn
+    running) for too long, the worker has wedged or died — recreate it. This is what makes
+    a `bot stop` / interrupt edge case unable to permanently strand the queue."""
+    global _worker_task
+    while True:
+        await asyncio.sleep(15)
+        try:
+            if not _pending or controller.busy:
+                continue  # nothing queued, or a turn is legitimately running
+            age = time.monotonic() - (_pending_since or time.monotonic())
+            dead = _worker_task is None or _worker_task.done()
+            if dead or age > 40:
+                log.warning("worker guard: %d msg(s) stuck %.0fs (worker dead=%s) — recreating worker",
+                            len(_pending), age, dead)
+                if _worker_task is not None and not _worker_task.done():
+                    _worker_task.cancel()
+                _worker_task = asyncio.create_task(dispatch_worker(), name="dispatch_worker")
+                _pending_event.set()  # kick it to drain immediately
+        except Exception:
+            log.exception("worker guard error")
 
 
 def ensure_cghome() -> None:
@@ -1399,8 +1440,10 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         await controller.reset()
         await reply("🆕 Fresh conversation (new session).")
     elif action == "stop":
-        await controller.interrupt()
-        await reply("✋ Interrupting the current task.")
+        await controller.stop()   # interrupt + clean reset (no post-interrupt wedge)
+        ensure_worker()           # revive the dispatcher if the interrupt killed it
+        _pending_event.set()
+        await reply("✋ Stopped — turn interrupted, session kept. Send your next message.")
     elif action == "kill":
         killed = await controller.kill()
         if killed:
@@ -1489,8 +1532,10 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         await update.message.reply_text("🚫 This is a private bot.")
         return
-    await controller.interrupt()
-    await update.message.reply_text("✋ Interrupting the current task.")
+    await controller.stop()
+    ensure_worker()
+    _pending_event.set()
+    await update.message.reply_text("✋ Stopped — turn interrupted, session kept.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1602,8 +1647,9 @@ async def on_startup(application) -> None:
     global _app
     _app = application
     # Single dispatcher: batches a burst of messages into one Claude turn.
-    asyncio.create_task(dispatch_worker())
-    log.info("dispatch worker started (batches bursts into one turn, debounce %.1fs)", BATCH_DEBOUNCE)
+    ensure_worker()
+    asyncio.create_task(worker_guard())
+    log.info("dispatch worker + guard started (debounce %.1fs)", BATCH_DEBOUNCE)
     # Relay the turns Claude starts on its OWN (a background shell landed) to the phone.
     controller.set_spontaneous_handler(SpontaneousRelay(application).on_message)
     # Start the IPC inbox so other programs on this machine can ping the phone.
@@ -1684,6 +1730,21 @@ def main() -> None:
             signal.signal(_s, _on_signal)
         except (ValueError, OSError):
             pass
+
+    # Diagnostic: `kill -USR1 <bot-pid>` dumps every asyncio task to the log — so a future
+    # "the worker vanished" mystery can be confirmed live (is dispatch_worker present?).
+    def _dump_tasks(signum, frame):
+        try:
+            tasks = asyncio.all_tasks()
+            names = sorted((t.get_name() + ("" if not t.done() else "(done)")) for t in tasks)
+            log.warning("SIGUSR1 task dump (%d): %s", len(tasks), ", ".join(names))
+        except Exception:
+            log.exception("task dump failed")
+
+    try:
+        signal.signal(signal.SIGUSR1, _dump_tasks)
+    except (ValueError, OSError):
+        pass
 
     # Warm up the transcription model before polling so the first voice is fast.
     get_model()

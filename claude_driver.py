@@ -491,6 +491,27 @@ class ClaudeController:
         if self._client is not None:
             await self._client.interrupt()
 
+    async def stop(self) -> None:
+        """Graceful stop for `bot stop`: interrupt the running turn, then reset to a CLEAN
+        state — release any ask() waiting on _segment_done, restart the reader, and drop the
+        client so the NEXT turn reconnects and RESUMES the session. This mirrors kill()
+        (which works) but without SIGKILL. A bare interrupt() left the dispatcher wedged;
+        this does the same cleanup kill() does, so the bridge keeps accepting input."""
+        client = self._client
+        if client is not None:
+            try:
+                await asyncio.wait_for(client.interrupt(), 5)
+            except Exception:
+                log.warning("stop: interrupt failed/timed out — resetting anyway")
+        self._stop_reader()
+        self._reset_live_state()  # sets _segment_done (frees a waiting ask) + clears state
+        self._client = None       # next ask reconnects + resumes (session_id persisted)
+        if client is not None:
+            try:
+                await asyncio.wait_for(client.disconnect(), 3)
+            except Exception:
+                pass
+
     async def kill(self) -> list[int]:
         """Hard-kill (SIGKILL) the Claude CLI subprocess. The next turn reconnects,
         resuming the session. Deliberately does NOT take the lock, so it works even
