@@ -35,5 +35,13 @@ for f in "$INBOX"/*.msg; do
   cat "$f"; echo
   [ "$mode" != "peek" ] && rm -f "$f"
 done
-if [ "$found" -eq 0 ]; then echo "(inbox empty)"; fi
+if [ "$found" -eq 0 ]; then
+  echo "(inbox empty)"
+else
+  echo "──────────────────────────────────────────"
+  echo "⚠️  ACK REQUIRED: the user is on their PHONE and CANNOT see this terminal."
+  echo "    For the message(s) above, immediately send an outbox ack describing what"
+  echo "    you're doing about it:  ./cg-notify \"got it — <action / answer>\""
+  echo "    Printing to your own output is NOT enough — they won't see it."
+fi
 exit 0

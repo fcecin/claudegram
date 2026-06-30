@@ -218,31 +218,38 @@ def enqueue_for_claude(chat_id, reply_to, text: str, source: str, voiceback: boo
 async def dispatch_worker() -> None:
     """The single dispatcher: waits for queued messages, lets a burst settle, then sends
     the WHOLE queue to Claude as one combined turn. Serializes user turns (one at a time);
-    messages that arrive while a turn runs are batched into the next one."""
+    messages that arrive while a turn runs are batched into the next one.
+
+    The ENTIRE loop body is guarded: an exception in any iteration is logged and the worker
+    keeps going. It must never die silently — a dead worker = messages received but never
+    dispatched (the queue stalls forever)."""
     ctx = types.SimpleNamespace(bot=_app.bot)
     while True:
-        await _pending_event.wait()
-        _pending_event.clear()
-        await asyncio.sleep(BATCH_DEBOUNCE)  # gather the burst
-        if not _pending:
-            continue
-        batch, _pending[:] = _pending[:], []
-        parts = [m["text"].strip() for m in batch if m["text"].strip()]
-        if not parts:
-            continue
-        combined = "\n\n".join(parts)
-        voiceback = any(m["voiceback"] for m in batch)
-        source = "audio" if any(m["source"] == "audio" for m in batch) else "text"
-        chat_id, reply_to = batch[-1]["chat_id"], batch[-1]["reply_to"]
-        header = "🤖 Claude is working…"
-        if len(batch) > 1:
-            header += f" · 📨 {len(batch)} msgs"
-            log.info("Batched %d messages into one turn", len(batch))
         try:
+            await _pending_event.wait()
+            _pending_event.clear()
+            await asyncio.sleep(BATCH_DEBOUNCE)  # gather the burst
+            if not _pending:
+                continue
+            batch, _pending[:] = _pending[:], []
+            parts = [m["text"].strip() for m in batch if m["text"].strip()]
+            if not parts:
+                continue
+            combined = "\n\n".join(parts)
+            voiceback = any(m["voiceback"] for m in batch)
+            source = "audio" if any(m["source"] == "audio" for m in batch) else "text"
+            chat_id, reply_to = batch[-1]["chat_id"], batch[-1]["reply_to"]
+            header = "🤖 Claude is working…"
+            if len(batch) > 1:
+                header += f" · 📨 {len(batch)} msgs"
+            log.info("worker: dispatching %d message(s) to Claude", len(batch))
             await dispatch_to_claude(ctx, chat_id, reply_to, combined, source,
                                      header=header, voiceback=voiceback)
+        except asyncio.CancelledError:
+            raise  # genuine shutdown — let it propagate
         except Exception:
-            log.exception("dispatch_worker turn failed")
+            log.exception("dispatch_worker iteration failed — continuing (worker stays alive)")
+            await asyncio.sleep(1)  # avoid a tight error loop
 
 
 def ensure_cghome() -> None:

@@ -458,8 +458,23 @@ class ClaudeController:
                 self._segment_done.clear()
                 self._awaiting_user_segment = True
                 await self._client.query(prompt)
-                await self._segment_done.wait()
+                # Wait for the turn to end — but never hang forever. If the stream goes
+                # totally silent (no message at all) for STUCK_SECS, give up and release
+                # the turn so the dispatcher isn't wedged. (Long foreground tools still
+                # produce stream activity / cap well under this.)
+                STUCK_SECS = 900
+                loop = asyncio.get_event_loop()
+                while not self._segment_done.is_set():
+                    try:
+                        await asyncio.wait_for(self._segment_done.wait(), 30)
+                    except asyncio.TimeoutError:
+                        idle = loop.time() - (self.last_activity or loop.time())
+                        if idle >= STUCK_SECS:
+                            log.warning("ask: no stream activity for %.0fs and no result — "
+                                        "releasing the turn (assumed stuck)", idle)
+                            break
             finally:
+                self._awaiting_user_segment = False
                 self._user_sink = None
                 self._on_system = None
 
