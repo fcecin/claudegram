@@ -204,6 +204,34 @@ def mark_sent() -> None:
         _watchdog.is_latest = False
 
 
+# Autonomy nudge state (ephemeral, NOT persisted): set when Claude declares it's out of
+# work (its reply leads with NO_MORE_WORK_MARKER), cleared the instant the user sends new
+# work. It ONLY controls whether the idle watchdog auto-nudges — it NEVER gates input.
+_no_more_work = False
+
+
+def set_no_more_work(v: bool) -> None:
+    global _no_more_work
+    _no_more_work = v
+
+
+def is_no_more_work() -> bool:
+    return _no_more_work
+
+
+# Recent tool errors ("issues"), shown on demand with `bot issues` (which DRAINS them, like
+# an inbox) instead of bloating every turn summary. In-memory, bounded, ephemeral — the turn
+# summary shows only the count; the detail lives here.
+_recent_issues: list = []   # (HH:MM:SS, "tool: snippet")
+ISSUES_KEEP = 100
+
+
+def record_issue(text: str) -> None:
+    _recent_issues.append((time.strftime("%H:%M:%S"), text))
+    if len(_recent_issues) > ISSUES_KEEP:
+        del _recent_issues[:-ISSUES_KEEP]
+
+
 # --- message batching: collapse a burst of messages into ONE Claude turn ----------
 # If you fire several messages, a single worker drains the whole queue and sends them to
 # Claude as one combined prompt — so it answers them together, not as N separate turns.
@@ -214,6 +242,18 @@ IDLE_SHELLS_NUDGE_AT = 30
 IDLE_SHELLS_NUDGE = (
     "You seem to be idle for a long time but with running shells. If you have work, "
     "continue your work and check for stuck shells. Otherwise clean up your shells."
+)
+# After ~×30 idle ticks (~30 min) with NOTHING running, nudge Claude to continue or to
+# declare it's done. NO_MORE_WORK_MARKER is the agreed opt-out: Claude must reply STARTING
+# WITH it (startswith detection in SegmentRenderer.finalize), so the prompt says so plainly.
+NO_MORE_WORK_MARKER = "NO MORE WORK"
+IDLE_NO_SHELLS_NUDGE_AT = 30
+IDLE_NO_SHELLS_NUDGE = (
+    "You have been idle for a long time with nothing running (no background shells). "
+    "If you have any remaining work or next steps, CONTINUE now. If you are genuinely out "
+    "of work and ideas, reply with your message STARTING WITH the exact words "
+    "'NO MORE WORK' (uppercase, as the very first thing in your reply) and I will stop "
+    "nudging you until the human sends something."
 )
 # Anthropic-side throttling (overloaded / 429 — NOT the user's quota): report + auto-retry.
 RATE_LIMIT_RETRY_SECS = 300   # wait this long before retrying a rate-limited turn
@@ -749,6 +789,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if voiceback and not text:
         await msg.reply_text("🔊 Say something after 'voice' for a spoken reply.")
         return
+    set_no_more_work(False)  # new work from the user re-arms the idle nudger
     enqueue_for_claude(msg.chat_id, msg.message_id, text, "audio", voiceback)
 
 
@@ -1117,9 +1158,9 @@ class SegmentRenderer:
                     log.info("RESULT %s err=%s: %s", name or "?",
                              block.is_error, _blocktext(block.content))
                     if block.is_error:
-                        self.problems.append(
-                            f"{name or 'tool'}: {_oneline(_blocktext(block.content), 120)}"
-                        )
+                        issue = f"{name or 'tool'}: {_oneline(_blocktext(block.content), 120)}"
+                        self.problems.append(issue)
+                        record_issue(issue)
                     line = summarize_result(name, block.content, block.is_error)
                     if line:
                         await self.board.add(line)
@@ -1156,6 +1197,12 @@ class SegmentRenderer:
 
         answer = "".join(self.answer_buf).strip() or final
         log.info("ANSWER (%d chars):\n%s", len(answer), answer)
+        # Autonomy: if Claude's reply LEADS WITH the marker, it's declaring it's out of work
+        # -> pause idle nudging (re-armed when the user next sends something). startswith,
+        # exactly as the nudge prompt instructs Claude.
+        if answer.lstrip().upper().startswith(NO_MORE_WORK_MARKER):
+            set_no_more_work(True)
+            log.info("watchdog: Claude declared NO MORE WORK — idle nudging paused")
 
         await self._compute_ctx(res)
         summary = self._summary(res)
@@ -1366,7 +1413,7 @@ class Watchdog:
         self.body = None          # dedupe key: status text without stamp/counter
         self.count = 1
         self.is_latest = False    # is our status message still the newest in the chat?
-        self.dead_declared = False
+        self.done_declared = False  # IDLE_DONE one-shot guard (Claude said NO MORE WORK)
 
     def _chat(self):
         return sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
@@ -1399,14 +1446,25 @@ class Watchdog:
                 if (time.monotonic() - _last_tg_send) < 55:
                     continue  # not silent — something already reached the phone recently
                 st = controller.status()
-                if not st["active"] and not st["shells"]:
-                    if self.dead_declared:
+                idle_no_shells = (not st["active"]) and (not st["shells"])
+                if idle_no_shells and is_no_more_work():
+                    # IDLE_DONE: Claude declared it's out of work. One-shot + terminal — no
+                    # nudging — until the user sends something (which clears the flag). Input
+                    # is NEVER gated by this; it only silences the auto-nudge.
+                    if self.done_declared:
                         continue
-                    self.dead_declared = True
-                    await self._show("💤 idle · 🐚 no shells — nothing is running, nothing "
-                                     "will wake me. Say hi to continue.")
+                    self.done_declared = True
+                    await self._show("✅ idle · done — you said NO MORE WORK. "
+                                     "Say hi whenever there's more.")
                     continue
-                self.dead_declared = False
+                self.done_declared = False
+                if idle_no_shells:
+                    # IDLE_NO_SHELLS: accumulate ×N (refreshing datetime), and at ×30 nudge
+                    # Claude to continue or declare done (reply leading with NO MORE WORK).
+                    await self._show("💤 idle · 🐚 no shells — nothing running.")
+                    if self.count == IDLE_NO_SHELLS_NUDGE_AT:
+                        await self._nudge_idle_no_shells()
+                    continue
                 idle_with_shells = (not st["active"]) and bool(st["shells"])
                 await self._show(self._status_body(st))
                 # Idle with shells for a long stretch (×N) -> nudge Claude to act.
@@ -1430,6 +1488,24 @@ class Watchdog:
         except Exception:
             log.exception("nudge notice failed")
         enqueue_for_claude(chat, None, IDLE_SHELLS_NUDGE, "text", False)
+
+    async def _nudge_idle_no_shells(self):
+        """~30 min idle with NOTHING running: ask Claude to continue or declare done (reply
+        leading with NO MORE WORK). Goes through the normal queue so the reply reaches the
+        phone; if Claude declares done, finalize() pauses these nudges until you send work."""
+        log.warning("watchdog: idle+no-shells ×%d — nudging Claude (continue or NO MORE WORK)",
+                    IDLE_NO_SHELLS_NUDGE_AT)
+        chat = self._chat()
+        if chat is None:
+            return
+        try:
+            await self.app.bot.send_message(
+                chat, "🐕 Idle a while with nothing running — nudging Claude to continue "
+                "or declare it's out of work.")
+            mark_sent()
+        except Exception:
+            log.exception("idle-no-shells nudge notice failed")
+        enqueue_for_claude(chat, None, IDLE_NO_SHELLS_NUDGE, "text", False)
 
     async def _show(self, body):
         chat = self._chat()
@@ -1722,6 +1798,22 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
             await reply(f"🗑 Dropped {n} queued message{'' if n == 1 else 's'}:\n{preview}{more}")
         return True
 
+    # "bot issues" — dump recent tool errors (the ⚠️ N issue(s) detail) and clear them, like
+    # draining an inbox. In-memory since the last bridge start; the turn summary shows only the
+    # count to keep it clean.
+    if re.match(r"^issues?\b", rest.strip(), re.IGNORECASE):
+        n = len(_recent_issues)
+        log.info("bot command: issues -> %d", n)
+        if not n:
+            await reply("✅ No issues — the inbox is clean.")
+        else:
+            shown = _recent_issues[-25:]
+            lines = "\n".join(f"  {ts} · {txt}" for ts, txt in shown)
+            older = f"\n(+{n - len(shown)} older, also cleared)" if n > len(shown) else ""
+            _recent_issues[:] = []  # drain on read
+            await reply(f"⚠️ {n} issue(s) — cleared:\n{lines}{older}")
+        return True
+
     action = classify_bot_command(rest)
     log.info("bot command: %r -> %s", rest, action)
 
@@ -1806,6 +1898,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if voiceback and not text:
         await msg.reply_text("🔊 Say something after 'voice' for a spoken reply.")
         return
+    set_no_more_work(False)  # new work from the user re-arms the idle nudger
     enqueue_for_claude(msg.chat_id, msg.message_id, text, "text", voiceback)
 
 
