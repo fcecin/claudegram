@@ -1,0 +1,18 @@
+# --- secrets (NEVER commit) ---
+.env
+token.txt
+
+# --- runtime state ---
+session.id
+effort.level
+cwd.path
+BLOCKED.flag
+
+# --- logs ---
+claudegram.log*
+gui-stderr.log
+
+# --- python / venv ---
+.venv/
+__pycache__/
+*.pyc
