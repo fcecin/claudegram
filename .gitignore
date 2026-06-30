@@ -6,6 +6,7 @@ token.txt
 session.id
 effort.level
 cwd.path
+compute.type
 BLOCKED.flag
 SLEEP.flag
 

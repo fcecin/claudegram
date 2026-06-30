@@ -96,15 +96,41 @@ def load_token() -> str:
 # --- Whisper transcription config -----------------------------------------------
 #
 # The model loads and runs in a SEPARATE process (transcribe_worker.py) so a stalled
-# decode can be killed — a thread cannot. These WHISPER_* values are read here only for the
-# `bot test` status line; the worker reads them itself (inherited via the environment,
-# including WHISPER_LANGUAGE). Defaults: the largest model at full precision (accuracy over
-# latency); set WHISPER_COMPUTE_TYPE=int8_float32 / int8 in .env to trade accuracy for speed.
+# decode can be killed — a thread cannot. These WHISPER_* values seed the defaults; the
+# worker is told its compute type per-spawn (see get_compute_type), so `bot transcribe`
+# can switch quality at runtime with no restart. WHISPER_LANGUAGE is inherited by the worker.
 MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3").strip()
 DEVICE = os.environ.get("WHISPER_DEVICE", "cpu").strip()
 COMPUTE_TYPE = os.environ.get(
     "WHISPER_COMPUTE_TYPE", "float32" if DEVICE == "cpu" else "float16"
 ).strip()
+COMPUTE_FILE = HERE / "compute.type"  # persisted runtime quality choice (survives restarts)
+
+# Friendly transcription-quality presets, toggled live via `bot transcribe <name>`. The
+# change takes effect on the NEXT voice message — the worker reads its compute type fresh on
+# every spawn, so nothing needs restarting.
+TRANSCRIBE_PRESETS = {       # name -> ctranslate2 compute type
+    "best": "float32",       # large-v3 full precision — slowest, most accurate
+    "good": "int8_float32",  # ~2x faster, near-best accuracy
+    "fast": "int8",          # ~3-4x faster, a little accuracy lost
+}
+_PRESET_BY_COMPUTE = {v: k for k, v in TRANSCRIBE_PRESETS.items()}
+
+
+def get_compute_type() -> str:
+    """Current whisper compute type: the persisted runtime choice if set, else the env/default."""
+    try:
+        saved = COMPUTE_FILE.read_text(encoding="utf-8").strip()
+        if saved:
+            return saved
+    except OSError:
+        pass
+    return COMPUTE_TYPE
+
+
+def set_compute_type(compute: str) -> None:
+    """Persist the chosen compute type; the next worker spawn picks it up."""
+    COMPUTE_FILE.write_text(compute, encoding="utf-8")
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -595,12 +621,15 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         worker_err = []
         proc = None
         try:
+            compute = get_compute_type()
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, str(HERE / "transcribe_worker.py"), tmp_path,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 limit=8 * 1024 * 1024,  # transcripts can exceed the 64K default line limit
+                env={**os.environ, "WHISPER_COMPUTE_TYPE": compute},  # live quality toggle
             )
-            log.info("Transcribe: worker pid=%s started", proc.pid)
+            log.info("Transcribe: worker pid=%s started (%s/%s)", proc.pid,
+                     _PRESET_BY_COMPUTE.get(compute, "?"), compute)
 
             async def _read_worker():
                 # Consume the worker's stdout records live. Returns the RESULT dict (or None).
@@ -1628,6 +1657,39 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
             await reply(f"📂 Couldn't switch to: {target}")
         return True
 
+    # "bot transcribe [best|good|fast]" — show or set transcription quality. Takes effect on
+    # the NEXT voice message (the decoder subprocess reads its compute type fresh each spawn).
+    m = re.match(r"^(?:transcribe|transcription|quality|tx)\b\s*(.*)$",
+                 rest.strip(), re.IGNORECASE)
+    if m:
+        raw = m.group(1).strip().strip(" .!?,;:").lower()
+        log.info("bot command: transcribe %r", raw)
+        cur = get_compute_type()
+        cur_name = _PRESET_BY_COMPUTE.get(cur, cur)
+        menu = ("best — float32, most accurate (slowest)\n"
+                "good — int8_float32, ~2× faster, near-best\n"
+                "fast — int8, ~3-4× faster, slight accuracy loss")
+        if not raw:
+            await reply(
+                f"🎚 Transcription quality: {cur_name} ({cur})\n{menu}\n"
+                "Set with: bot transcribe <best|good|fast>"
+            )
+        elif raw in TRANSCRIBE_PRESETS:
+            set_compute_type(TRANSCRIBE_PRESETS[raw])
+            await reply(
+                f"🎚 Quality → {raw} ({TRANSCRIBE_PRESETS[raw]}). "
+                "Applies to your next voice message."
+            )
+        elif raw in _PRESET_BY_COMPUTE:  # they typed the raw compute type itself
+            set_compute_type(raw)
+            await reply(
+                f"🎚 Quality → {_PRESET_BY_COMPUTE[raw]} ({raw}). "
+                "Applies to your next voice message."
+            )
+        else:
+            await reply(f'🎚 Unknown quality "{raw}".\n{menu}')
+        return True
+
     # "bot logs [n]" — last N lines of the bridge log.
     m = re.match(r"^logs?\b\s*(\d*)$", rest.strip(), re.IGNORECASE)
     if m:
@@ -1836,7 +1898,8 @@ async def on_startup(application) -> None:
         f"📂 cwd: {controller.get_cwd()}\n"
         f"🤖 model: {controller.model or 'Opus 4.8 (Claude Code default)'}\n"
         f"⚙️ effort: {controller.get_effort() or 'default'}\n"
-        f"🎙 transcribe: {MODEL_SIZE}/{COMPUTE_TYPE}"
+        f"🎙 transcribe: {MODEL_SIZE}/{get_compute_type()} "
+        f"({_PRESET_BY_COMPUTE.get(get_compute_type(), '?')})"
         + ("\n🔒 LOCKED — unblock at the machine to resume" if is_blocked() else "")
         + ("\n😴 SLEEPING — input paused; press WAKE UP on the tray to resume" if is_sleeping() else "")
     )
