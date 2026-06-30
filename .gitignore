@@ -7,6 +7,7 @@ session.id
 effort.level
 cwd.path
 compute.type
+voice.mode
 BLOCKED.flag
 SLEEP.flag
 

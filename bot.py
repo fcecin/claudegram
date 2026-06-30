@@ -362,7 +362,7 @@ async def dispatch_worker() -> None:
             if not parts:
                 continue
             combined = "\n\n".join(parts)
-            voiceback = any(m["voiceback"] for m in batch)
+            voiceback = voice_mode_on() or any(m["voiceback"] for m in batch)
             source = "audio" if any(m["source"] == "audio" for m in batch) else "text"
             chat_id, reply_to = batch[-1]["chat_id"], batch[-1]["reply_to"]
             header = "🤖 Claude is working…"
@@ -508,15 +508,23 @@ def synthesize_voice(text: str) -> str | None:
         return None
 
 
-_VOICE_RE = re.compile(r"^\s*voice\b[\s,:.\-]*(.*)$", re.IGNORECASE | re.DOTALL)
+# Voiceback is a persistent mode toggled by `bot voice on`/`off` (there is no per-message
+# trigger — that was finicky over transcription). While on, every reply comes back as audio.
+VOICE_MODE_FILE = HERE / "voice.mode"  # presence = persistent "spoken replies for everything"
 
 
-def parse_voiceback(text: str):
-    """If the message starts with the word 'voice', return (True, rest); else (False, text)."""
-    m = _VOICE_RE.match(text or "")
-    if m:
-        return True, m.group(1).strip()
-    return False, text
+def voice_mode_on() -> bool:
+    return VOICE_MODE_FILE.exists()
+
+
+def set_voice_mode(on: bool) -> None:
+    if on:
+        VOICE_MODE_FILE.write_text("on", encoding="utf-8")
+    else:
+        try:
+            VOICE_MODE_FILE.unlink()
+        except OSError:
+            pass
 
 
 def is_blocked() -> bool:
@@ -810,12 +818,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if is_blocked():
         await msg.reply_text(BLOCKED_MSG)
         return
-    voiceback, text = parse_voiceback(text)
-    if voiceback and not text:
-        await msg.reply_text("🔊 Say something after 'voice' for a spoken reply.")
-        return
     set_no_more_work(False)  # new work from the user re-arms the idle nudger
-    enqueue_for_claude(msg.chat_id, msg.message_id, text, "audio", voiceback)
+    enqueue_for_claude(msg.chat_id, msg.message_id, text, "audio", False)
 
 
 async def reply_chunked(msg, text: str, limit: int = 4096) -> None:
@@ -1632,7 +1636,7 @@ BOT_HELP = (
     "• bot issues — list & clear recent tool errors\n"
     "• bot restart — restart the bridge process\n"
     "• bot echo <text> — echo text back (not sent to Claude)\n"
-    "• start a message with \"voice\" — get a spoken reply (e.g. \"voice summarize this\")\n"
+    "• bot voice [on|off] — spoken replies for EVERYTHING (toggle)\n"
     "• bot harness <text> (or bot h) — message the AI working on this machine\n"
     "• bot status — bridge, effort, session & context\n"
     "• bot session — current session id\n"
@@ -1808,6 +1812,25 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
             )
         else:
             await reply(f'🎚 Unknown quality "{raw}".\n{menu}')
+        return True
+
+    # "bot voice [on|off]" — persistent spoken-reply mode: while on, every answer comes back as
+    # audio. Toggles when given no argument (also accepts the Portuguese "voz").
+    m = re.match(r"^(?:voice|voz)\b\s*(.*)$", rest.strip(), re.IGNORECASE)
+    if m:
+        arg = m.group(1).strip().strip(" .!?,;:").lower()
+        if arg in ("on", "yes"):
+            state = True
+        elif arg in ("off", "no", "stop"):
+            state = False
+        else:
+            state = not voice_mode_on()  # no/unknown arg → toggle
+        set_voice_mode(state)
+        log.info("bot command: voice -> %s", "on" if state else "off")
+        await reply(
+            "🔊 Voice replies ON — every answer comes back as audio. Turn off with: bot voice off"
+            if state else "🔇 Voice replies OFF — back to text."
+        )
         return True
 
     # "bot logs [n]" — last N lines of the bridge log.
@@ -2004,12 +2027,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if is_blocked():
         await msg.reply_text(BLOCKED_MSG)
         return
-    voiceback, text = parse_voiceback(text)
-    if voiceback and not text:
-        await msg.reply_text("🔊 Say something after 'voice' for a spoken reply.")
-        return
     set_no_more_work(False)  # new work from the user re-arms the idle nudger
-    enqueue_for_claude(msg.chat_id, msg.message_id, text, "text", voiceback)
+    enqueue_for_claude(msg.chat_id, msg.message_id, text, "text", False)
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2128,6 +2147,7 @@ async def on_startup(application) -> None:
         f"⚙️ effort: {controller.get_effort() or 'default'}\n"
         f"🎙 transcribe: {MODEL_SIZE}/{get_compute_type()} "
         f"({_PRESET_BY_COMPUTE.get(get_compute_type(), '?')})"
+        + f"\n🔊 voice replies: {'on' if voice_mode_on() else 'off'}"
         + ("\n🔒 LOCKED — unblock at the machine to resume" if is_blocked() else "")
         + ("\n😴 SLEEPING — input paused; press WAKE UP on the tray to resume" if is_sleeping() else "")
     )
