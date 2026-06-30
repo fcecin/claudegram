@@ -265,6 +265,17 @@ def enqueue_for_claude(chat_id, reply_to, text: str, source: str, voiceback: boo
     _pending_event.set()
 
 
+def drop_pending() -> list[str]:
+    """Discard messages queued but NOT yet dispatched to Claude; return their texts so the
+    caller can report what was dropped. Safe to call from a handler: same event loop as the
+    dispatcher, and the clear is a single non-awaiting statement (no race with the drain)."""
+    global _pending_since
+    texts = [m["text"] for m in _pending]
+    _pending[:] = []
+    _pending_since = 0.0
+    return texts
+
+
 async def dispatch_worker() -> None:
     """The single dispatcher: waits for queued messages, lets a burst settle, then sends
     the WHOLE queue to Claude as one combined turn. Serializes user turns (one at a time);
@@ -1695,6 +1706,20 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
     if m:
         n = max(1, min(int(m.group(1)), 60)) if m.group(1) else 20
         await reply("📜 last log lines:\n" + _tail_log(n))
+        return True
+
+    # "bot drop" — discard messages queued but not yet sent to Claude. Does NOT touch a turn
+    # already running (that's `bot stop`); only clears the waiting batch.
+    if re.match(r"^drop\b", rest.strip(), re.IGNORECASE):
+        dropped = drop_pending()
+        n = len(dropped)
+        log.info("bot command: drop -> %d queued message(s)", n)
+        if not n:
+            await reply("🗑 Queue is empty — nothing to drop.")
+        else:
+            preview = "\n".join(f"  • {_oneline(t, 80)}" for t in dropped[:5])
+            more = f"\n  …and {n - 5} more" if n > 5 else ""
+            await reply(f"🗑 Dropped {n} queued message{'' if n == 1 else 's'}:\n{preview}{more}")
         return True
 
     action = classify_bot_command(rest)
