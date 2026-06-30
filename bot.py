@@ -232,6 +232,27 @@ def record_issue(text: str) -> None:
         del _recent_issues[:-ISSUES_KEEP]
 
 
+# Audio transcription in-flight counter. While >0 the bot is busy decoding voice — which is
+# NOT a Claude turn, so controller.status() reads "idle". The idle watchdog checks this to
+# FREEZE its ×N counters and skip nudging while a transcription runs (the transcription
+# bubble already shows liveness). Plain int on the single event loop; inc/dec never await.
+_transcribing = 0
+
+
+def transcribe_active() -> bool:
+    return _transcribing > 0
+
+
+def transcribe_begin() -> None:
+    global _transcribing
+    _transcribing += 1
+
+
+def transcribe_end() -> None:
+    global _transcribing
+    _transcribing = max(0, _transcribing - 1)
+
+
 # --- message batching: collapse a burst of messages into ONE Claude turn ----------
 # If you fire several messages, a single worker drains the whole queue and sends them to
 # Claude as one combined prompt — so it answers them together, not as N separate turns.
@@ -671,6 +692,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         stalled = False
         worker_err = []
         proc = None
+        transcribe_begin()  # tell the idle watchdog we're decoding (freeze its ×N counters)
         try:
             compute = get_compute_type()
             proc = await asyncio.create_subprocess_exec(
@@ -726,6 +748,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception:
             log.exception("Transcription handler error (audio %.0fs)", audio_dur)
         finally:
+            transcribe_end()
             # Always reap the worker, and BOUND every wait so a wedged reap can't hang us.
             if proc is not None and proc.returncode is None:
                 try:
@@ -1445,6 +1468,11 @@ class Watchdog:
             try:
                 if (time.monotonic() - _last_tg_send) < 55:
                     continue  # not silent — something already reached the phone recently
+                if transcribe_active():
+                    # Busy decoding voice (not a Claude turn, so status() reads "idle"):
+                    # freeze every ×N counter and skip nudging. The transcription bubble is
+                    # already showing liveness, so the watchdog stays quiet until it's done.
+                    continue
                 st = controller.status()
                 idle_no_shells = (not st["active"]) and (not st["shells"])
                 if idle_no_shells and is_no_more_work():
