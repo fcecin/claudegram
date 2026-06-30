@@ -17,6 +17,7 @@ Guarantees:
 import asyncio
 import logging
 import os
+import shutil
 import signal
 from pathlib import Path
 
@@ -25,6 +26,9 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 log = logging.getLogger("claudegram")
 
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# The SDK doesn't expose Claude Code's unset/default effort as a value, so we pin an
+# explicit default — "effort" is then always a concrete, known level (override: bot effort).
+DEFAULT_EFFORT = "high"
 
 
 def _proc_ppid_cmd(pid: int):
@@ -116,6 +120,29 @@ def summarize_tool(name: str, inp: dict) -> str:
     return f"⚙️ {name}"
 
 
+def _migrate_session(session_id: str, old_cwd: str, new_cwd: str) -> None:
+    """Copy a conversation transcript so the SAME session id is resumable from
+    new_cwd. Claude keys sessions by directory; we copy the .jsonl (the latest
+    state, from wherever we currently are) into new_cwd's project space, OVERWRITING
+    any older copy there — so moving dirs never loses or regresses the conversation."""
+    try:
+        from claude_agent_sdk import project_key_for_directory
+        projects = Path.home() / ".claude" / "projects"
+        src = projects / project_key_for_directory(old_cwd) / f"{session_id}.jsonl"
+        dst_dir = projects / project_key_for_directory(new_cwd)
+        dst = dst_dir / f"{session_id}.jsonl"
+        if not src.exists():
+            log.warning("Migrate: no transcript at %s — nothing to carry over.", src)
+            return
+        existed = dst.exists()
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        log.info("Migrated session %s -> %s%s", session_id, dst,
+                 " (overwrote older copy)" if existed else "")
+    except Exception:
+        log.exception("Session migration failed")
+
+
 class ClaudeController:
     """A long-lived, multi-turn Claude Code session that resumes across restarts."""
 
@@ -127,7 +154,8 @@ class ClaudeController:
         self._default_cwd = str(cwd)
         self.cwd = self._load_cwd() or str(cwd)
         self.session_id = self._load_session()
-        self.effort = self._load_effort()  # None => model/CLI default
+        self.effort = self._load_effort() or DEFAULT_EFFORT  # always a concrete level
+        self.model = None  # actual model, captured from the init message
         self._client: ClaudeSDKClient | None = None
         self._lock = asyncio.Lock()
         self.busy = False
@@ -196,18 +224,21 @@ class ClaudeController:
         return self.cwd
 
     async def set_cwd(self, path: str) -> bool:
-        """Switch Claude's working directory. Creates it if needed, persists it, and
-        starts a fresh session there (sessions are per-directory). False on error."""
+        """Switch Claude's working directory, MIGRATING the current conversation so
+        the SAME session id resumes there. The conversation follows you across dirs
+        and never resets on a move. Returns False on error."""
         p = Path(path).expanduser()
         try:
             p.mkdir(parents=True, exist_ok=True)
         except OSError:
             return False
         async with self._lock:
-            self.cwd = str(p)
+            old_cwd, new_cwd = self.cwd, str(p)
+            if self.session_id and new_cwd != old_cwd:
+                _migrate_session(self.session_id, old_cwd, new_cwd)
+            self.cwd = new_cwd
             self._save_cwd()
-            self.session_id = None  # new directory => new session space
-            self._save_session()
+            # session_id is KEPT — same conversation, now resumable from new_cwd.
             if self._client is not None:
                 try:
                     await self._client.disconnect()
@@ -288,6 +319,14 @@ class ClaudeController:
                 await self._client.connect()
             else:
                 raise
+        # Announce the (re)started session to the active turn's listener.
+        if self._on_system is not None:
+            try:
+                await self._on_system(
+                    "session_started", {"id": self.session_id, "cwd": self.cwd}
+                )
+            except Exception:
+                pass
 
     # --- turns ---------------------------------------------------------------
     async def ask(self, prompt: str, on_event, on_system=None) -> None:
@@ -302,6 +341,10 @@ class ClaudeController:
                     if sid and sid != self.session_id:
                         self.session_id = sid
                         self._save_session()
+                    if getattr(message, "subtype", None) == "init":
+                        mdl = (getattr(message, "data", None) or {}).get("model")
+                        if mdl:
+                            self.model = mdl
                     await on_event(message)
             finally:
                 self.busy = False

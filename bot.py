@@ -19,9 +19,11 @@ Configuration (env vars, or a .env file in this directory):
 """
 
 import asyncio
+import atexit
 import logging
 import os
 import re
+import signal
 import tempfile
 import time
 from pathlib import Path
@@ -583,6 +585,9 @@ async def dispatch_to_claude(
                 f"🗜 Auto-compaction started ({data.get('trigger', 'auto')}) — "
                 "summarizing the conversation to free up context…"
             )
+        elif kind == "session_started":
+            sid = data.get("id")
+            await board.add(f"🧵 Resuming session {sid[:8]}" if sid else "🧵 New session")
 
     async def on_event(message) -> None:
         if state["tripped"]:
@@ -675,10 +680,12 @@ async def dispatch_to_claude(
     ctx = await controller.context_usage()
     ctx_str = f" · ctx {ctx['percentage']:.0f}%" if ctx else ""
     turns, secs = res.get("turns", "?"), res.get("secs", 0)
+    sid8 = (controller.session_id or "")[:8]
+    sess = f" · 🧵 {sid8}" if sid8 else ""
     if res.get("is_error"):
-        await board.finish(f"⚠️ Ended: {res.get('subtype')} · {turns} turns · {secs:.0f}s{ctx_str}")
+        await board.finish(f"⚠️ Ended: {res.get('subtype')} · {turns} turns · {secs:.0f}s{ctx_str}{sess}")
     else:
-        await board.finish(f"✅ Done · {turns} turns · {secs:.0f}s{ctx_str}")
+        await board.finish(f"✅ Done · {turns} turns · {secs:.0f}s{ctx_str}{sess}")
     log.info("TURN DONE: subtype=%s turns=%s secs=%.1f%s session=%s",
              res.get("subtype"), turns, secs, ctx_str, controller.session_id)
 
@@ -764,8 +771,8 @@ async def _status_text() -> str:
     ctx = await controller.context_usage()
     ctx_str = f" · ctx {ctx['percentage']:.0f}%" if ctx else ""
     return (
-        f"✅ Bridge OK · Claude {busy} · effort {eff} · "
-        f"session {sid_str}{ctx_str}{blocked} · cwd {controller.get_cwd()}"
+        f"✅ Bridge OK · Claude {busy} · model {controller.model or 'default'} · "
+        f"effort {eff} · session {sid_str}{ctx_str}{blocked} · cwd {controller.get_cwd()}"
     )
 
 
@@ -849,7 +856,11 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
             hint = "" if verb == "pwd" else "\nSet with: bot cwd <path>"
             await reply(f"📂 Working dir: {controller.get_cwd()}{hint}")
         elif await controller.set_cwd(target):
-            await reply(f"📂 Working dir set to: {controller.get_cwd()} (fresh session started there).")
+            sid8 = (controller.session_id or "")[:8]
+            await reply(
+                f"📂 Working dir → {controller.get_cwd()} — conversation moved here "
+                f"(🧵 {sid8 or 'none'})."
+            )
         else:
             await reply(f"📂 Couldn't switch to: {target}")
         return True
@@ -958,6 +969,54 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled error", exc_info=context.error)
 
 
+# --- lifecycle: startup ping + shutdown diagnostics --------------------------
+
+_START_TS = time.monotonic()
+_exit_logged = False
+
+
+def _log_exit(signum: int | None = None) -> None:
+    """Log that claudegram is exiting, with whatever diagnostics we have. Fires on
+    normal exit (atexit) and on catchable signals. (SIGKILL can't be caught — the
+    tray supervisor logs that case instead.)"""
+    global _exit_logged
+    if _exit_logged:
+        return
+    _exit_logged = True
+    up = time.monotonic() - _START_TS
+    sig = ""
+    if signum is not None:
+        try:
+            sig = f" · signal={signal.Signals(signum).name}({signum})"
+        except ValueError:
+            sig = f" · signal={signum}"
+    log.warning(
+        "🛑 claudegram exited — uptime %.0fs · session=%s · cwd=%s%s",
+        up, controller.session_id or "none", controller.get_cwd(), sig,
+    )
+
+
+async def on_startup(application) -> None:
+    """Runs once the bot is initialized — log it and ping the owner(s) on Telegram
+    that the bridge just came online (handy to see power-cycles from your phone)."""
+    sid = controller.session_id
+    log.info("🟢 claudegram online — session=%s cwd=%s", sid or "new", controller.get_cwd())
+    text = (
+        "🟢 claudegram online\n"
+        f"🧵 session: {sid or 'new (none yet)'}\n"
+        f"📂 cwd: {controller.get_cwd()}\n"
+        f"🤖 model: {controller.model or 'Opus 4.8 (Claude Code default)'}\n"
+        f"⚙️ effort: {controller.get_effort() or 'default'}\n"
+        f"🎙 transcribe: {MODEL_SIZE}/{COMPUTE_TYPE}"
+        + ("\n🔒 LOCKED — unblock at the machine to resume" if is_blocked() else "")
+    )
+    for uid in sorted(ALLOWED_USER_IDS):
+        try:
+            await application.bot.send_message(uid, text)
+        except Exception:
+            log.exception("Could not send startup ping to %s", uid)
+
+
 def main() -> None:
     token = load_token()
 
@@ -983,6 +1042,7 @@ def main() -> None:
     app = (
         ApplicationBuilder()
         .token(token)
+        .post_init(on_startup)     # ping the owner(s) that the bridge is online
         .concurrent_updates(True)  # so /stop runs while a turn is in progress
         .build()
     )
@@ -1000,13 +1060,29 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
 
+    # Shutdown diagnostics: log on normal exit, and on catchable signals (we handle
+    # them ourselves so we can record which signal — stop_signals=None below).
+    atexit.register(_log_exit)
+
+    def _on_signal(signum, frame):
+        _log_exit(signum)          # flushes the exit line to the log first
+        os._exit(128 + signum)     # then exit hard (closes the poll socket cleanly)
+
+    for _s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(_s, _on_signal)
+        except (ValueError, OSError):
+            pass
+
     # Warm up the transcription model before polling so the first voice is fast.
     get_model()
 
     log.info("claudegram bridge is up. Talk to your bot (voice or text).")
     # drop_pending_updates=False: messages sent while we were offline are held by
     # Telegram (for ~24h) and delivered when we reconnect, so nothing is skipped.
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES, drop_pending_updates=False, stop_signals=None
+    )
 
 
 if __name__ == "__main__":

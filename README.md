@@ -45,8 +45,14 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   doing and the results — `🔧 Bash: …` → `↳ <output>`, `📝 Write: …` → `✓ saved`,
   `📖 Read`, `🔎 Grep`, `🤖 Subagent`, `💭 thinking…`, `🗜 compaction`, `❌ errors` —
   then a footer (`✅ Done · N turns · Ns · ctx X%`).
-- **Session resume**: the Claude session id is persisted; after a reboot/crash the
-  bridge resumes the *same* conversation. Auto-compaction is surfaced live.
+- **One conversation, always**: the session id is persisted and resumed after a
+  reboot/crash; `bot cwd` even **migrates** the conversation across directories so the
+  same thread follows you everywhere (only `bot new`/`clear` resets it). The
+  conversation id is surfaced in the activity board, the footer, and `bot status`.
+  Auto-compaction is surfaced live.
+- **Lifecycle pings**: it sends you a Telegram **🟢 online** message (with session,
+  cwd, model, effort) whenever the bridge starts — so you see power-cycles from your
+  phone — and logs a **🛑 exited** line with signal + uptime on shutdown.
 - **"bot" commands**: any message whose first word is `bot` is a harness command,
   never sent to Claude (see below). Slash equivalents `/new /stop /status` also work.
 - **Your subscription, not the API**: strips `ANTHROPIC_API_KEY` & friends at boot
@@ -78,7 +84,7 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `bot kill` | `kill -9` the Claude process; it respawns (resuming the session) |
 | `bot lock` | `bot kill` **and** lock the bridge — unlock only at the machine |
 | `bot effort [level]` | show, or set, reasoning effort: `low\|medium\|high\|xhigh\|max` |
-| `bot cwd [path]` | show, or switch, Claude's working directory (fresh session there) |
+| `bot cwd [path]` | show, or switch, Claude's working directory (the conversation **migrates** with you — same id) |
 | `bot context` | detailed context-window usage breakdown |
 | `bot logs [n]` | last n bridge log lines |
 | `bot restart` | restart the bridge process (supervisor respawns it) |
