@@ -42,6 +42,22 @@ continuous reader relays them.
   `working|idle` PLUS `N shells (what) | no shells`. Speaks only on silence (tracked by
   `mark_sent()` on every NEW message — edits don't count), declares dead-idle once.
 
+## Voiceback (spoken replies)
+A message starting with the word `voice` (`parse_voiceback`) sets `voiceback=True` for
+that turn: `build_prompt` injects `VOICEBACK_PREAMBLE`, the `SegmentRenderer` does NOT
+stream (collects `answer_buf`), and `_finalize_voiceback` parses `VOICESTART…VOICEEND`
+blocks → `synthesize_voice` (gTTS → mp3 → ffmpeg ogg/opus) → `bot.send_voice`, one per
+block, plus the text (markers stripped) and `[[END]]`. gTTS is online — swap to piper for
+offline if asked.
+
+## Message batching
+Handlers don't call `dispatch_to_claude` directly — they `enqueue_for_claude`. A single
+`dispatch_worker` (started in on_startup) drains the queue after a `BATCH_DEBOUNCE` window
+and sends the WHOLE burst as ONE combined prompt (`\n\n`-joined). voiceback/source are
+OR'd across the batch. This also serializes user turns (one at a time); messages arriving
+mid-turn batch into the next. `bot compact` still dispatches directly (serialized by the
+controller lock).
+
 ## `[HARNESS]` channels (IPC, both directions)
 - **machine → phone**: drop a file in `outbox/` (atomic rename) → `harness_outbox_loop`
   relays it as `🤖 [HARNESS] …`. Helper: `./cg-notify "msg"`.

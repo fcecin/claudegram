@@ -124,6 +124,8 @@ Tell the user:
   lock, sleep, effort, cwd, context, logs, restart, echo, harness, status, session, help.
 - **Sleep**: `bot sleep` pauses ALL Telegram input (Claude keeps running); the only way
   back is the **WAKE UP** button on the tray. Distinct from lock (security) and kill.
+- **Voiceback**: start a message with `voice` → spoken reply (audio). Uses `gTTS` (online).
+- **Batching**: several messages fired in a row are combined into ONE Claude turn.
 - **Watchdog**: after ~60 s of silence the bridge posts the Claude instance's state —
   `working`/`idle` plus background shells (how many + what) or none — so they know whether
   to wait (idle + shells → it'll wake itself and report) or it's done (idle + no shells).

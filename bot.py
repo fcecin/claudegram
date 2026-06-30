@@ -24,8 +24,11 @@ import logging
 import os
 import re
 import signal
+import subprocess
 import tempfile
 import time
+import types
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -165,6 +168,7 @@ EFFORT_FILE = HERE / "effort.level"  # persisted reasoning effort
 CWD_FILE = HERE / "cwd.path"         # persisted working directory
 LOG_PATH = HERE / "claudegram.log"   # bridge log (written by the tray supervisor)
 AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # transient voice files
+VOICE_TMP = Path(tempfile.gettempdir()) / "claudegram_voiceback"  # transient TTS output
 HARNESS_OUTBOX = HERE / "outbox"     # drop dir: any program leaves a msg -> sent to phone
 HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by the AI here
 controller = ClaudeController(
@@ -181,21 +185,69 @@ def mark_sent() -> None:
     _last_tg_send = time.monotonic()
 
 
+# --- message batching: collapse a burst of messages into ONE Claude turn ----------
+# If you fire several messages, a single worker drains the whole queue and sends them to
+# Claude as one combined prompt — so it answers them together, not as N separate turns.
+BATCH_DEBOUNCE = 1.2  # s: after the first queued message, wait this long for more
+_pending: list[dict] = []
+_pending_event = asyncio.Event()
+_app = None  # the telegram Application; set in on_startup so the worker can send
+
+
+def enqueue_for_claude(chat_id, reply_to, text: str, source: str, voiceback: bool) -> None:
+    _pending.append({
+        "chat_id": chat_id, "reply_to": reply_to, "text": text,
+        "source": source, "voiceback": voiceback,
+    })
+    _pending_event.set()
+
+
+async def dispatch_worker() -> None:
+    """The single dispatcher: waits for queued messages, lets a burst settle, then sends
+    the WHOLE queue to Claude as one combined turn. Serializes user turns (one at a time);
+    messages that arrive while a turn runs are batched into the next one."""
+    ctx = types.SimpleNamespace(bot=_app.bot)
+    while True:
+        await _pending_event.wait()
+        _pending_event.clear()
+        await asyncio.sleep(BATCH_DEBOUNCE)  # gather the burst
+        if not _pending:
+            continue
+        batch, _pending[:] = _pending[:], []
+        parts = [m["text"].strip() for m in batch if m["text"].strip()]
+        if not parts:
+            continue
+        combined = "\n\n".join(parts)
+        voiceback = any(m["voiceback"] for m in batch)
+        source = "audio" if any(m["source"] == "audio" for m in batch) else "text"
+        chat_id, reply_to = batch[-1]["chat_id"], batch[-1]["reply_to"]
+        header = "🤖 Claude is working…"
+        if len(batch) > 1:
+            header += f" · 📨 {len(batch)} msgs"
+            log.info("Batched %d messages into one turn", len(batch))
+        try:
+            await dispatch_to_claude(ctx, chat_id, reply_to, combined, source,
+                                     header=header, voiceback=voiceback)
+        except Exception:
+            log.exception("dispatch_worker turn failed")
+
+
 def ensure_cghome() -> None:
     CGHOME.mkdir(parents=True, exist_ok=True)
 
 
 def sweep_audio_tmp() -> None:
-    """Clear leftover voice temp files (e.g. from a crash mid-transcription)."""
-    try:
-        AUDIO_TMP.mkdir(parents=True, exist_ok=True)
-        for f in AUDIO_TMP.iterdir():
-            try:
-                f.unlink()
-            except OSError:
-                pass
-    except OSError:
-        pass
+    """Clear leftover temp audio (incoming voice + outgoing TTS) from a prior crash."""
+    for d in (AUDIO_TMP, VOICE_TMP):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            for f in d.iterdir():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
 
 # --- Firewall / kill-switch ---------------------------------------------------
@@ -229,11 +281,62 @@ BLOCKED_MSG = (
 )
 
 
-def build_prompt(user_text: str, source: str) -> str:
+# Injected only when the user opts a turn into voiceback (prompt starts with "voice").
+VOICEBACK_PREAMBLE = (
+    "[VOICEBACK ON: the user will HEAR this reply, not read it. Put anything you want "
+    "spoken aloud between VOICESTART and VOICEEND markers — each VOICESTART…VOICEEND block "
+    "becomes ONE spoken audio message. Speak naturally and briefly, like talking aloud: "
+    "give the answer/gist, NOT code, file paths, logs, or long lists. Use several blocks "
+    "if it helps pacing. Anything outside the markers is shown as text, not spoken. Use it "
+    "smartly.]\n"
+)
+
+
+def build_prompt(user_text: str, source: str, voiceback: bool = False) -> str:
     # Lean prepend: short guard only. Regressions live in a file the model reads
     # when unsure (referenced in the guard) — not injected, to avoid context bloat.
     guard = GUARD_AUDIO if source == "audio" else GUARD_TEXT
-    return f"{guard}\n{user_text}"
+    pre = VOICEBACK_PREAMBLE if voiceback else ""
+    return f"{guard}\n{pre}{user_text}"
+
+
+def synthesize_voice(text: str) -> str | None:
+    """Blocking: turn text into a Telegram-ready ogg/opus voice file; return its path
+    (or None on failure). Uses gTTS (online) -> mp3 -> ffmpeg -> ogg/opus. Run in a
+    thread so it never blocks the event loop."""
+    text = " ".join(text.split())
+    if not text:
+        return None
+    try:
+        from gtts import gTTS
+        VOICE_TMP.mkdir(parents=True, exist_ok=True)
+        stem = VOICE_TMP / uuid.uuid4().hex
+        mp3, ogg = f"{stem}.mp3", f"{stem}.ogg"
+        gTTS(text[:4000]).save(mp3)  # cap very long blocks
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", mp3,
+             "-c:a", "libopus", "-b:a", "48k", ogg],
+            check=True, timeout=120,
+        )
+        try:
+            os.remove(mp3)
+        except OSError:
+            pass
+        return ogg
+    except Exception:
+        log.exception("Voice synthesis failed")
+        return None
+
+
+_VOICE_RE = re.compile(r"^\s*voice\b[\s,:.\-]*(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def parse_voiceback(text: str):
+    """If the message starts with the word 'voice', return (True, rest); else (False, text)."""
+    m = _VOICE_RE.match(text or "")
+    if m:
+        return True, m.group(1).strip()
+    return False, text
 
 
 def is_blocked() -> bool:
@@ -387,7 +490,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if is_blocked():
         await msg.reply_text(BLOCKED_MSG)
         return
-    await dispatch_to_claude(context, msg.chat_id, msg.message_id, text, "audio")
+    voiceback, text = parse_voiceback(text)
+    if voiceback and not text:
+        await msg.reply_text("🔊 Say something after 'voice' for a spoken reply.")
+        return
+    enqueue_for_claude(msg.chat_id, msg.message_id, text, "audio", voiceback)
 
 
 async def reply_chunked(msg, text: str, limit: int = 4096) -> None:
@@ -619,12 +726,13 @@ class SegmentRenderer:
     it works, the answer streamed below, a summary at the end. Used for BOTH user-driven
     turns and the turns Claude starts on its own when a background shell lands."""
 
-    def __init__(self, bot, chat_id, reply_to, header, *, user_text=None):
+    def __init__(self, bot, chat_id, reply_to, header, *, user_text=None, voiceback=False):
         self.bot = bot
         self.chat_id = chat_id
         self.reply_to = reply_to
         self.base_header = header
         self.user_text = user_text or "(self-initiated turn)"
+        self.voiceback = voiceback  # spoken reply: no live streaming, TTS at the end
         self.board = StatusBoard(bot, chat_id, reply_to, header)
         self.streamer = ParagraphStreamer(bot, chat_id, reply_to)
         self.answer_buf: list[str] = []
@@ -690,6 +798,11 @@ class SegmentRenderer:
                 if delta.get("type") == "text_delta":
                     self.thinking = False
                     chunk = delta.get("text", "")
+                    # Voiceback: don't stream live — collect the whole reply, then speak
+                    # the VOICESTART…VOICEEND blocks (and show the text) at finalize.
+                    if self.voiceback:
+                        self.answer_buf.append(chunk)
+                        return
                     # First answer text: freeze the board so it stops mutating ABOVE the
                     # answer; from here the only moving thing is the answer below it.
                     if not self.answer_started:
@@ -769,6 +882,9 @@ class SegmentRenderer:
         if final and sentinel_tripped(final):
             await self.trip("\n".join(final.splitlines()[1:]).strip())
             return
+        if self.voiceback:
+            await self._finalize_voiceback(res, final)
+            return
         # Only feed `final` if nothing streamed (else it double-sends the answer).
         if not self.answer_buf and final:
             await self.streamer.feed(final)
@@ -777,16 +893,8 @@ class SegmentRenderer:
         answer = "".join(self.answer_buf).strip() or final
         log.info("ANSWER (%d chars):\n%s", len(answer), answer)
 
-        ctx = await controller.context_usage()
-        ctx_str = f" · ctx {ctx['percentage']:.0f}%" if ctx else ""
-        turns, secs = res.get("turns", "?"), res.get("secs", 0)
-        sid8 = (controller.session_id or "")[:8]
-        sess = f" · 🧵 {sid8}" if sid8 else ""
-        probs = f" · ⚠️ {len(self.problems)} issue(s)" if self.problems else ""
-        if res.get("is_error"):
-            summary = f"⚠️ Ended: {res.get('subtype')} · {turns} turns · {secs:.0f}s{ctx_str}{sess}"
-        else:
-            summary = f"✅ Done · {turns} turns · {secs:.0f}s{ctx_str}{sess}{probs}"
+        await self._compute_ctx(res)
+        summary = self._summary(res)
         # Summary where the eye is: a NEW bottom message if the answer streamed below the
         # sealed board; else finalize the board in place (a tools-only turn). On error
         # with no answer, also ping (board edits don't notify).
@@ -798,7 +906,70 @@ class SegmentRenderer:
         else:
             await self.board.finish(summary)
         log.info("TURN DONE: subtype=%s turns=%s secs=%.1f%s session=%s",
-                 res.get("subtype"), turns, secs, ctx_str, controller.session_id)
+                 res.get("subtype"), res.get("turns", "?"), res.get("secs", 0),
+                 res.get("_ctx_str", ""), controller.session_id)
+
+    async def _compute_ctx(self, res: dict) -> None:
+        ctx = await controller.context_usage()
+        res["_ctx_str"] = f" · ctx {ctx['percentage']:.0f}%" if ctx else ""
+
+    def _summary(self, res: dict) -> str:
+        ctx = res.get("_ctx_str", "")
+        turns, secs = res.get("turns", "?"), res.get("secs", 0)
+        sid8 = (controller.session_id or "")[:8]
+        sess = f" · 🧵 {sid8}" if sid8 else ""
+        probs = f" · ⚠️ {len(self.problems)} issue(s)" if self.problems else ""
+        if res.get("is_error"):
+            return f"⚠️ Ended: {res.get('subtype')} · {turns} turns · {secs:.0f}s{ctx}{sess}"
+        return f"✅ Done · {turns} turns · {secs:.0f}s{ctx}{sess}{probs}"
+
+    async def _finalize_voiceback(self, res: dict, final: str) -> None:
+        """Spoken reply: freeze the board, show the text (markers stripped), and send one
+        Telegram voice message per VOICESTART…VOICEEND block."""
+        full = "".join(self.answer_buf).strip() or final
+        log.info("ANSWER (voiceback, %d chars):\n%s", len(full), full)
+        blocks = [b.strip() for b in re.findall(r"VOICESTART(.*?)VOICEEND", full, re.DOTALL)]
+        blocks = [b for b in blocks if b]
+        display = full.replace("VOICESTART", "").replace("VOICEEND", "").strip()
+
+        await self.board.seal(self.base_header + " · 🔊 voiceback below 👇")
+        if display:
+            for i in range(0, len(display), 4096):
+                try:
+                    await self.bot.send_message(
+                        self.chat_id, display[i:i + 4096],
+                        reply_to_message_id=self.reply_to if i == 0 else None,
+                    )
+                    mark_sent()
+                except Exception:
+                    log.exception("voiceback text send failed")
+        if not blocks:
+            await self.alert("🔇 (voiceback was on, but the reply had no VOICESTART/VOICEEND "
+                             "blocks — nothing to speak)")
+        for n, spoken in enumerate(blocks, 1):
+            ogg = await asyncio.to_thread(synthesize_voice, spoken)
+            if ogg:
+                try:
+                    with open(ogg, "rb") as fh:
+                        await self.bot.send_voice(self.chat_id, voice=fh)
+                    mark_sent()
+                    log.info("voiceback sent piece %d/%d (%d chars)", n, len(blocks), len(spoken))
+                except Exception:
+                    log.exception("send_voice failed")
+                    await self.alert(f"🔇 (couldn't send audio {n}: {_oneline(spoken, 80)})")
+                finally:
+                    try:
+                        os.remove(ogg)
+                    except OSError:
+                        pass
+            else:
+                await self.alert(f"🔇 (couldn't synthesize audio {n})")
+        await self.bot.send_message(self.chat_id, "[[END]]")
+        mark_sent()
+        await self._compute_ctx(res)
+        await self.alert(self._summary(res) + f" · 🔊 {len(blocks)} audio")
+        log.info("TURN DONE (voiceback): subtype=%s session=%s",
+                 res.get("subtype"), controller.session_id)
 
     async def crashed(self, exc: Exception) -> None:
         if self.tripped:
@@ -816,19 +987,21 @@ class SegmentRenderer:
 
 async def dispatch_to_claude(
     context, chat_id, reply_to, user_text: str, source: str,
-    raw: bool = False, header: str = "🤖 Claude is working…",
+    raw: bool = False, header: str = "🤖 Claude is working…", voiceback: bool = False,
 ) -> None:
     """Drive ONE user turn. The continuous reader feeds messages to the renderer; we
     return when this turn ends. Claude's later self-started turns (a shell landed) are
     rendered separately by SpontaneousRelay, so they reach the phone without a prompt."""
     bot = context.bot
-    log.info("DISPATCH start chat=%s source=%s busy=%s len=%d",
-             chat_id, source, controller.busy, len(user_text))
+    log.info("DISPATCH start chat=%s source=%s busy=%s voiceback=%s len=%d",
+             chat_id, source, controller.busy, voiceback, len(user_text))
     if controller.busy:
         await bot.send_message(chat_id, "⏳ Still on the previous request — queuing this one.")
-    r = SegmentRenderer(bot, chat_id, reply_to, header, user_text=user_text)
+    if voiceback:
+        header += " · 🔊 voiceback"
+    r = SegmentRenderer(bot, chat_id, reply_to, header, user_text=user_text, voiceback=voiceback)
     await r.start()
-    prompt = user_text if raw else build_prompt(user_text, source)
+    prompt = user_text if raw else build_prompt(user_text, source, voiceback=voiceback)
     try:
         await controller.ask(prompt, r.handle, on_system=r.on_system)
     except Exception as e:
@@ -988,6 +1161,7 @@ BOT_HELP = (
     "• bot logs [n] — last n bridge log lines\n"
     "• bot restart — restart the bridge process\n"
     "• bot echo <text> — echo text back (not sent to Claude)\n"
+    "• start a message with \"voice\" — get a spoken reply (e.g. \"voice summarize this\")\n"
     "• bot harness <text> (or bot h) — message the AI working on this machine\n"
     "• bot status — bridge, effort, session & context\n"
     "• bot session — current session id\n"
@@ -1217,7 +1391,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if is_blocked():
         await msg.reply_text(BLOCKED_MSG)
         return
-    await dispatch_to_claude(context, msg.chat_id, msg.message_id, text, "text")
+    voiceback, text = parse_voiceback(text)
+    if voiceback and not text:
+        await msg.reply_text("🔊 Say something after 'voice' for a spoken reply.")
+        return
+    enqueue_for_claude(msg.chat_id, msg.message_id, text, "text", voiceback)
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1342,6 +1520,11 @@ async def on_startup(application) -> None:
         except Exception:
             log.exception("Could not send startup ping to %s", uid)
     mark_sent()  # the online ping counts — don't let the watchdog fire immediately
+    global _app
+    _app = application
+    # Single dispatcher: batches a burst of messages into one Claude turn.
+    asyncio.create_task(dispatch_worker())
+    log.info("dispatch worker started (batches bursts into one turn, debounce %.1fs)", BATCH_DEBOUNCE)
     # Relay the turns Claude starts on its OWN (a background shell landed) to the phone.
     controller.set_spontaneous_handler(SpontaneousRelay(application).on_message)
     # Start the IPC inbox so other programs on this machine can ping the phone.

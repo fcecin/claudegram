@@ -37,6 +37,13 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
 
 - **Voice → Claude**: voice messages transcribed locally with `faster-whisper`
   (`large-v3`, full precision), echoed back, then dispatched. **Text → Claude** too.
+- **Voice replies (voiceback)**: start a message with the word **`voice`** and the reply
+  comes back as **spoken audio**. That turn doesn't stream; Claude wraps what to say in
+  `VOICESTART…VOICEEND` (each block = one voice message), is told to speak naturally and
+  skip code/paths/logs, and the text is shown too. (TTS via `gTTS` — online.)
+- **Message batching**: fire several messages in a row and the bridge collapses the whole
+  queue into **one** Claude turn (combined prompt) instead of answering each separately —
+  including anything you send while it's mid-turn (batched into the next one).
 - **Streaming answers**: the answer arrives as paragraph messages as Claude writes
   them, with a ~3 s coalescing window (adjacent paragraphs batch into one message;
   long answers still flow instead of dumping at the end). Clean paragraph breaks are
