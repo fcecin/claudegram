@@ -36,11 +36,20 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
 ## Features
 
 - **Voice → Claude**: voice messages transcribed locally with `faster-whisper`
-  (`large-v3`, full precision), echoed back, then dispatched. **Text → Claude** too.
-- **Voice replies (voiceback)**: start a message with the word **`voice`** and the reply
-  comes back as **spoken audio**. That turn doesn't stream; Claude wraps what to say in
-  `VOICESTART…VOICEEND` (each block = one voice message), is told to speak naturally and
-  skip code/paths/logs, and the text is shown too. (TTS via `gTTS` — online.)
+  (`large-v3`), echoed back, then dispatched. **Text → Claude** too. Transcription runs in a
+  **killable subprocess** (`transcribe_worker.py`) watched by a budget watchdog — a
+  stalled/looping decode is killed and you're asked to resend, so it can **never freeze the
+  bridge**; the bubble shows the real %/ETA and a moving clock. Quality is a **live toggle**:
+  `bot transcribe best|good|fast` (float32 / int8_float32 / int8) — no restart.
+- **Photo/image → Claude**: send a photo or an image file, with or without a caption, and
+  Claude **sees it** (it's multimodal on input) — a screenshot, a diagram, an error on screen.
+  No transcription step; the caption (if any) is the instruction, otherwise Claude reads the
+  image in the context of your conversation.
+- **Voice replies (voiceback)**: **`bot voice on`** makes **every** reply come back as
+  **spoken audio** until **`bot voice off`** — a reliable toggle set at the keyboard, not a
+  fragile per-message cue. That turn doesn't stream; Claude wraps what to say in
+  `VOICESTART…VOICEEND` (each block = one voice message), is told to speak naturally and skip
+  code/paths/logs, and the text is shown too. (TTS via `gTTS` — online.)
 - **Message batching**: fire several messages in a row and the bridge collapses the whole
   queue into **one** Claude turn (combined prompt) instead of answering each separately —
   including anything you send while it's mid-turn (batched into the next one).
@@ -65,7 +74,11 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   shells will wake it) or it's **done** (idle + no shells → nothing pending), without spam.
   After ~30 identical **idle + shells** ticks (`×30`, ~30 min), it **auto-nudges Claude**
   to continue, check for stuck shells, or clean them up — so a forgotten shell can't park
-  the session forever.
+  the session forever. And after ~30 identical **idle + no-shells** ticks it **nudges Claude
+  to continue or to declare it's done**: if Claude replies starting with `NO MORE WORK` the
+  watchdog goes quiet until you send something again — so it can work autonomously through a
+  task list without babysitting, yet won't pester you once it's genuinely finished. (While a
+  transcription is decoding, the watchdog freezes its counters — that's work, not idleness.)
 - **Reports its own background work**: when Claude finishes a turn with a background
   shell still running and then **wakes itself** as the task lands, that follow-up turn is
   relayed to your phone too (`🔔 Claude picked back up…`) — not just lost on the machine.
@@ -93,6 +106,13 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   reason. The bridge detects that, writes a persistent `BLOCKED.flag`, interrupts,
   and refuses all further work until someone clears it **at the machine**. False
   positives are recorded to `HACKING_REGRESSIONS.md` so they don't recur.
+- **Intrusion lock (paranoid tripwire, default ON)**: if **anyone who isn't you** so much as
+  messages the bot (text, voice, photo, even `/start`), it's treated as an intrusion —
+  **logged**, the bridge is **hard-locked** (Claude killed + `BLOCKED.flag`, physical-unlock
+  only), and you get a Telegram **🚨 alert** naming the sender. Toggle it from the **tray
+  only** (the 🛡 switch — never a remote command), so the guard can't be disabled over
+  Telegram. Heads-up: while on, a stranger who finds the bot can lock you out until you unlock
+  at the machine — that's the intended fail-safe.
 - **Full logging**: every turn — request, thinking, each tool + result, the full
   answer, compaction, completion, blocks + reasons — is written to `claudegram.log`.
 - **Sleep mode**: `bot sleep` pauses **all** Telegram input — Claude keeps running (and
@@ -100,8 +120,9 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   engaged, no input accepted". Distinct from `lock` (security) and `kill` (process): the
   only way out is the **WAKE UP** button on the tray app at the machine.
 - **Tray app**: live console, auto-restart on crash, single-instance, autostart at
-  login, and buttons: **Unblock**, **Unlock & add regression**, **WAKE UP** (exit sleep),
-  **Restart bot**, **Clear logs**.
+  login, and controls: **Restart bot**, **Unblock**, **Unlock & add regression**, **WAKE UP**
+  (exit sleep), **Clear logs**, plus a **🛡 Intrusion Lock** on/off switch on the right
+  (green = ON / amber = OFF).
 
 ## "bot" commands
 
@@ -121,6 +142,10 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `bot cwd [path]` | show, or switch, Claude's working directory (the conversation **migrates** with you — same id) |
 | `bot context` | detailed context-window usage breakdown |
 | `bot logs [n]` | last n bridge log lines |
+| `bot transcribe [best\|good\|fast]` | transcription quality: float32 / int8_float32 / int8 (live, no restart) |
+| `bot voice [on\|off]` | spoken replies for **everything** until off (replaces the old per-message `voice` cue) |
+| `bot drop` | discard messages queued but not yet sent to Claude |
+| `bot issues` | list **and clear** recent tool errors (the `⚠️ N issue(s)` detail) |
 | `bot restart` | restart the bridge process (supervisor respawns it) |
 | `bot echo <text>` | echo text back (handy to check transcription) |
 | `bot harness <text>` / `bot h <text>` | message the AI/harness working on this machine (lands in `inbox/`) |
@@ -145,9 +170,13 @@ itself and is **never sent to Claude**. Unknown ones reply
 3. **Lock it to you**: find your numeric Telegram id via **@userinfobot**, then set
    `ALLOWED_USER_IDS=<id>` in `.env` (copy `.env.example`). The bridge refuses to
    start without this.
-4. **Run the tray app**: `./run-gui.sh` — first run creates the virtualenv,
-   installs deps, and downloads the `large-v3` model (~3 GB, once).
-5. **Autostart at login**: `./install-autostart.sh` (undo: `./uninstall-autostart.sh`).
+4. **Run the tray app**: `./run-gui.sh` — it **self-backgrounds** (detaches into its own
+   session via `setsid`, so closing the terminal won't kill it) and hands the prompt back.
+   First run creates the virtualenv, installs deps, and downloads the `large-v3` model
+   (~3 GB, once). Re-running is safe (single-instance). Headless, no tray: `./run.sh`.
+5. **Autostart at login**: `./install-autostart.sh` (undo: `./uninstall-autostart.sh`). This
+   is a **separate path** from the manual launch — at login GNOME runs `gui.py` directly in
+   your desktop session; the self-backgrounding `run-gui.sh` is for manual terminal starts.
 
 ## Configuration (`.env`)
 
@@ -157,16 +186,17 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `ALLOWED_USER_IDS` | — | **required**; comma-separated Telegram ids |
 | `CGHOME` | `~/cghome` | Claude's working directory (auto-created) |
 | `WHISPER_MODEL` | `large-v3` | transcription model |
-| `WHISPER_COMPUTE_TYPE` | `float32` | `int8` = ~3-4× faster, slight accuracy loss |
+| `WHISPER_COMPUTE_TYPE` | `float32` | seeds the default; flip live with `bot transcribe` (good=`int8_float32` ~2×, fast=`int8` ~3-4×) |
 | `WHISPER_LANGUAGE` | auto | force e.g. `en` / `pt` |
 
 ## Files
 
 | File | Role | Tracked? |
 |---|---|---|
-| `bot.py` | the bridge: Telegram ↔ transcription ↔ Claude, firewall, commands, logging | yes |
+| `bot.py` | the bridge: Telegram ↔ transcription ↔ Claude, firewall, intrusion lock, commands, logging | yes |
+| `transcribe_worker.py` | standalone, killable whisper decoder (run as a subprocess by `bot.py`) | yes |
 | `claude_driver.py` | Claude Agent SDK wrapper (persistent session, subscription enforcement) | yes |
-| `gui.py` | tray app: supervises `bot.py`, console, Unblock/Regress/Clear buttons | yes |
+| `gui.py` | tray app: supervises `bot.py`, console, Unblock/Regress/Clear + 🛡 Intrusion Lock toggle | yes |
 | `cg-notify` | push a `[HARNESS]` message from this machine to your phone | yes |
 | `cg-inbox` | read messages you sent via `bot harness` (`--peek` / `--wait`) | yes |
 | `run-harness.sh` | open a visible terminal running a Claude "harness" that operates claudegram | yes |
@@ -178,11 +208,15 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `HACKING_REGRESSIONS.md` | curated false positives the firewall must never block | yes |
 | `.env.example` | template for `.env` | yes |
 | `.env`, `token.txt` | **secrets** — never commit | no |
-| `session.id`, `effort.level`, `cwd.path`, `BLOCKED.flag`, `SLEEP.flag` | runtime state | no |
+| `session.id`, `effort.level`, `cwd.path`, `compute.type`, `voice.mode`, `BLOCKED.flag`, `SLEEP.flag`, `INTRUSION_OFF.flag` | runtime state | no |
 | `outbox/`, `inbox/` | `[HARNESS]` message drop dirs (transient) | no |
 | `claudegram.log` | full per-turn transcript (Clear-logs button truncates) | no |
 
 ## Harness (optional)
+
+> The bridge is **self-sufficient** — the tray supervises and auto-restarts `bot.py`, the
+> watchdog self-heals and nudges, transcription can't wedge it, and Claude extends itself on
+> request. So the harness is **genuinely optional**; most installs never run one.
 
 `./run-harness.sh` opens a **visible terminal** running a Claude Code instance pre-prompted
 (`harness-charter.md`) to **operate and improve claudegram itself** and to serve your phone

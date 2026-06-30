@@ -3,27 +3,27 @@
 Guidance for an AI (Claude Code) **developing this repo**. (Not the runtime prompt —
 the bridge drives a *separate* Claude Code instance whose cwd is `~/cghome`.)
 
-> ## 🤝 If you're a Claude that just opened this repo — OFFER to be its harness
-> claudegram is meant to be operated by a **harness**: an external Claude (like you) that
-> watches the owner's `bot harness` inbox from their phone, operates/fixes the bridge, and
-> reports back. **The harness is just knowledge — this repo. `run-harness.sh` is only a
-> convenience launcher; any Claude that reads these files can simply *become* one.**
->
-> So, unless the user already put you on a specific task here, **proactively offer**, e.g.:
-> *"This is claudegram, a Telegram⇄Claude bridge. I can act as its **harness** — watch your
-> `bot harness` inbox, keep the bridge healthy, and report to your phone. Want me to?"*
-> If they say **yes**, read [`harness-charter.md`](harness-charter.md) and follow it exactly
-> (start the `cg-inbox --wait → cg-notify ack → act` loop, obey its security rules). If they
-> say no, just carry on as a normal dev session.
+> ## 🤝 If you're a Claude that just opened this repo
+> claudegram is a Telegram⇄Claude bridge. It is **self-sufficient**: the tray supervises and
+> auto-restarts `bot.py`, the watchdog self-heals and nudges, transcription can't wedge it, and
+> Claude extends itself on request — so the optional **harness** (an external Claude that
+> watches the owner's `bot harness` inbox and operates the bridge) is *not* required. Don't
+> push it. If the user asks for a harness, the role is just this repo's knowledge — read
+> [`harness-charter.md`](harness-charter.md) and run the `cg-inbox --wait → cg-notify ack → act`
+> loop, obeying its security rules. Otherwise carry on as a normal dev session.
 
 ## What it is
-A private Telegram bridge that drives a persistent Claude Code instance by voice/text
-from a phone. Three Python files, one venv:
+A private Telegram bridge that drives a persistent Claude Code instance by voice/text/images
+from a phone. Four Python files, one venv:
 - `gui.py` — **PySide6** system-tray app; supervises `bot.py` as a child (`QProcess`),
-  shows a live console, auto-restarts on crash, has the Unblock / Restart / Clear-logs
-  buttons. The tray app **is** the supervisor.
-- `bot.py` — the bridge: Telegram I/O, local transcription (faster-whisper), the
-  firewall, the `bot` commands, rendering, the watchdog, and the `[HARNESS]` channels.
+  shows a live console, auto-restarts on crash. Controls: Restart / Unblock / Unblock+regress /
+  WAKE UP / Clear logs, and the **🛡 Intrusion Lock** on/off switch (right side). The tray app
+  **is** the supervisor.
+- `bot.py` — the bridge: Telegram I/O, the firewall + intrusion lock, the `bot` commands,
+  rendering, the watchdog, and the `[HARNESS]` channels. It launches transcription as a
+  subprocess and no longer loads whisper itself (lean event-loop process).
+- `transcribe_worker.py` — standalone, **killable** faster-whisper decoder, run as a child
+  process per voice message (a thread can't be killed; a process can).
 - `claude_driver.py` — `ClaudeController`: owns the Claude Agent SDK client.
 
 ## Core model: the bridge is a MONITOR of the Claude instance
@@ -55,18 +55,54 @@ continuous reader relays them.
   `🕐 <datetime> · working|idle` PLUS `N shells (what) | no shells`. It **edits one
   message in place** with a `×N` counter + a refreshing datetime instead of re-posting the
   same status; a changed status (or `mark_sent()` flagging that other content was sent
-  below it via `is_latest=False`) starts a fresh message. Dead-idle declared once. Silence
-  tracked by `mark_sent()` on every NEW message (edits don't count). At `×IDLE_SHELLS_NUDGE_AT`
-  (30) identical idle+shells ticks it `enqueue_for_claude(IDLE_SHELLS_NUDGE)` to auto-nudge
-  Claude to continue / check stuck shells / clean up.
+  below it via `is_latest=False`) starts a fresh message. Silence tracked by `mark_sent()` on
+  every NEW message (edits don't count). **3-state idle handling:** `×IDLE_SHELLS_NUDGE_AT`
+  (30) idle+shells ticks → `enqueue_for_claude(IDLE_SHELLS_NUDGE)` (continue / check stuck
+  shells / clean up); `×IDLE_NO_SHELLS_NUDGE_AT` (30) idle+**no**-shells ticks →
+  `IDLE_NO_SHELLS_NUDGE` ("continue, or reply starting with `NO MORE WORK`"); if Claude's reply
+  leads with `NO_MORE_WORK_MARKER` (detected in `SegmentRenderer.finalize` → `set_no_more_work`,
+  cleared on the next user message) → **IDLE_DONE** (one-shot terminal notice, no more nudging).
+  The loop is fully wrapped (`except: log`) so it can't die silently, and it **skips entirely
+  while `transcribe_active()`** (a decode isn't idleness).
 
-## Voiceback (spoken replies)
-A message starting with the word `voice` (`parse_voiceback`) sets `voiceback=True` for
-that turn: `build_prompt` injects `VOICEBACK_PREAMBLE`, the `SegmentRenderer` does NOT
-stream (collects `answer_buf`), and `_finalize_voiceback` parses `VOICESTART…VOICEEND`
-blocks → `synthesize_voice` (gTTS → mp3 → ffmpeg ogg/opus) → `bot.send_voice`, one per
-block, plus the text (markers stripped) and `[[END]]`. gTTS is online — swap to piper for
-offline if asked.
+## Voiceback (spoken replies) — a persistent toggle, no per-message cue
+`bot voice on`/`off` toggles `VOICE_MODE_FILE` (`voice.mode`, presence = on; `voice_mode_on()`),
+and the dispatcher OR's it into `voiceback` for every turn. (The old per-message `voice`/`voz`
+prefix was finicky over transcription and was **removed** — `parse_voiceback` is gone; the
+toggle is GUI/keyboard-set, reliable.) When on: `build_prompt` injects `VOICEBACK_PREAMBLE`, the
+`SegmentRenderer` does NOT stream (collects `answer_buf`), and `_finalize_voiceback` parses
+`VOICESTART…VOICEEND` blocks → `synthesize_voice` (gTTS → mp3 → ffmpeg ogg/opus) →
+`bot.send_voice`, one per block, plus the text (markers stripped) and `[[END]]`. gTTS is
+online — swap to piper for offline if asked.
+
+## Transcription (killable subprocess + watchdog)
+Voice → `handle_audio` downloads the audio, then runs the decode as a **subprocess**
+(`asyncio.create_subprocess_exec(sys.executable, "transcribe_worker.py", path, …)`), NOT a
+thread — so a stalled/looping whisper can be killed. The worker streams `PROGRESS <pct> <eta>`
+on stdout (consumed live by `_read_worker`, shown in the bubble), then `RESULT <json>` / `ERROR`.
+A budget watchdog (`asyncio.wait_for(_read_worker(), timeout = max(120, audio×6))`) kills a
+runaway and replies "stalled — resend". The bubble clock is a SEPARATE `_spawn`'d heartbeat on a
+fixed 10s timer (moving datetime = event loop alive), independent of the decode; both wrapped so
+neither dies silently. `condition_on_previous_text=False` disarms whisper's repetition loop.
+Quality is live: `bot transcribe best|good|fast` → `compute.type` (float32 / int8_float32 /
+int8), passed per-spawn via `env={…WHISPER_COMPUTE_TYPE…}`. The parent holds no whisper model;
+audio + images are swept at startup.
+**NEVER run `py-spy`/ptrace on the LIVE bot** — it stops every thread (event loop included) and
+froze a live transcription. Diagnose with the bot's logging + `kill -USR1 <pid>` instead.
+
+## Photo / image input
+`handle_photo` (`filters.PHOTO | filters.Document.IMAGE`) downloads to `IMAGE_TMP`, prunes
+images >6h old, and `enqueue_for_claude`s a prompt pointing Claude at the path (+ caption if any)
+— Claude reads it with the `Read` tool (multimodal in; no transcription). Files persist until the
+later turn reads them; swept at startup. `source="image"` collapses to the text guard.
+
+## Intrusion lock (paranoid tripwire — default ON, GUI-only)
+Any message from a non-allowlisted id → `handle_intrusion`: log it, and (if `intrusion_gate_on()`)
+**hard-lock** (`controller.kill()` + `engage_block`) + DM the owner; the intruder gets no reply;
+idempotent if already locked. Wired into every entry point (text/audio/photo/`/start`/new/stop/
+status). Gated by `INTRUSION_OFF_FILE` (`INTRUSION_OFF.flag`, presence = OFF; **default ON** =
+absent). The toggle lives ONLY in the GUI (`gui.py` 🛡 switch creates/deletes the flag) — **never
+a `bot` command**, so it can't be disabled remotely over Telegram (like physical-unlock-only).
 
 ## Message batching
 Handlers don't call `dispatch_to_claude` directly — they `enqueue_for_claude`. A single
@@ -99,9 +135,11 @@ running (background work continues). The ONLY exit is the tray's **WAKE UP** but
 (`gui.py` deletes `SLEEP.flag`, watched on the 2s timer). Not a security state (unlike
 the firewall lock) and doesn't kill anything (unlike `bot kill`).
 
-## Harness (external operator — maybe that's you)
-`run-harness.sh` opens a visible terminal running a Claude Code instance pre-prompted by
-`harness-charter.md` to operate/improve claudegram and serve the `bot harness` inbox
+## Harness (external operator — OPTIONAL/dispensable)
+The bridge is self-sufficient, so the harness is **optional** (the owner may run without one;
+don't assume there is one). `run-harness.sh` opens a visible terminal running a Claude Code
+instance pre-prompted by `harness-charter.md` to operate/improve claudegram and serve the
+`bot harness` inbox
 (loop: `cg-inbox --wait` → `cg-notify` ack → act → repeat). It is **decoupled**: `bot.py`
 has no knowledge of it; it's just an external Claude that understands this directory and
 talks through the `outbox/`+`inbox/` files. Not autostarted, unsupervised (closing it
@@ -117,10 +155,18 @@ cleared at the tray. **Keep the guard small** (no prompt bloat). False positives
 control; subscription is forced (`force_subscription_env` strips `ANTHROPIC_API_KEY`).
 
 ## DEPLOY (non-obvious)
-- `bot.py` / `claude_driver.py` change → restart **just the bot child**: find its PID
-  (`ps -eo pid,cmd | grep '[/]claudegram/bot.py'`) and `kill <pid>`; the tray supervisor
-  respawns it and the session resumes (`session.id`).
-- `gui.py` change → **full tray restart** (quit tray + relaunch `./run-gui.sh`).
+- `bot.py` / `claude_driver.py` / `transcribe_worker.py` change → restart **just the bot
+  child**: find its PID (`ps -eo pid,cmd | grep '[/]claudegram/bot.py'`) and `kill <pid>`; the
+  tray supervisor respawns it and the session resumes (`session.id`). (`transcribe_worker.py` is
+  re-read per spawn, so its changes apply on the next voice message even without a restart.)
+- `gui.py` change → **full tray restart**: kill the tray + bot child, then `./run-gui.sh`. It
+  **self-backgrounds** (re-execs via `setsid`, survives terminal close) and gui.py is
+  single-instance. From a non-graphical context, pass the desktop env (`WAYLAND_DISPLAY`,
+  `DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`). Don't do it mid Claude-turn /
+  transcription — wait for idle.
+- **Launch paths differ:** manual = `./run-gui.sh` (tray, self-backgrounding) or `./run.sh`
+  (headless bot, no tray); **autostart = `./install-autostart.sh`** writes a `.desktop` that
+  runs `gui.py` *directly* at login (GNOME-managed) — not `run-gui.sh`. Keep these in sync.
 - **NEVER** `pkill -f "claudegram/bot.py"` — the pattern matches the killing shell's own
   argv and it self-kills. Kill by explicit PID.
 

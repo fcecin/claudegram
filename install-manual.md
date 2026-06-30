@@ -59,9 +59,10 @@ Ask for, and help them obtain:
 2. **Their numeric Telegram user id** — guide them to message **@userinfobot**, which
    replies `Id: 123456789`. (A username is NOT usable for the allowlist.)
 3. **Working directory** — default `~/cghome` (auto-created). Ask if they want another.
-4. **Transcription** — default `large-v3` / `float32` (max accuracy, CPU-heavy). Offer
-   `WHISPER_COMPUTE_TYPE=int8` (~3–4× faster, slight accuracy loss) and a forced
-   `WHISPER_LANGUAGE` if they speak one language.
+4. **Transcription** — default `large-v3` / `float32` (max accuracy, CPU-heavy); quality is
+   also a live toggle, `bot transcribe best|good|fast` (float32 / int8_float32 ~2× / int8
+   ~3-4×), no restart. Offer a forced `WHISPER_LANGUAGE` if they speak one language. Decoding
+   runs in a killable subprocess, so a bad clip can't freeze the bridge.
 5. **Autostart at login?** — yes/no.
 
 ---
@@ -75,14 +76,15 @@ cp .env.example .env
 # to start without it). Add CGHOME / WHISPER_* overrides if requested.
 ```
 Confirm `.gitignore` already excludes `token.txt`, `.env`, `session.id`, `effort.level`,
-`cwd.path`, `BLOCKED.flag`, logs, and `.venv/`.
+`cwd.path`, `compute.type`, `voice.mode`, `BLOCKED.flag`, `SLEEP.flag`, `INTRUSION_OFF.flag`,
+logs, and `.venv/`.
 
 ---
 
 ## STEP 4 — Install & launch
 
 ```bash
-./run-gui.sh
+./run-gui.sh    # self-backgrounds (survives closing the terminal); ./run.sh = headless, no tray
 ```
 First run creates the virtualenv, installs deps, and downloads the `large-v3` model
 (~3 GB, once). It then starts the tray app, which supervises the bot. Watch
@@ -121,10 +123,15 @@ Tell the user:
 - **One persistent session**, resumed across reboots; only `bot new` / `bot clear` /
   `bot compact` reset/manage it.
 - **`bot` commands** (voice or text, first word `bot`): new, clear, compact, stop, kill,
-  lock, sleep, effort, cwd, context, logs, restart, echo, harness, status, session, help.
+  lock, sleep, effort, cwd, transcribe, voice, drop, issues, context, logs, restart, echo,
+  harness, status, session, help.
 - **Sleep**: `bot sleep` pauses ALL Telegram input (Claude keeps running); the only way
   back is the **WAKE UP** button on the tray. Distinct from lock (security) and kill.
-- **Voiceback**: start a message with `voice` → spoken reply (audio). Uses `gTTS` (online).
+- **Voiceback**: `bot voice on` → every reply comes back as spoken audio until `bot voice
+  off`. Uses `gTTS` (online).
+- **Images**: send a photo (with or without a caption) and Claude reads it (multimodal in).
+- **Intrusion lock** (tray toggle, default ON): if anyone who isn't them messages the bot it
+  hard-locks and alerts them; toggle only at the tray (the 🛡 switch), never remotely.
 - **Batching**: several messages fired in a row are combined into ONE Claude turn.
 - **Watchdog**: after ~60 s of silence the bridge posts the Claude instance's state —
   `working`/`idle` plus background shells (how many + what) or none — so they know whether
@@ -133,8 +140,8 @@ Tell the user:
 - **`[HARNESS]` channel** (two-way side channel, optional): `./cg-notify "msg"` pushes a
   message from the machine to their phone; `bot harness <msg>` (or `bot h`) sends a message
   back to whatever AI is working on the machine, read with `./cg-inbox`.
-- **Tray**: Unblock / Unlock-&-add-regression / WAKE UP / Restart bot / Clear logs;
-  everything is logged to `claudegram.log`.
+- **Tray**: Restart bot / Unblock / Unlock-&-add-regression / WAKE UP / Clear logs / 🛡
+  Intrusion Lock toggle; everything is logged to `claudegram.log`.
 - **Re-read the security warning** in `README.md`. Keep this machine clean.
 
 ## Notes for the installer
