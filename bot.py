@@ -165,9 +165,20 @@ EFFORT_FILE = HERE / "effort.level"  # persisted reasoning effort
 CWD_FILE = HERE / "cwd.path"         # persisted working directory
 LOG_PATH = HERE / "claudegram.log"   # bridge log (written by the tray supervisor)
 AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # transient voice files
+HARNESS_OUTBOX = HERE / "outbox"     # drop dir: any program leaves a msg -> sent to phone
+HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by the AI here
 controller = ClaudeController(
     str(CGHOME), str(SESSION_FILE), str(EFFORT_FILE), str(CWD_FILE)
 )
+
+# Silence tracker for the watchdog: monotonic ts of the last NEW message sent to the
+# owner. Edits don't count (they don't notify). The 60s watchdog only speaks after a gap.
+_last_tg_send = time.monotonic()
+
+
+def mark_sent() -> None:
+    global _last_tg_send
+    _last_tg_send = time.monotonic()
 
 
 def ensure_cghome() -> None:
@@ -406,7 +417,14 @@ async def reply_chunked_bot(bot, chat_id, reply_to, text: str, limit: int = 4096
 
 
 class StatusBoard:
-    """One Telegram message, edited in place to show a live activity feed."""
+    """One Telegram message, edited in place to show a live activity feed.
+
+    Telegram edits a message AT ITS ORIGINAL POSITION — it never moves to the
+    bottom. So this board must only update while it is still the newest message
+    in the chat (the thinking/tool phase, when the user is waiting). The instant
+    the answer starts streaming below it, we `seal()` the board: it freezes into a
+    static "what I did" log and is never edited again, so the only thing moving in
+    the chat is the answer at the bottom (natural reading order)."""
 
     def __init__(self, bot, chat_id: int, reply_to, header: str):
         self.bot = bot
@@ -415,8 +433,9 @@ class StatusBoard:
         self.header = header
         self.lines: list[str] = []
         self.message_id = None
+        self.sealed = False           # once True, never edit this message again
         self._last_edit = 0.0
-        self._min_interval = 1.2  # throttle edits (Telegram rate limits)
+        self._min_interval = 1.2      # throttle edits (Telegram rate limits)
 
     def _render(self) -> str:
         body = "\n".join(self.lines[-22:])
@@ -424,28 +443,44 @@ class StatusBoard:
         return text[-3900:]
 
     async def start(self) -> None:
+        t0 = time.monotonic()
         m = await self.bot.send_message(
             self.chat_id, self._render(), reply_to_message_id=self.reply_to
         )
         self.message_id = m.message_id
+        mark_sent()  # a new bubble — breaks silence for the watchdog
+        log.info("TG board-start in %.2fs (mid=%s)", time.monotonic() - t0, self.message_id)
 
     async def add(self, line: str) -> None:
         self.lines.append(line)
         await self._flush(force=False)
 
     async def _flush(self, force: bool) -> None:
-        if self.message_id is None:
+        if self.message_id is None or self.sealed:
             return
         now = time.monotonic()
         if not force and (now - self._last_edit) < self._min_interval:
             return
         self._last_edit = now
         try:
+            t0 = time.monotonic()
             await self.bot.edit_message_text(
                 self._render(), chat_id=self.chat_id, message_id=self.message_id
             )
-        except Exception:
-            pass  # "message is not modified" / transient — ignore
+            log.info("TG board-edit in %.2fs", time.monotonic() - t0)
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                log.info("TG board-edit failed: %r", e)  # flood/timeout worth seeing
+
+    async def seal(self, header: str | None = None) -> None:
+        """Freeze the board in place (one last edit) so it stops mutating above the
+        answer. Called when the answer begins streaming below it."""
+        if self.sealed:
+            return
+        if header is not None:
+            self.header = header
+        await self._flush(force=True)
+        self.sealed = True
 
     async def finish(self, header: str) -> None:
         self.header = header
@@ -511,10 +546,19 @@ class ParagraphStreamer:
 
     async def _send(self, text: str) -> None:
         for i in range(0, len(text), self.TG_LIMIT):
-            await self.bot.send_message(
-                self.chat_id, text[i:i + self.TG_LIMIT],
-                reply_to_message_id=self.reply_to if not self.sent_any else None,
-            )
+            piece = text[i:i + self.TG_LIMIT]
+            t0 = time.monotonic()
+            try:
+                await self.bot.send_message(
+                    self.chat_id, piece,
+                    reply_to_message_id=self.reply_to if not self.sent_any else None,
+                )
+                log.info("TG stream-send %d chars in %.2fs", len(piece), time.monotonic() - t0)
+                mark_sent()
+            except Exception as e:
+                log.warning("TG stream-send FAILED after %.2fs (%d chars): %r",
+                            time.monotonic() - t0, len(piece), e)
+                raise
             self.sent_any = True
 
     async def _close(self) -> None:
@@ -536,113 +580,150 @@ class ParagraphStreamer:
 
     async def finish(self) -> None:
         await self._close()
+        t0 = time.monotonic()
         await self.bot.send_message(self.chat_id, "[[END]]")
+        mark_sent()
+        log.info("TG [[END]] sent in %.2fs", time.monotonic() - t0)
 
 
-async def dispatch_to_claude(
-    context, chat_id, reply_to, user_text: str, source: str,
-    raw: bool = False, header: str = "🤖 Claude is working…",
-) -> None:
-    """Stream one turn to the chat. Normally the prompt is guarded (firewall); with
-    raw=True it is sent verbatim (used for slash commands like /compact)."""
-    bot = context.bot
-    if controller.busy:
-        await bot.send_message(chat_id, "⏳ Still on the previous request — queuing this one.")
+class SegmentRenderer:
+    """Renders ONE Claude turn (a 'segment') to the chat: a live activity board while
+    it works, the answer streamed below, a summary at the end. Used for BOTH user-driven
+    turns and the turns Claude starts on its own when a background shell lands."""
 
-    board = StatusBoard(bot, chat_id, reply_to, header)
-    await board.start()
+    def __init__(self, bot, chat_id, reply_to, header, *, user_text=None):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.reply_to = reply_to
+        self.base_header = header
+        self.user_text = user_text or "(self-initiated turn)"
+        self.board = StatusBoard(bot, chat_id, reply_to, header)
+        self.streamer = ParagraphStreamer(bot, chat_id, reply_to)
+        self.answer_buf: list[str] = []
+        self.tripped = False
+        self.thinking = False
+        self.answer_started = False
+        self.text_interrupted = False
+        self.tools: dict = {}
+        self.problems: list[str] = []
+        self.result = None
 
-    state = {"thinking": False, "tripped": False, "result": None, "tools": {}}
-    answer_buf: list[str] = []  # accumulate streamed answer text for logging
+    async def start(self) -> None:
+        await self.board.start()
 
-    # The answer text streams out as paragraph messages (a block reply streams too,
-    # so you can see the model's stated reason).
-    streamer = ParagraphStreamer(bot, chat_id, reply_to)
+    async def alert(self, text: str) -> None:
+        """A real bottom-of-chat message (notifies), for genuine failures/summaries."""
+        try:
+            await self.bot.send_message(self.chat_id, text)
+            mark_sent()
+        except Exception:
+            log.exception("could not send alert")
 
-    async def trip(model_reason: str = "") -> None:
-        if state["tripped"]:
+    async def trip(self, model_reason: str = "") -> None:
+        if self.tripped:
             return
-        state["tripped"] = True
-        await streamer.flush()  # flush whatever already streamed (no [[END]])
-        engage_block(_oneline(user_text, 1000))
-        log.warning("🔒 BLOCKED prompt: %s", user_text)
+        self.tripped = True
+        await self.streamer.flush()  # flush whatever already streamed (no [[END]])
+        engage_block(_oneline(self.user_text, 1000))
+        log.warning("🔒 BLOCKED prompt: %s", self.user_text)
         if model_reason:
             log.warning("Block reasoning: %s", model_reason)
         try:
             await controller.interrupt()
         except Exception:
             pass
-        await board.finish("🛑 HACKING ATTEMPT BLOCKED — bridge locked")
+        if not self.board.sealed:
+            await self.board.finish("🛑 HACKING ATTEMPT BLOCKED — bridge locked")
         msg = BLOCKED_MSG
         if model_reason:
             msg += f"\n\nClaude's reason: {_oneline(model_reason, 400)}"
-        await bot.send_message(chat_id, msg)
+        await self.alert(msg)
 
-    async def on_system(kind: str, data: dict) -> None:
+    async def on_system(self, kind: str, data: dict) -> None:
         if kind == "compaction_started":
             log.info("🗜 Auto-compaction started (%s)", data.get("trigger", "auto"))
-            await board.add(
+            await self.board.add(
                 f"🗜 Auto-compaction started ({data.get('trigger', 'auto')}) — "
                 "summarizing the conversation to free up context…"
             )
         elif kind == "session_started":
             sid = data.get("id")
-            await board.add(f"🧵 Resuming session {sid[:8]}" if sid else "🧵 New session")
+            await self.board.add(f"🧵 Resuming session {sid[:8]}" if sid else "🧵 New session")
 
-    async def on_event(message) -> None:
-        if state["tripped"]:
+    async def handle(self, message) -> None:
+        """Render one stream message. Fed for every message of this segment."""
+        if self.tripped:
             return
-        # Live text deltas -> stream into paragraph messages.
         if isinstance(message, StreamEvent):
             ev = message.event
             t = ev.get("type")
             if t == "content_block_delta":
                 delta = ev.get("delta", {})
                 if delta.get("type") == "text_delta":
-                    state["thinking"] = False
+                    self.thinking = False
                     chunk = delta.get("text", "")
-                    answer_buf.append(chunk)
-                    await streamer.feed(chunk)
+                    # First answer text: freeze the board so it stops mutating ABOVE the
+                    # answer; from here the only moving thing is the answer below it.
+                    if not self.answer_started:
+                        self.answer_started = True
+                        await self.board.seal(self.base_header + " · 💬 answering below 👇")
+                    # A tool/thinking split the prose: re-insert a paragraph break so the
+                    # pre- and post-tool text don't mash ("…in the background:Confirmed…").
+                    if self.text_interrupted:
+                        self.text_interrupted = False
+                        if chunk and not chunk.startswith("\n"):
+                            chunk = "\n\n" + chunk
+                    self.answer_buf.append(chunk)
+                    await self.streamer.feed(chunk)
             elif t == "content_block_start":
-                if ev.get("content_block", {}).get("type") == "thinking" and not state["thinking"]:
-                    await board.add("💭 thinking…")
-                    state["thinking"] = True
+                if ev.get("content_block", {}).get("type") == "thinking" and not self.thinking:
+                    await self.board.add("💭 thinking…")
+                    self.thinking = True
+                    if self.answer_started:
+                        self.text_interrupted = True
             return
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ThinkingBlock):
                     log.info("THINKING: %s", block.thinking)
-                    if not state["thinking"]:
-                        await board.add("💭 thinking…")
-                        state["thinking"] = True
+                    if self.answer_started:
+                        self.text_interrupted = True
+                    if not self.thinking:
+                        await self.board.add("💭 thinking…")
+                        self.thinking = True
                 elif isinstance(block, ToolUseBlock):
-                    state["thinking"] = False
-                    state["tools"][block.id] = block.name
+                    self.thinking = False
+                    self.tools[block.id] = block.name
+                    if self.answer_started:
+                        self.text_interrupted = True
                     log.info("TOOL %s input=%r", block.name, block.input)
-                    await board.add(summarize_tool(block.name, block.input or {}))
+                    await self.board.add(summarize_tool(block.name, block.input or {}))
                 elif isinstance(block, TextBlock):
-                    # already streamed via StreamEvent — detect a block (it leads
-                    # with the sentinel) and capture the model's stated reason.
+                    # already streamed via StreamEvent — detect a block (leads with the
+                    # sentinel) and capture the model's stated reason.
                     if sentinel_tripped(block.text):
-                        reason = "\n".join(block.text.splitlines()[1:]).strip()
-                        await trip(reason)
+                        await self.trip("\n".join(block.text.splitlines()[1:]).strip())
                         return
         elif isinstance(message, UserMessage):
             content = message.content if isinstance(message.content, list) else []
             for block in content:
                 if isinstance(block, ToolResultBlock):
-                    name = state["tools"].get(block.tool_use_id, "")
+                    name = self.tools.get(block.tool_use_id, "")
                     log.info("RESULT %s err=%s: %s", name or "?",
                              block.is_error, _blocktext(block.content))
+                    if block.is_error:
+                        self.problems.append(
+                            f"{name or 'tool'}: {_oneline(_blocktext(block.content), 120)}"
+                        )
                     line = summarize_result(name, block.content, block.is_error)
                     if line:
-                        await board.add(line)
+                        await self.board.add(line)
         elif isinstance(message, SystemMessage):
             log.info("SYSTEM subtype=%s", message.subtype)
             if "compact" in (message.subtype or "").lower():
-                await board.add("🗜 Compaction finished — context summarized.")
+                await self.board.add("🗜 Compaction finished — context summarized.")
         elif isinstance(message, ResultMessage):
-            state["result"] = {
+            self.result = {
                 "turns": message.num_turns,
                 "secs": (message.duration_ms or 0) / 1000,
                 "is_error": bool(message.is_error)
@@ -651,43 +732,173 @@ async def dispatch_to_claude(
                 "text": (message.result or "").strip(),
             }
 
+    async def finalize(self) -> None:
+        """Close the segment: flush the answer + [[END]], post a summary at the bottom."""
+        if self.tripped:
+            return
+        res = self.result or {}
+        final = res.get("text", "")
+        if final and sentinel_tripped(final):
+            await self.trip("\n".join(final.splitlines()[1:]).strip())
+            return
+        # Only feed `final` if nothing streamed (else it double-sends the answer).
+        if not self.answer_buf and final:
+            await self.streamer.feed(final)
+        await self.streamer.finish()  # remainder + [[END]] (prompt is free for input)
+
+        answer = "".join(self.answer_buf).strip() or final
+        log.info("ANSWER (%d chars):\n%s", len(answer), answer)
+
+        ctx = await controller.context_usage()
+        ctx_str = f" · ctx {ctx['percentage']:.0f}%" if ctx else ""
+        turns, secs = res.get("turns", "?"), res.get("secs", 0)
+        sid8 = (controller.session_id or "")[:8]
+        sess = f" · 🧵 {sid8}" if sid8 else ""
+        probs = f" · ⚠️ {len(self.problems)} issue(s)" if self.problems else ""
+        if res.get("is_error"):
+            summary = f"⚠️ Ended: {res.get('subtype')} · {turns} turns · {secs:.0f}s{ctx_str}{sess}"
+        else:
+            summary = f"✅ Done · {turns} turns · {secs:.0f}s{ctx_str}{sess}{probs}"
+        # Summary where the eye is: a NEW bottom message if the answer streamed below the
+        # sealed board; else finalize the board in place (a tools-only turn). On error
+        # with no answer, also ping (board edits don't notify).
+        if self.answer_started:
+            await self.alert(summary)
+        elif res.get("is_error"):
+            await self.board.finish("⚠️ ended with an error")
+            await self.alert(summary)
+        else:
+            await self.board.finish(summary)
+        log.info("TURN DONE: subtype=%s turns=%s secs=%.1f%s session=%s",
+                 res.get("subtype"), turns, secs, ctx_str, controller.session_id)
+
+    async def crashed(self, exc: Exception) -> None:
+        if self.tripped:
+            return
+        if not self.board.sealed:
+            try:
+                await self.board.finish("⚠️ turn crashed")
+            except Exception:
+                pass
+        await self.alert(
+            f"⚠️ That turn crashed: {_oneline(f'{type(exc).__name__}: {exc}', 300)}\n"
+            "The session is intact — just resend to continue."
+        )
+
+
+async def dispatch_to_claude(
+    context, chat_id, reply_to, user_text: str, source: str,
+    raw: bool = False, header: str = "🤖 Claude is working…",
+) -> None:
+    """Drive ONE user turn. The continuous reader feeds messages to the renderer; we
+    return when this turn ends. Claude's later self-started turns (a shell landed) are
+    rendered separately by SpontaneousRelay, so they reach the phone without a prompt."""
+    bot = context.bot
+    log.info("DISPATCH start chat=%s source=%s busy=%s len=%d",
+             chat_id, source, controller.busy, len(user_text))
+    if controller.busy:
+        await bot.send_message(chat_id, "⏳ Still on the previous request — queuing this one.")
+    r = SegmentRenderer(bot, chat_id, reply_to, header, user_text=user_text)
+    await r.start()
     prompt = user_text if raw else build_prompt(user_text, source)
     try:
-        await controller.ask(prompt, on_event, on_system=on_system)
-    except Exception:
+        await controller.ask(prompt, r.handle, on_system=r.on_system)
+    except Exception as e:
         log.exception("Claude turn failed")
-        if not state["tripped"]:
-            await board.finish("⚠️ Something went wrong driving Claude.")
+        await r.crashed(e)
         return
+    await r.finalize()
 
-    if state["tripped"]:
-        return
 
-    res = state["result"] or {}
-    final = res.get("text", "")
-    # Backstop firewall check on the full answer (in case it never streamed).
-    if final and sentinel_tripped(final):
-        await trip("\n".join(final.splitlines()[1:]).strip())
-        return
-    # If nothing streamed (answer arrived only in the result), send it now.
-    if not streamer.sent_any and final:
-        await streamer.feed(final)
-    await streamer.finish()  # flush remainder + [[END]]
+class SpontaneousRelay:
+    """Renders the turns Claude starts on its OWN (a background shell completed) to the
+    owner's chat — a fresh segment each time, posted at the bottom. This is what makes
+    'I'll report when the build lands' actually reach your phone."""
 
-    answer = "".join(answer_buf).strip() or final
-    log.info("ANSWER (%d chars):\n%s", len(answer), answer)
+    def __init__(self, application):
+        self.app = application
+        self.cur: SegmentRenderer | None = None
 
-    ctx = await controller.context_usage()
-    ctx_str = f" · ctx {ctx['percentage']:.0f}%" if ctx else ""
-    turns, secs = res.get("turns", "?"), res.get("secs", 0)
-    sid8 = (controller.session_id or "")[:8]
-    sess = f" · 🧵 {sid8}" if sid8 else ""
-    if res.get("is_error"):
-        await board.finish(f"⚠️ Ended: {res.get('subtype')} · {turns} turns · {secs:.0f}s{ctx_str}{sess}")
-    else:
-        await board.finish(f"✅ Done · {turns} turns · {secs:.0f}s{ctx_str}{sess}")
-    log.info("TURN DONE: subtype=%s turns=%s secs=%.1f%s session=%s",
-             res.get("subtype"), turns, secs, ctx_str, controller.session_id)
+    def _owner_chat(self):
+        return sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
+
+    async def on_message(self, message) -> None:
+        kind = type(message).__name__
+        if self.cur is None:
+            # Leading task/ratelimit chatter isn't the start of a renderable turn; the
+            # shell set is already tracked by the controller before we get here.
+            if kind in ("TaskStartedMessage", "TaskUpdatedMessage",
+                        "TaskNotificationMessage", "RateLimitEvent"):
+                return
+            chat = self._owner_chat()
+            if chat is None:
+                return
+            self.cur = SegmentRenderer(
+                self.app.bot, chat, None,
+                "🔔 Claude picked back up (a background task landed)…",
+            )
+            await self.cur.start()
+        await self.cur.handle(message)
+        if kind == "ResultMessage":
+            try:
+                await self.cur.finalize()
+            finally:
+                self.cur = None
+
+
+async def watchdog_loop(application) -> None:
+    """Break Telegram silence. About every minute of quiet, post the Claude INSTANCE
+    state so you never stare at a dead screen: working|idle, PLUS (orthogonally) the
+    background shells (how many + what) or none. You read it and decide:
+      • idle + shells  -> wait, it'll wake itself when they land
+      • idle + no shells -> fully done/dead; any 'I'll get back to you' was false — poke it
+    Only speaks on ~60s of silence (so streaming turns aren't interrupted), and declares
+    the dead-idle state just once."""
+    dead_declared = False
+    while True:
+        await asyncio.sleep(20)
+        try:
+            if (time.monotonic() - _last_tg_send) < 58:
+                continue  # not silent — something already reached the phone recently
+            st = controller.status()
+            shells = st["shells"]
+            active = st["active"]
+            if not active and not shells:
+                if dead_declared:
+                    continue
+                dead_declared = True
+                await _watchdog_say(
+                    application,
+                    "🐕 💤 idle · 🐚 no shells — nothing is running, nothing will wake me. "
+                    "Say hi to continue.",
+                )
+                continue
+            dead_declared = False
+            if active:
+                mins = int(st["segment_secs"] // 60)
+                head = f"🟢 working {mins}m" if mins else "🟢 working"
+            else:
+                head = "💤 idle"
+            if shells:
+                descs = ", ".join(_oneline(s.get("desc", "task"), 40) for s in shells[:4])
+                more = f" (+{len(shells) - 4})" if len(shells) > 4 else ""
+                tail = f"🐚 {len(shells)} shell(s): {descs}{more}"
+                if not active:
+                    tail += " — they'll wake me when they land"
+            else:
+                tail = "🐚 no shells"
+            await _watchdog_say(application, f"🐕 {head} · {tail}")
+        except Exception:
+            log.exception("watchdog error")
+
+
+async def _watchdog_say(application, text: str) -> None:
+    for uid in sorted(ALLOWED_USER_IDS):
+        try:
+            await application.bot.send_message(uid, text)
+            mark_sent()
+        except Exception:
+            log.exception("watchdog send failed")
 
 
 # --- "bot ..." harness commands (intercepted before Claude) ------------------
@@ -745,6 +956,7 @@ BOT_HELP = (
     "• bot logs [n] — last n bridge log lines\n"
     "• bot restart — restart the bridge process\n"
     "• bot echo <text> — echo text back (not sent to Claude)\n"
+    "• bot harness <text> (or bot h) — message the AI working on this machine\n"
     "• bot status — bridge, effort, session & context\n"
     "• bot session — current session id\n"
     "• bot help — this list\n"
@@ -824,6 +1036,28 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
     if m:
         payload = m.group(1).strip()
         await reply(payload if payload else "(nothing to echo)")
+        return True
+
+    # "bot harness <msg>" / "bot h <msg>" — message the AI/harness working on this
+    # machine (the reverse of the [HARNESS] outbox). Lands in inbox/ for the AI to
+    # read via cg-inbox. Never sent to Claude.
+    m = re.match(r"^(?:harness|h)\b[\s:,\-]*(.*)$", rest, re.IGNORECASE | re.DOTALL)
+    if m:
+        payload = m.group(1).strip()
+        if not payload:
+            await reply("📨 Usage: bot harness <message> — sends it to the AI working on this machine.")
+            return True
+        try:
+            HARNESS_INBOX.mkdir(parents=True, exist_ok=True)
+            stamp = str(time.time_ns())
+            tmp = HARNESS_INBOX / f".{stamp}.tmp"
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.rename(HARNESS_INBOX / f"{stamp}.msg")  # atomic: AI never reads a partial
+            log.info("INBOX <- user (harness): %s", _oneline(payload, 300))
+            await reply("📨 Sent to the harness — the AI on this machine will see it.")
+        except OSError:
+            log.exception("Could not write harness inbox")
+            await reply("⚠️ Couldn't queue that for the harness.")
         return True
 
     # "bot effort [level]" — special-cased because it takes an argument.
@@ -996,6 +1230,53 @@ def _log_exit(signum: int | None = None) -> None:
     )
 
 
+async def deliver_harness(application, body: str) -> None:
+    """Send a [HARNESS] message to the owner(s) on Telegram."""
+    text = "🤖 [HARNESS] " + body.strip()
+    for uid in sorted(ALLOWED_USER_IDS):
+        try:
+            await reply_chunked_bot(application.bot, uid, None, text)
+        except Exception:
+            log.exception("Failed to deliver HARNESS message to %s", uid)
+    mark_sent()
+    log.info("HARNESS -> %s: %s", sorted(ALLOWED_USER_IDS), _oneline(body, 200))
+
+
+async def harness_outbox_loop(application) -> None:
+    """IPC inbox for OTHER programs on this machine. Anything (an AI like Claude Code
+    working here, a cron job, a build script) can ping the phone by dropping a message
+    file in the outbox dir; we relay it as a [HARNESS] message, then delete the file.
+
+    Convention (atomic, so we never read a half-written file): write to a name that
+    starts with '.' or ends in '.tmp', then rename to the final name. The helper
+    `cg-notify` does this for you:  ./cg-notify "build finished, all green"
+    Or by hand:  echo 'hi' > outbox/.x && mv outbox/.x outbox/x.msg
+    """
+    try:
+        HARNESS_OUTBOX.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        log.exception("Could not create outbox dir %s", HARNESS_OUTBOX)
+        return
+    while True:
+        try:
+            for f in sorted(HARNESS_OUTBOX.iterdir()):
+                if (not f.is_file()) or f.name.startswith(".") or f.name.endswith(".tmp"):
+                    continue  # not a finished drop
+                try:
+                    body = f.read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    continue
+                try:
+                    f.unlink()  # consumed (delete before sending: never double-send)
+                except OSError:
+                    pass
+                if body:
+                    await deliver_harness(application, body)
+        except Exception:
+            log.exception("harness outbox loop error")
+        await asyncio.sleep(1.0)
+
+
 async def on_startup(application) -> None:
     """Runs once the bot is initialized — log it and ping the owner(s) on Telegram
     that the bridge just came online (handy to see power-cycles from your phone)."""
@@ -1015,6 +1296,15 @@ async def on_startup(application) -> None:
             await application.bot.send_message(uid, text)
         except Exception:
             log.exception("Could not send startup ping to %s", uid)
+    mark_sent()  # the online ping counts — don't let the watchdog fire immediately
+    # Relay the turns Claude starts on its OWN (a background shell landed) to the phone.
+    controller.set_spontaneous_handler(SpontaneousRelay(application).on_message)
+    # Start the IPC inbox so other programs on this machine can ping the phone.
+    asyncio.create_task(harness_outbox_loop(application))
+    log.info("HARNESS outbox watcher started at %s", HARNESS_OUTBOX)
+    # Start the watchdog: break Telegram silence with the Claude instance's state.
+    asyncio.create_task(watchdog_loop(application))
+    log.info("watchdog started (60s silence-breaker: working/idle + shells)")
 
 
 def main() -> None:
@@ -1039,11 +1329,22 @@ def main() -> None:
     if is_blocked():
         log.warning("Starting in BLOCKED state — Unblock from the tray app to resume.")
 
+    # Transport tuning. The API-call request (send/edit) already pools 256 conns by
+    # default, so it isn't the bottleneck — but PTB's default read/write timeouts are
+    # only 5s, so a slow or bursty send (status-board edits + streamed paragraphs all
+    # firing during a turn) can hit that ceiling and drop a message. Make the pool
+    # explicit and give sends generous timeouts so streamed output flows reliably.
     app = (
         ApplicationBuilder()
         .token(token)
-        .post_init(on_startup)     # ping the owner(s) that the bridge is online
-        .concurrent_updates(True)  # so /stop runs while a turn is in progress
+        .post_init(on_startup)            # ping the owner(s) that the bridge is online
+        .concurrent_updates(True)         # so /stop runs while a turn is in progress
+        .connection_pool_size(256)        # explicit (PTB default; documents intent)
+        .pool_timeout(30.0)               # wait for a slot under burst, don't error early
+        .connect_timeout(15.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .media_write_timeout(120.0)       # voice downloads can be chunky
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))

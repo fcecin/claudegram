@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# cg-notify — ping the phone via claudegram's [HARNESS] channel.
+#
+# Any program on this machine (an AI working here, a build script, cron) can use
+# this to push a message to the owner's Telegram. It drops the message into the
+# bridge's outbox dir atomically; the running bot relays it as a [HARNESS] message.
+#
+# Usage:
+#   ./cg-notify "build finished — all green"
+#   echo "multi-line
+#   report" | ./cg-notify
+#
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTBOX="$HERE/outbox"
+mkdir -p "$OUTBOX"
+
+msg="$*"
+if [ -z "$msg" ]; then
+  msg="$(cat)"   # read from stdin when no args
+fi
+if [ -z "${msg//[[:space:]]/}" ]; then
+  echo "cg-notify: empty message, nothing sent" >&2
+  exit 1
+fi
+
+# Atomic drop: write a hidden temp file, then rename to the final name so the bot
+# never reads a half-written message. Name is sortable so messages keep their order.
+stamp="$(date +%s).$$.$RANDOM"
+tmp="$OUTBOX/.${stamp}.tmp"
+final="$OUTBOX/${stamp}.msg"
+printf '%s' "$msg" > "$tmp"
+mv "$tmp" "$final"
+echo "queued: $final"

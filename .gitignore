@@ -16,3 +16,7 @@ gui-stderr.log
 .venv/
 __pycache__/
 *.pyc
+
+# HARNESS IPC drop dir (runtime messages)
+outbox/
+inbox/

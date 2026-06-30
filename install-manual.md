@@ -121,7 +121,14 @@ Tell the user:
 - **One persistent session**, resumed across reboots; only `bot new` / `bot clear` /
   `bot compact` reset/manage it.
 - **`bot` commands** (voice or text, first word `bot`): new, clear, compact, stop, kill,
-  lock, effort, cwd, context, logs, restart, echo, status, session, help.
+  lock, effort, cwd, context, logs, restart, echo, harness, status, session, help.
+- **Watchdog**: after ~60 s of silence the bridge posts the Claude instance's state —
+  `working`/`idle` plus background shells (how many + what) or none — so they know whether
+  to wait (idle + shells → it'll wake itself and report) or it's done (idle + no shells).
+  `[[END]]` just means the prompt is free for the next message.
+- **`[HARNESS]` channel** (two-way side channel, optional): `./cg-notify "msg"` pushes a
+  message from the machine to their phone; `bot harness <msg>` (or `bot h`) sends a message
+  back to whatever AI is working on the machine, read with `./cg-inbox`.
 - **Tray**: Unblock / Unlock-&-add-regression / Restart bot / Clear logs; everything is
   logged to `claudegram.log`.
 - **Re-read the security warning** in `README.md`. Keep this machine clean.
@@ -132,3 +139,5 @@ Tell the user:
   (`bot restart`); a `gui.py` change needs a **full tray restart** (quit + `./run-gui.sh`).
 - Never run tests against the live bridge — they can clobber `session.id`. Use a separate
   working dir + session file.
+- Developing claudegram itself? Read `CLAUDE.md` (architecture, the watchdog/continuous-
+  reader model, deploy and testing rules).

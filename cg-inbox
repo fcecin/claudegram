@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# cg-inbox — read messages the user sent from the phone via `bot harness <text>`.
+#
+# For the AI/harness working on this machine: this is how the user talks back to you.
+#   (no args) : print pending messages (oldest first) and DRAIN them (consume once)
+#   --peek    : print without draining (leave them for the next read)
+#   --wait    : block until a message arrives, then print + drain it (loop primitive:
+#               `while true; do ./cg-inbox --wait; done` to monitor continuously)
+#
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INBOX="$HERE/inbox"
+mkdir -p "$INBOX"
+
+mode="drain"
+case "${1:-}" in
+  --peek) mode="peek" ;;
+  --wait) mode="wait" ;;
+  "")     : ;;
+  *) echo "usage: cg-inbox [--peek|--wait]" >&2; exit 2 ;;
+esac
+
+if [ "$mode" = "wait" ]; then
+  while ! compgen -G "$INBOX/*.msg" >/dev/null; do sleep 2; done
+fi
+
+found=0
+for f in "$INBOX"/*.msg; do
+  [ -e "$f" ] || continue
+  found=1
+  ns="$(basename "$f" .msg)"
+  secs=$(( ns / 1000000000 ))
+  when="$(date -d "@$secs" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$secs")"
+  echo "── [$when] ──────────────────────────────"
+  cat "$f"; echo
+  [ "$mode" != "peek" ] && rm -f "$f"
+done
+[ "$found" -eq 0 ] && echo "(inbox empty)"

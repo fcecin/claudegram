@@ -157,9 +157,29 @@ class ClaudeController:
         self.effort = self._load_effort() or DEFAULT_EFFORT  # always a concrete level
         self.model = None  # actual model, captured from the init message
         self._client: ClaudeSDKClient | None = None
-        self._lock = asyncio.Lock()
-        self.busy = False
+        self._lock = asyncio.Lock()  # serializes USER turns (not the reader)
         self._on_system = None  # async callback(kind:str, data:dict) for the active turn
+
+        # --- continuous watchdog of the Claude instance --------------------------
+        # The bridge is a MONITOR: one persistent reader drains the SDK stream forever,
+        # so it sees not only replies to our queries but also the turns Claude starts on
+        # its OWN when a background shell completes ("the build landed"). It never walks
+        # away at a ResultMessage, so it never inserts fake idleness.
+        self._reader_task = None          # the always-on receive_messages() loop
+        self._user_sink = None            # async fn(msg): renders the current USER turn
+        self._spontaneous_sink = None     # async fn(msg): renders self-started turns
+        self.in_segment = False           # True while Claude is actively thinking/typing
+        self._cur_is_user = False         # is the in-flight segment a reply to our query?
+        self._awaiting_user_segment = False  # we queried; next segment is ours
+        self._segment_done = asyncio.Event()  # set when the current user segment ends
+        self.last_activity = 0.0          # monotonic ts of the last stream message
+        self.shells: dict[str, dict] = {}  # task_id -> {desc, type}: live background work
+        self._seg_started_ts = 0.0        # monotonic ts the current segment began
+
+    @property
+    def busy(self) -> bool:
+        """Claude is actively producing a turn right now (thinking/typing/tooling)."""
+        return self.in_segment
 
     # --- session persistence (resume across process restarts) ----------------
     def _load_session(self) -> str | None:
@@ -319,6 +339,8 @@ class ClaudeController:
                 await self._client.connect()
             else:
                 raise
+        # (Re)start the always-on reader on the fresh client.
+        self._start_reader()
         # Announce the (re)started session to the active turn's listener.
         if self._on_system is not None:
             try:
@@ -328,26 +350,117 @@ class ClaudeController:
             except Exception:
                 pass
 
+    def set_spontaneous_handler(self, handler) -> None:
+        """Register the async fn(message) that renders turns Claude starts on its own
+        (e.g. when a background shell completes). Called for every message of a
+        self-initiated segment, including its init (start) and ResultMessage (end)."""
+        self._spontaneous_sink = handler
+
+    # --- the always-on reader (watchdog) -------------------------------------
+    def _start_reader(self) -> None:
+        if self._reader_task is None or self._reader_task.done():
+            self._reader_task = asyncio.create_task(self._read_loop())
+
+    def _stop_reader(self) -> None:
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            self._reader_task = None
+
+    def _track(self, message) -> None:
+        """Update the live picture of the Claude instance from one stream message:
+        background-shell set, segment boundaries, session id, model."""
+        self.last_activity = asyncio.get_event_loop().time()
+        kind = type(message).__name__
+        data = getattr(message, "data", None) or {}
+        sid = getattr(message, "session_id", None) or data.get("session_id")
+        if sid and sid != self.session_id:
+            self.session_id = sid
+            self._save_session()
+        if kind == "TaskStartedMessage":
+            tid = data.get("task_id")
+            if tid:
+                self.shells[tid] = {
+                    "desc": data.get("description") or "(task)",
+                    "type": data.get("task_type") or "task",
+                }
+        elif kind in ("TaskUpdatedMessage", "TaskNotificationMessage"):
+            tid = data.get("task_id")
+            status = data.get("status") or (data.get("patch") or {}).get("status")
+            if tid and status in ("completed", "failed", "cancelled", "killed", "error"):
+                self.shells.pop(tid, None)
+
+    async def _read_loop(self) -> None:
+        """Drain the SDK stream forever. Route each segment to the right renderer:
+        a segment that follows one of our queries is a USER turn; any other segment
+        is one Claude started on its own (relayed via the spontaneous sink)."""
+        client = self._client
+        try:
+            async for message in client.receive_messages():
+                self._track(message)
+                kind = type(message).__name__
+                sub = getattr(message, "subtype", None)
+                # Segment start: every turn (ours or self-started) opens with init.
+                if kind == "SystemMessage" and sub == "init":
+                    self.in_segment = True
+                    self._seg_started_ts = asyncio.get_event_loop().time()
+                    self._cur_is_user = self._awaiting_user_segment
+                    self._awaiting_user_segment = False
+                    mdl = (getattr(message, "data", None) or {}).get("model")
+                    if mdl:
+                        self.model = mdl
+                elif not self.in_segment and kind in (
+                    "AssistantMessage", "UserMessage", "StreamEvent"
+                ):
+                    # Defensive: content without a preceding init — open a segment.
+                    self.in_segment = True
+                    self._seg_started_ts = asyncio.get_event_loop().time()
+                    self._cur_is_user = self._awaiting_user_segment
+                    self._awaiting_user_segment = False
+
+                sink = self._user_sink if self._cur_is_user else self._spontaneous_sink
+                if sink is not None:
+                    try:
+                        await sink(message)
+                    except Exception:
+                        log.exception("stream sink error")
+
+                if kind == "ResultMessage":
+                    self.in_segment = False
+                    if self._cur_is_user:
+                        self._segment_done.set()
+                    self._cur_is_user = False
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("reader loop ended")
+
+    def status(self) -> dict:
+        """A snapshot of the Claude INSTANCE state, for the watchdog poll."""
+        now = asyncio.get_event_loop().time()
+        return {
+            "active": self.in_segment,
+            "segment_secs": (now - self._seg_started_ts) if self.in_segment else 0,
+            "shells": [dict(v) for v in self.shells.values()],
+            "idle_secs": now - self.last_activity if self.last_activity else 0,
+            "connected": self._client is not None,
+        }
+
     # --- turns ---------------------------------------------------------------
     async def ask(self, prompt: str, on_event, on_system=None) -> None:
+        """Send a user prompt and return when ITS reply turn ends. The reader keeps
+        running afterwards, so any turns Claude later starts on its own are still
+        relayed (via the spontaneous sink) without another user message."""
         async with self._lock:
-            self.busy = True
             self._on_system = on_system
+            self._user_sink = on_event
             try:
                 await self._ensure_connected()
+                self._segment_done.clear()
+                self._awaiting_user_segment = True
                 await self._client.query(prompt)
-                async for message in self._client.receive_response():
-                    sid = getattr(message, "session_id", None)
-                    if sid and sid != self.session_id:
-                        self.session_id = sid
-                        self._save_session()
-                    if getattr(message, "subtype", None) == "init":
-                        mdl = (getattr(message, "data", None) or {}).get("model")
-                        if mdl:
-                            self.model = mdl
-                    await on_event(message)
+                await self._segment_done.wait()
             finally:
-                self.busy = False
+                self._user_sink = None
                 self._on_system = None
 
     async def context_usage(self):
@@ -369,6 +482,8 @@ class ClaudeController:
         when a turn is stuck."""
         killed = sigkill_claude_subtree()
         client = self._client
+        self._stop_reader()
+        self._reset_live_state()
         self._client = None  # force a reconnect on the next ask()
         if client is not None:
             try:
@@ -385,6 +500,8 @@ class ClaudeController:
             except Exception:
                 pass
         async with self._lock:
+            self._stop_reader()
+            self._reset_live_state()
             if self._client is not None:
                 try:
                     await self._client.disconnect()
@@ -393,3 +510,12 @@ class ClaudeController:
                 self._client = None
             self.session_id = None
             self._save_session()
+
+    def _reset_live_state(self) -> None:
+        """Forget the live picture when the CLI goes away (its background shells die
+        with it). A fresh connection starts with a clean watchdog view."""
+        self.in_segment = False
+        self._cur_is_user = False
+        self._awaiting_user_segment = False
+        self.shells.clear()
+        self._segment_done.set()  # release any ask() waiting on a now-dead client
