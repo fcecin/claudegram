@@ -83,9 +83,13 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   positives are recorded to `HACKING_REGRESSIONS.md` so they don't recur.
 - **Full logging**: every turn — request, thinking, each tool + result, the full
   answer, compaction, completion, blocks + reasons — is written to `claudegram.log`.
+- **Sleep mode**: `bot sleep` pauses **all** Telegram input — Claude keeps running (and
+  any background work continues), but messages are ignored and answered with "sleep mode
+  engaged, no input accepted". Distinct from `lock` (security) and `kill` (process): the
+  only way out is the **WAKE UP** button on the tray app at the machine.
 - **Tray app**: live console, auto-restart on crash, single-instance, autostart at
-  login, and buttons: **Unblock**, **Unlock & add regression**, **Restart bot**,
-  **Clear logs**.
+  login, and buttons: **Unblock**, **Unlock & add regression**, **WAKE UP** (exit sleep),
+  **Restart bot**, **Clear logs**.
 
 ## "bot" commands
 
@@ -100,6 +104,7 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `bot stop` | interrupt the current task (Esc/Ctrl-C — graceful) |
 | `bot kill` | `kill -9` the Claude process; it respawns (resuming the session) |
 | `bot lock` | `bot kill` **and** lock the bridge — unlock only at the machine |
+| `bot sleep` | pause **all Telegram input** (Claude keeps running); wake only at the machine |
 | `bot effort [level]` | show, or set, reasoning effort: `low\|medium\|high\|xhigh\|max` |
 | `bot cwd [path]` | show, or switch, Claude's working directory (the conversation **migrates** with you — same id) |
 | `bot context` | detailed context-window usage breakdown |
@@ -159,7 +164,7 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `HACKING_REGRESSIONS.md` | curated false positives the firewall must never block | yes |
 | `.env.example` | template for `.env` | yes |
 | `.env`, `token.txt` | **secrets** — never commit | no |
-| `session.id`, `effort.level`, `cwd.path`, `BLOCKED.flag` | runtime state | no |
+| `session.id`, `effort.level`, `cwd.path`, `BLOCKED.flag`, `SLEEP.flag` | runtime state | no |
 | `outbox/`, `inbox/` | `[HARNESS]` message drop dirs (transient) | no |
 | `claudegram.log` | full per-turn transcript (Clear-logs button truncates) | no |
 

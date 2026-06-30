@@ -48,6 +48,13 @@ continuous reader relays them.
 - **phone → machine/AI**: `bot harness <msg>` / `bot h <msg>` writes to `inbox/`. Helper:
   `./cg-inbox` (drain), `--peek`, or `--wait` (block until one; loop primitive).
 
+## Sleep mode (distinct from lock/kill)
+`bot sleep` writes `SLEEP.flag`; while it exists, `handle_text`/`handle_audio` ignore
+**all** Telegram input (even `bot` commands) and reply `SLEEP_MSG` — but Claude keeps
+running (background work continues). The ONLY exit is the tray's **WAKE UP** button
+(`gui.py` deletes `SLEEP.flag`, watched on the 2s timer). Not a security state (unlike
+the firewall lock) and doesn't kill anything (unlike `bot kill`).
+
 ## Firewall
 Lean guard preamble per prompt; a genuine malicious request makes Claude reply leading
 with `HACKING ATTEMPT BLOCKED` + reason → bridge writes `BLOCKED.flag` (hard lock) until

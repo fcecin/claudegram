@@ -209,6 +209,7 @@ def sweep_audio_tmp() -> None:
 
 SENTINEL = "HACKING ATTEMPT BLOCKED"
 BLOCK_FILE = HERE / "BLOCKED.flag"
+SLEEP_FILE = HERE / "SLEEP.flag"  # presence = sleep mode: Telegram input paused
 REGRESSIONS_FILE = HERE / "HACKING_REGRESSIONS.md"  # curated list of false positives
 
 # The model is capable; a sane prompt + the regressions list converges. Almost
@@ -248,6 +249,27 @@ def engage_block(reason: str) -> None:
     except OSError:
         log.exception("Could not write block flag")
     log.warning("🔒 BLOCKED — %s", reason)
+
+
+# --- sleep mode: pause Telegram input while keeping Claude running ------------
+# Distinct from lock (firewall/security, kills Claude) and kill (SIGKILL): sleep just
+# ignores incoming Telegram messages. Claude keeps running (any background work too);
+# the only way out is the WAKE button on the tray app at the machine.
+SLEEP_MSG = "😴 sleep mode engaged, no input accepted (wake from the tray on the PC)"
+
+
+def is_sleeping() -> bool:
+    return SLEEP_FILE.exists()
+
+
+def engage_sleep() -> None:
+    try:
+        SLEEP_FILE.write_text(
+            f"slept_at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8"
+        )
+    except OSError:
+        log.exception("Could not write sleep flag")
+    log.warning("😴 SLEEP — Telegram input paused (wake at the machine)")
 
 
 def sentinel_tripped(text: str) -> bool:
@@ -303,6 +325,12 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     media = msg.voice or msg.audio or msg.video_note or msg.video
     if media is None:
+        return
+
+    # Sleep mode: ignore ALL Telegram input (don't even transcribe).
+    if is_sleeping():
+        log.info("Ignoring audio — sleep mode engaged")
+        await msg.reply_text(SLEEP_MSG)
         return
 
     user = msg.from_user
@@ -926,6 +954,9 @@ def classify_bot_command(rest: str):
         return "kill"
     if norm in ("lock", "lockdown", "lock down", "panic", "emergency"):
         return "lock"
+    if norm in ("sleep", "sleep mode", "pause", "dnd", "do not disturb", "quiet",
+                "go to sleep", "sleep now"):
+        return "sleep"
     if norm in ("compact", "compaction", "compact context", "compact session"):
         return "compact"
     if norm in ("restart", "restart bridge", "reboot", "reload"):
@@ -950,6 +981,7 @@ BOT_HELP = (
     "• bot stop — interrupt the current task (Esc/Ctrl-C)\n"
     "• bot kill — force-kill the Claude process (kill -9), then respawn\n"
     "• bot lock — kill Claude AND lock the bridge (unlock at the machine)\n"
+    "• bot sleep — pause Telegram input (Claude keeps running); wake at the machine\n"
     "• bot effort [level] — show/set reasoning effort (low|medium|high|xhigh|max)\n"
     "• bot cwd [path] — show/set Claude's working directory\n"
     "• bot context — detailed context-window usage\n"
@@ -980,11 +1012,12 @@ async def _status_text() -> str:
     sid_str = (sid[:8] + "…") if sid else "new (none yet)"
     eff = controller.get_effort() or "default"
     blocked = " · 🔒 LOCKED" if is_blocked() else ""
+    sleeping = " · 😴 SLEEPING" if is_sleeping() else ""
     ctx = await controller.context_usage()
     ctx_str = f" · ctx {ctx['percentage']:.0f}%" if ctx else ""
     return (
         f"✅ Bridge OK · Claude {busy} · model {controller.model or 'default'} · "
-        f"effort {eff} · session {sid_str}{ctx_str}{blocked} · cwd {controller.get_cwd()}"
+        f"effort {eff} · session {sid_str}{ctx_str}{blocked}{sleeping} · cwd {controller.get_cwd()}"
     )
 
 
@@ -1132,6 +1165,12 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
             f"🔒 LOCKED{extra}. Claude killed and the bridge is locked. "
             "Unblock it from the tray app on the machine."
         )
+    elif action == "sleep":
+        engage_sleep()
+        await reply(
+            "😴 Sleep mode engaged — no input accepted. Claude keeps running; I'll just "
+            "ignore Telegram until you press WAKE UP on the tray app at the machine."
+        )
     elif action == "compact":
         # Send a raw /compact (no guard prefix) and stream the outcome.
         await dispatch_to_claude(
@@ -1167,6 +1206,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not text:
         return
     log.info("Text from %s: %s", msg.from_user.id if msg.from_user else "?", text)
+    # Sleep mode: ignore ALL Telegram input (wake only at the machine).
+    if is_sleeping():
+        log.info("Ignoring text — sleep mode engaged")
+        await msg.reply_text(SLEEP_MSG)
+        return
     # "bot ..." messages are harness commands and never reach Claude.
     if await maybe_handle_bot_command(context, msg.chat_id, msg.message_id, text):
         return
@@ -1290,6 +1334,7 @@ async def on_startup(application) -> None:
         f"⚙️ effort: {controller.get_effort() or 'default'}\n"
         f"🎙 transcribe: {MODEL_SIZE}/{COMPUTE_TYPE}"
         + ("\n🔒 LOCKED — unblock at the machine to resume" if is_blocked() else "")
+        + ("\n😴 SLEEPING — input paused; press WAKE UP on the tray to resume" if is_sleeping() else "")
     )
     for uid in sorted(ALLOWED_USER_IDS):
         try:

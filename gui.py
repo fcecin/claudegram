@@ -39,6 +39,7 @@ BOT = str(HERE / "bot.py")
 APP_ID = "claudegram-gui"  # single-instance key (one instance per user session)
 LOG_FILE = HERE / "claudegram.log"   # persistent copy of the bot's output
 BLOCK_FILE = HERE / "BLOCKED.flag"   # presence = bridge is locked (firewall trip)
+SLEEP_FILE = HERE / "SLEEP.flag"     # presence = sleep mode (Telegram input paused)
 REGRESSIONS_FILE = HERE / "HACKING_REGRESSIONS.md"  # false-positive list to append to
 
 MAX_FAST_FAILS = 6      # give up auto-restart after this many quick crashes
@@ -105,6 +106,10 @@ class Supervisor(QMainWindow):
         self.act_regress.triggered.connect(self.unblock_and_regress)
         self.act_regress.setVisible(False)
         tb.addAction(self.act_regress)
+        self.act_wake = QAction("☀️ WAKE UP", self)
+        self.act_wake.triggered.connect(self.wake)
+        self.act_wake.setVisible(False)
+        tb.addAction(self.act_wake)
         act_clear = QAction("Clear logs", self)
         act_clear.triggered.connect(self.clear_logs)
         tb.addAction(act_clear)
@@ -126,18 +131,23 @@ class Supervisor(QMainWindow):
         self.tray_unblock.setVisible(False)
         self.tray_regress = menu.addAction("🔓 Unlock & add regression", self.unblock_and_regress)
         self.tray_regress.setVisible(False)
+        self.tray_wake = menu.addAction("☀️ Wake up (exit sleep)", self.wake)
+        self.tray_wake.setVisible(False)
         menu.addSeparator()
         menu.addAction("Quit", self.quit_app)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
 
-        # Watch the firewall BLOCK flag and reflect the locked state in the tray.
+        # Watch the firewall BLOCK flag and the SLEEP flag; reflect them in the tray.
         self._was_blocked = None
+        self._was_sleeping = None
         self._block_timer = QTimer(self)
         self._block_timer.timeout.connect(self._check_block)
+        self._block_timer.timeout.connect(self._check_sleep)
         self._block_timer.start(2000)
         self._check_block()
+        self._check_sleep()
 
         self.start_bot()
 
@@ -208,6 +218,40 @@ class Supervisor(QMainWindow):
             "Unblocked and added to the regressions list — it won't block this again.",
             self.icon,
             5000,
+        )
+
+    # --- sleep state (Telegram input paused; Claude keeps running) ------------
+    def _check_sleep(self) -> None:
+        sleeping = SLEEP_FILE.exists()
+        for act in (self.act_wake, self.tray_wake):
+            act.setVisible(sleeping)
+        if sleeping == self._was_sleeping:
+            return
+        self._was_sleeping = sleeping
+        if sleeping:
+            self.set_status("😴 SLEEP — Telegram input paused")
+            self.append(
+                "\n[supervisor] 😴 SLEEP mode — Telegram input is paused (Claude keeps "
+                "running). Click 'WAKE UP' to resume accepting input.\n"
+            )
+            self.tray.showMessage(
+                "claudegram — sleeping 😴",
+                "Telegram input is paused. Click the tray icon → 'Wake up' to resume.",
+                self.icon,
+                6000,
+            )
+        elif not BLOCK_FILE.exists():
+            self.set_status("running")
+
+    def wake(self) -> None:
+        try:
+            SLEEP_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self.append("\n[supervisor] ☀️ Woken at the machine — Telegram input resumes.\n")
+        self._check_sleep()
+        self.tray.showMessage(
+            "claudegram", "Awake — Telegram input resumes.", self.icon, 4000
         )
 
     # --- bot process management ----------------------------------------------

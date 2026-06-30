@@ -35,4 +35,5 @@ for f in "$INBOX"/*.msg; do
   cat "$f"; echo
   [ "$mode" != "peek" ] && rm -f "$f"
 done
-[ "$found" -eq 0 ] && echo "(inbox empty)"
+if [ "$found" -eq 0 ]; then echo "(inbox empty)"; fi
+exit 0
