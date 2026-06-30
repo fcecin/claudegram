@@ -183,6 +183,7 @@ LOG_PATH = HERE / "claudegram.log"   # bridge log (written by the tray superviso
 AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # transient voice files
 VOICE_TMP = Path(tempfile.gettempdir()) / "claudegram_voiceback"  # transient TTS output
 IMAGE_TMP = Path(tempfile.gettempdir()) / "claudegram_images"  # incoming images (kept until Claude's turn Reads them; swept at startup)
+IMAGE_MAX_AGE = 6 * 3600  # also prune cached images older than this on each new one (self-bound for long no-restart sessions)
 HARNESS_OUTBOX = HERE / "outbox"     # drop dir: any program leaves a msg -> sent to phone
 HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by the AI here
 controller = ClaudeController(
@@ -1904,6 +1905,21 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
     return True
 
 
+def prune_old_images() -> None:
+    """Delete cached images older than IMAGE_MAX_AGE so a long no-restart session doesn't pile
+    them up. Safe: a freshly-queued image is seconds old, never near the threshold."""
+    try:
+        cutoff = time.time() - IMAGE_MAX_AGE
+        for f in IMAGE_TMP.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """An image IS the input — no transcription (unlike audio). Download it and hand Claude
     the path (+ caption if any); Claude views it with the Read tool. Same state-machinery as
@@ -1942,6 +1958,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Download to a dedicated dir. UNLIKE audio we do NOT delete it here: Claude reads the
     # file during its (later) turn. Leftovers are swept at startup.
     IMAGE_TMP.mkdir(parents=True, exist_ok=True)
+    prune_old_images()  # self-bound: drop cached images older than IMAGE_MAX_AGE
     ext = ".jpg"
     fname = getattr(media, "file_name", None)
     if fname and "." in fname:
