@@ -144,13 +144,46 @@ def get_model() -> WhisperModel:
     return _model
 
 
-def transcribe(path: str) -> dict:
-    """Blocking transcription. Returns text + diagnostics for quality testing."""
+PROGRESS_INTERVAL = 30.0  # seconds between transcription progress callbacks
+
+
+def transcribe(path: str, progress_cb=None) -> dict:
+    """Blocking transcription. Returns text + diagnostics for quality testing. If
+    progress_cb is given it is called as (pct, eta_secs, elapsed_secs) at most every
+    PROGRESS_INTERVAL seconds while consuming the audio (faster-whisper exposes each
+    segment's .end position, and info.duration is the total) — handy for long clips."""
     model = get_model()
     t0 = time.monotonic()
     segments, info = model.transcribe(path, language=LANGUAGE, beam_size=5, vad_filter=True)
+    duration = info.duration or 0.0
     # segments is a generator; consuming it is where the work actually happens.
-    text = "".join(seg.text for seg in segments).strip()
+    parts = []
+    last_report = t0
+    prev_done = prev_elapsed = 0.0
+    reports = 0
+    for seg in segments:
+        parts.append(seg.text)
+        if progress_cb and duration > 0:
+            now = time.monotonic()
+            if now - last_report >= PROGRESS_INTERVAL:
+                last_report = now
+                done = min(max(seg.end / duration, 0.0), 1.0)
+                elapsed = now - t0
+                # ETA from the RECENT rate (between reports) — excludes the one-time
+                # language-detect/warmup that skews a cumulative estimate. None on the
+                # first report (no baseline yet).
+                eta = None
+                if reports >= 1:
+                    d_done, d_elapsed = done - prev_done, elapsed - prev_elapsed
+                    if d_done > 0 and d_elapsed > 0:
+                        eta = (1.0 - done) / (d_done / d_elapsed)
+                prev_done, prev_elapsed = done, elapsed
+                reports += 1
+                try:
+                    progress_cb(done * 100.0, eta, elapsed)
+                except Exception:
+                    pass
+    text = "".join(parts).strip()
     return {
         "text": text,
         "language": info.language,
@@ -529,13 +562,36 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         tg_file = await context.bot.get_file(media.file_id)
         await tg_file.download_to_drive(tmp_path)
-        # Transcription is CPU-bound and blocking — keep the event loop free.
+        # Transcription is CPU-bound and blocking — keep the event loop free, and post a
+        # live progress bubble (% + ETA, refreshed ~every 30s) since large-v3 on CPU is slow.
+        loop = asyncio.get_running_loop()
+        prog = await context.bot.send_message(
+            msg.chat_id, "🎙 Transcribing…", reply_to_message_id=msg.message_id)
+        mark_sent()
+
+        def progress_cb(pct, eta, elapsed):
+            # Called from the worker thread — marshal the edit onto the event loop.
+            eta_str = f" · ~{int(eta)}s left" if (eta and eta > 1) else ""
+            text = f"🎙 Transcribing… {pct:.0f}%{eta_str}"
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    context.bot.edit_message_text(
+                        text, chat_id=msg.chat_id, message_id=prog.message_id), loop)
+                fut.result(timeout=10)
+            except Exception:
+                pass  # "message is not modified" / transient — ignore
+
         try:
-            result = await asyncio.to_thread(transcribe, tmp_path)
+            result = await asyncio.to_thread(transcribe, tmp_path, progress_cb)
         except Exception:
             log.exception("Transcription failed")
             await msg.reply_text("⚠️ Sorry, I couldn't transcribe that.")
             return
+        finally:
+            try:
+                await context.bot.delete_message(msg.chat_id, prog.message_id)
+            except Exception:
+                pass
     finally:
         try:
             os.remove(tmp_path)  # delete the audio as soon as transcription ends
