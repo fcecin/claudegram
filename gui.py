@@ -28,9 +28,12 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QPushButton,
+    QSizePolicy,
     QStatusBar,
     QSystemTrayIcon,
     QToolBar,
+    QWidget,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -42,6 +45,37 @@ BLOCK_FILE = HERE / "BLOCKED.flag"   # presence = bridge is locked (firewall tri
 SLEEP_FILE = HERE / "SLEEP.flag"     # presence = sleep mode (Telegram input paused)
 INTRUSION_OFF_FILE = HERE / "INTRUSION_OFF.flag"  # presence = paranoid intrusion gate OFF (default ON)
 REGRESSIONS_FILE = HERE / "HACKING_REGRESSIONS.md"  # false-positive list to append to
+
+# Toolbar buttons get real chrome (border, hover highlight, pressed feedback) instead of
+# flat text. Explicit colors so it looks deliberate under any system theme; blue accent
+# matches the tray icon.
+TOOLBAR_CSS = """
+QToolBar { spacing: 6px; padding: 5px; }
+QToolButton {
+    background: #f0f1f3; color: #1f2937;
+    border: 1px solid #c4c8cf; border-radius: 6px;
+    padding: 6px 14px; font-weight: 600;
+}
+QToolButton:hover { background: #e3effb; border-color: #2b6cb0; }
+QToolButton:pressed { background: #cfe0f4; border-color: #2b6cb0; }
+"""
+# Intrusion toggle: a physical switch — green & sunken when ON, grey & raised when OFF.
+INTRUSION_ON_CSS = """
+QPushButton {
+    background: #2e9e4f; color: white;
+    border: 3px inset #1c6b34; border-radius: 6px;
+    padding: 6px 18px; font-weight: 700;
+}
+QPushButton:hover { background: #34b259; }
+"""
+INTRUSION_OFF_CSS = """
+QPushButton {
+    background: #e6e8eb; color: #5a5f66;
+    border: 3px outset #c0c4cb; border-radius: 6px;
+    padding: 6px 18px; font-weight: 700;
+}
+QPushButton:hover { background: #eef0f3; }
+"""
 
 MAX_FAST_FAILS = 6      # give up auto-restart after this many quick crashes
 FAST_FAIL_SECS = 10_000  # an exit sooner than this (ms) counts as a "fast fail"
@@ -95,6 +129,7 @@ class Supervisor(QMainWindow):
 
         tb = QToolBar()
         tb.setMovable(False)
+        tb.setStyleSheet(TOOLBAR_CSS)
         self.addToolBar(tb)
         act_restart = QAction("Restart bot", self)
         act_restart.triggered.connect(self.restart_bot)
@@ -111,19 +146,25 @@ class Supervisor(QMainWindow):
         self.act_wake.triggered.connect(self.wake)
         self.act_wake.setVisible(False)
         tb.addAction(self.act_wake)
-        self.act_intrusion = QAction("🛡 Intrusion lock: ON", self)
-        self.act_intrusion.setCheckable(True)
-        self.act_intrusion.setToolTip(
-            "ON: a message from any non-allowed Telegram user hard-locks the bridge "
-            "(kills Claude + locks) and alerts you. Toggle here only — never remotely.")
-        self.act_intrusion.triggered.connect(self.toggle_intrusion)
-        tb.addAction(self.act_intrusion)
         act_clear = QAction("Clear logs", self)
         act_clear.triggered.connect(self.clear_logs)
         tb.addAction(act_clear)
         act_hide = QAction("Hide to tray", self)
         act_hide.triggered.connect(self.hide)
         tb.addAction(act_hide)
+        # Intrusion lock: a real checkable on/off switch, pushed to the far right and
+        # visually distinct from the action buttons.
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
+        self.intrusion_btn = QPushButton("🛡 Intrusion Lock")
+        self.intrusion_btn.setCheckable(True)
+        self.intrusion_btn.setCursor(Qt.PointingHandCursor)
+        self.intrusion_btn.setToolTip(
+            "ON: a message from any non-allowed Telegram user hard-locks the bridge "
+            "(kills Claude + locks) and alerts you. Toggle here only — never remotely.")
+        self.intrusion_btn.clicked.connect(self.toggle_intrusion)
+        tb.addWidget(self.intrusion_btn)
 
         self.setStatusBar(QStatusBar())
         self.status_label = QLabel("starting…")
@@ -251,9 +292,11 @@ class Supervisor(QMainWindow):
 
     def _refresh_intrusion(self) -> None:
         on = not INTRUSION_OFF_FILE.exists()
-        for act in (self.act_intrusion, self.tray_intrusion):
-            act.setChecked(on)
-            act.setText(f"🛡 Intrusion lock: {'ON' if on else 'OFF'}")
+        self.intrusion_btn.setChecked(on)
+        self.intrusion_btn.setText(f"🛡 Intrusion Lock: {'ON' if on else 'OFF'}")
+        self.intrusion_btn.setStyleSheet(INTRUSION_ON_CSS if on else INTRUSION_OFF_CSS)
+        self.tray_intrusion.setChecked(on)
+        self.tray_intrusion.setText(f"🛡 Intrusion lock: {'ON' if on else 'OFF'}")
 
     # --- sleep state (Telegram input paused; Claude keeps running) ------------
     def _check_sleep(self) -> None:
