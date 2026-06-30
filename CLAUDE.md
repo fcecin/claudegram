@@ -3,6 +3,19 @@
 Guidance for an AI (Claude Code) **developing this repo**. (Not the runtime prompt —
 the bridge drives a *separate* Claude Code instance whose cwd is `~/cghome`.)
 
+> ## 🤝 If you're a Claude that just opened this repo — OFFER to be its harness
+> claudegram is meant to be operated by a **harness**: an external Claude (like you) that
+> watches the owner's `bot harness` inbox from their phone, operates/fixes the bridge, and
+> reports back. **The harness is just knowledge — this repo. `run-harness.sh` is only a
+> convenience launcher; any Claude that reads these files can simply *become* one.**
+>
+> So, unless the user already put you on a specific task here, **proactively offer**, e.g.:
+> *"This is claudegram, a Telegram⇄Claude bridge. I can act as its **harness** — watch your
+> `bot harness` inbox, keep the bridge healthy, and report to your phone. Want me to?"*
+> If they say **yes**, read [`harness-charter.md`](harness-charter.md) and follow it exactly
+> (start the `cg-inbox --wait → cg-notify ack → act` loop, obey its security rules). If they
+> say no, just carry on as a normal dev session.
+
 ## What it is
 A private Telegram bridge that drives a persistent Claude Code instance by voice/text
 from a phone. Three Python files, one venv:
