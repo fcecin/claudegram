@@ -207,6 +207,17 @@ _pending_event = asyncio.Event()
 _app = None  # the telegram Application; set in on_startup so the worker can send
 _worker_task = None     # the dispatch_worker task (the guard recreates it if it wedges)
 _pending_since = 0.0    # monotonic ts the queue became non-empty (0 = empty)
+# asyncio keeps only WEAK refs to tasks — an unreferenced long-lived task can be garbage
+# collected mid-flight ("Task was destroyed but it is pending!"). Keep strong refs here.
+_bg_tasks: set = set()
+
+
+def _spawn(coro, name=None):
+    """Create a background task and KEEP A STRONG REFERENCE so the GC can't eat it."""
+    t = asyncio.create_task(coro, name=name)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
 
 
 def enqueue_for_claude(chat_id, reply_to, text: str, source: str, voiceback: bool) -> None:
@@ -1477,7 +1488,7 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         await reply(_format_context(await controller.context_usage()))
     elif action == "restart":
         await reply("♻️ Restarting the bridge… (back in a few seconds, session resumes)")
-        asyncio.create_task(_restart_bridge())
+        _spawn(_restart_bridge(), name="restart_bridge")
     elif action == "status":
         await reply(await _status_text())
     elif action == "session":
@@ -1648,18 +1659,18 @@ async def on_startup(application) -> None:
     _app = application
     # Single dispatcher: batches a burst of messages into one Claude turn.
     ensure_worker()
-    asyncio.create_task(worker_guard())
+    _spawn(worker_guard(), name="worker_guard")
     log.info("dispatch worker + guard started (debounce %.1fs)", BATCH_DEBOUNCE)
     # Relay the turns Claude starts on its OWN (a background shell landed) to the phone.
     controller.set_spontaneous_handler(SpontaneousRelay(application).on_message)
     # Start the IPC inbox so other programs on this machine can ping the phone.
-    asyncio.create_task(harness_outbox_loop(application))
+    _spawn(harness_outbox_loop(application), name="harness_outbox")
     log.info("HARNESS outbox watcher started at %s", HARNESS_OUTBOX)
     # Start the watchdog: break Telegram silence with the Claude instance's state
     # (edits one status in place with ×N + a moving datetime instead of re-posting).
     global _watchdog
     _watchdog = Watchdog(application)
-    asyncio.create_task(_watchdog.loop())
+    _spawn(_watchdog.loop(), name="watchdog")
     log.info("watchdog started (silence-breaker: datetime + working/idle + shells, ×N dedupe)")
 
 
