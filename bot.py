@@ -20,11 +20,13 @@ Configuration (env vars, or a .env file in this directory):
 
 import asyncio
 import atexit
+import json
 import logging
 import os
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import types
@@ -32,7 +34,6 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from faster_whisper import WhisperModel
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -92,16 +93,18 @@ def load_token() -> str:
     return token
 
 
-# --- Whisper model (loaded once, transcription runs in a thread pool) ----------
-
-# Defaults tuned for maximum accuracy: the largest model at full precision.
-# This is CPU-heavy but correctness matters more than latency here.
+# --- Whisper transcription config -----------------------------------------------
+#
+# The model loads and runs in a SEPARATE process (transcribe_worker.py) so a stalled
+# decode can be killed — a thread cannot. These WHISPER_* values are read here only for the
+# `bot test` status line; the worker reads them itself (inherited via the environment,
+# including WHISPER_LANGUAGE). Defaults: the largest model at full precision (accuracy over
+# latency); set WHISPER_COMPUTE_TYPE=int8_float32 / int8 in .env to trade accuracy for speed.
 MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3").strip()
 DEVICE = os.environ.get("WHISPER_DEVICE", "cpu").strip()
 COMPUTE_TYPE = os.environ.get(
     "WHISPER_COMPUTE_TYPE", "float32" if DEVICE == "cpu" else "float16"
 ).strip()
-LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "").strip() or None
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -126,72 +129,22 @@ def is_authorized(update: Update) -> bool:
     return user is not None and user.id in ALLOWED_USER_IDS
 
 
-_model: WhisperModel | None = None
+# --- Transcription (runs in a killable subprocess; see transcribe_worker.py) ----
 
-
-def get_model() -> WhisperModel:
-    global _model
-    if _model is None:
-        log.info(
-            "Loading whisper model '%s' (device=%s, compute=%s) — "
-            "first run downloads it, please wait...",
-            MODEL_SIZE,
-            DEVICE,
-            COMPUTE_TYPE,
-        )
-        _model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-        log.info("Model loaded.")
-    return _model
-
-
-PROGRESS_INTERVAL = 10.0     # min seconds between %/ETA recomputes (gated by segment yields)
 TRANSCRIBE_HEARTBEAT = 10.0  # fixed cadence to re-edit the bubble (moving datetime = alive)
 
-
-def transcribe(path: str, progress_cb=None) -> dict:
-    """Blocking transcription. Returns text + diagnostics for quality testing. If
-    progress_cb is given it is called as (pct, eta_secs, elapsed_secs) at most every
-    PROGRESS_INTERVAL seconds while consuming the audio (faster-whisper exposes each
-    segment's .end position, and info.duration is the total) — handy for long clips."""
-    model = get_model()
-    t0 = time.monotonic()
-    segments, info = model.transcribe(path, language=LANGUAGE, beam_size=5, vad_filter=True)
-    duration = info.duration or 0.0
-    # segments is a generator; consuming it is where the work actually happens.
-    parts = []
-    last_report = t0
-    prev_done = prev_elapsed = 0.0
-    reports = 0
-    for seg in segments:
-        parts.append(seg.text)
-        if progress_cb and duration > 0:
-            now = time.monotonic()
-            if now - last_report >= PROGRESS_INTERVAL:
-                last_report = now
-                done = min(max(seg.end / duration, 0.0), 1.0)
-                elapsed = now - t0
-                # ETA from the RECENT rate (between reports) — excludes the one-time
-                # language-detect/warmup that skews a cumulative estimate. None on the
-                # first report (no baseline yet).
-                eta = None
-                if reports >= 1:
-                    d_done, d_elapsed = done - prev_done, elapsed - prev_elapsed
-                    if d_done > 0 and d_elapsed > 0:
-                        eta = (1.0 - done) / (d_done / d_elapsed)
-                prev_done, prev_elapsed = done, elapsed
-                reports += 1
-                try:
-                    progress_cb(done * 100.0, eta, elapsed)
-                except Exception:
-                    pass
-    text = "".join(parts).strip()
-    return {
-        "text": text,
-        "language": info.language,
-        "language_probability": info.language_probability,
-        "audio_seconds": info.duration,
-        "elapsed_seconds": time.monotonic() - t0,
-    }
+# Decoder watchdog. The live path runs the decode as a KILLABLE SUBPROCESS
+# (transcribe_worker.py) — not a thread, because a thread cannot be killed. If the decode
+# overruns its budget (a stalled/looping whisper, a wedged process) the watchdog kills it,
+# so a bad clip can never freeze the bridge again. Budget is generous: a slow-but-healthy
+# clip survives; only a genuine runaway gets the axe.
+TRANSCRIBE_BUDGET_FACTOR = 6.0      # kill past audio_duration × this …
+TRANSCRIBE_MIN_BUDGET = 120.0       # … but never before this (protects tiny clips)
+TRANSCRIBE_NODUR_BUDGET = 900.0     # hard cap when the clip's duration is unknown
+# The %/ETA shown in the bubble are the REAL ones: the worker subprocess streams
+# `PROGRESS <pct> <eta>` lines on stdout (computed from seg.end / audio duration) and the
+# parent reads them live. The clock advances on its own 10s timer regardless, so even while
+# a long segment decodes (no fresh %), the bubble still proves the bridge is alive.
 
 
 # --- Claude Code control ------------------------------------------------------
@@ -584,54 +537,153 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         tg_file = await context.bot.get_file(media.file_id)
         await tg_file.download_to_drive(tmp_path)
-        # Transcription is CPU-bound and blocking — keep the event loop free, and post a
-        # live progress bubble. DECOUPLE the display from faster-whisper's choppy segment
-        # yields: a heartbeat re-edits the bubble on a FIXED clock (moving datetime + the
-        # latest %/ETA) so it always looks alive even while whisper grinds one long segment.
-        # If the clock moves but % is frozen, the chop is whisper, not us.
+        # Transcription is CPU-bound, blocking, and CAN STALL OR LOOP FOREVER (whisper's
+        # repetition bug; a wedged process). So it runs as a KILLABLE SUBPROCESS
+        # (transcribe_worker.py) — not a thread, because a thread cannot be killed. A
+        # watchdog kills it if it overruns its budget, so a bad clip can never freeze the
+        # bridge. A heartbeat re-edits the bubble on a FIXED clock (moving datetime = the
+        # bridge is alive) with a smooth time-based %/ETA estimate alongside (the numbers
+        # may lie; the moving clock is the truth).
         prog = await context.bot.send_message(
             msg.chat_id, "🎙 Transcribing…", reply_to_message_id=msg.message_id)
         mark_sent()
-        prog_state = {"pct": 0.0, "eta": None}
 
-        def progress_cb(pct, eta, elapsed):
-            prog_state["pct"], prog_state["eta"] = pct, eta  # set from the worker thread
+        audio_dur = float(getattr(media, "duration", 0) or 0)
+        budget = (max(TRANSCRIBE_MIN_BUDGET, audio_dur * TRANSCRIBE_BUDGET_FACTOR)
+                  if audio_dur > 0 else TRANSCRIBE_NODUR_BUDGET)
+        t_start = time.monotonic()
+        prog_state = {"pct": 0.0, "eta": -1.0}  # REAL %/ETA, streamed from the worker
 
         async def _transcribe_heartbeat():
+            # Independent clock + decoder watchdog. Re-edits the bubble every
+            # TRANSCRIBE_HEARTBEAT seconds with a fresh datetime (= bridge alive) + the latest
+            # real %/ETA. THIS LOOP MUST NOT DIE: every iteration is wrapped and every failure
+            # is LOGGED, never swallowed; the edit is timeout-bounded so a hung Telegram call
+            # cannot freeze the clock. If the clock ever goes silent again, the log says why.
+            ticks = 0
             while True:
-                await asyncio.sleep(TRANSCRIBE_HEARTBEAT)
-                pct, eta = prog_state["pct"], prog_state["eta"]
-                pct_str = f" {pct:.0f}%" if pct > 0 else ""
-                eta_str = f" · ~{int(eta)}s left" if (eta and eta > 1) else ""
-                text = f"🕐 {time.strftime('%H:%M:%S')} · 🎙 Transcribing…{pct_str}{eta_str}"
                 try:
-                    await context.bot.edit_message_text(
-                        text, chat_id=msg.chat_id, message_id=prog.message_id)
+                    await asyncio.sleep(TRANSCRIBE_HEARTBEAT)
+                    ticks += 1
+                    elapsed = int(time.monotonic() - t_start)
+                    pct, eta = prog_state["pct"], prog_state["eta"]
+                    pct_str = f" {pct:.0f}%" if pct > 0 else ""
+                    eta_str = f" · ~{int(eta)}s left" if eta and eta > 1 else ""
+                    text = (f"🕐 {time.strftime('%H:%M:%S')} · 🎙 Transcribing…"
+                            f"{pct_str}{eta_str} · {elapsed}s")
+                    try:
+                        await asyncio.wait_for(
+                            context.bot.edit_message_text(
+                                text, chat_id=msg.chat_id, message_id=prog.message_id),
+                            timeout=TRANSCRIBE_HEARTBEAT,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        log.warning("transcribe heartbeat edit failed (tick %d, %ds): %r",
+                                    ticks, elapsed, e)
+                except asyncio.CancelledError:
+                    break
                 except Exception:
-                    pass  # transient ("not modified" won't happen — the clock always moves)
+                    log.exception("transcribe heartbeat loop error — continuing")
 
-        hb = asyncio.create_task(_transcribe_heartbeat())
+        # STRONG ref via _spawn so the GC can't eat the clock (the bare-create_task bug).
+        hb = _spawn(_transcribe_heartbeat(), name="transcribe_heartbeat")
+        log.info("Transcribe: watching worker (audio %.0fs, budget %.0fs)", audio_dur, budget)
+        result = None
+        stalled = False
+        worker_err = []
+        proc = None
         try:
-            result = await asyncio.to_thread(transcribe, tmp_path, progress_cb)
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(HERE / "transcribe_worker.py"), tmp_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                limit=8 * 1024 * 1024,  # transcripts can exceed the 64K default line limit
+            )
+            log.info("Transcribe: worker pid=%s started", proc.pid)
+
+            async def _read_worker():
+                # Consume the worker's stdout records live. Returns the RESULT dict (or None).
+                res = None
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    s = line.decode("utf-8", "replace").rstrip("\n")
+                    if s.startswith("PROGRESS "):
+                        try:
+                            _, p, e = s.split()
+                            prog_state["pct"], prog_state["eta"] = float(p), float(e)
+                        except Exception:
+                            log.warning("bad PROGRESS line: %r", s)
+                    elif s.startswith("RESULT "):
+                        try:
+                            res = json.loads(s[len("RESULT "):])
+                        except Exception:
+                            log.exception("Bad RESULT line from worker")
+                    elif s.startswith("ERROR "):
+                        try:
+                            worker_err.append(json.loads(s[len("ERROR "):]))
+                        except Exception:
+                            worker_err.append(s[len("ERROR "):])
+                    else:
+                        log.warning("worker said (unparsed): %r", s[:300])
+                return res
+
+            try:
+                result = await asyncio.wait_for(_read_worker(), timeout=budget)
+            except asyncio.TimeoutError:
+                stalled = True
+                log.error("Transcription KILLED: worker pid=%s past %.0fs budget "
+                          "(audio %.0fs, last %.0f%%)", getattr(proc, "pid", "?"),
+                          budget, audio_dur, prog_state["pct"])
+            else:
+                if worker_err:
+                    log.error("Transcription worker error: %s", str(worker_err[0])[:2000])
+                else:
+                    log.info("Transcribe: worker pid=%s done in %.0fs",
+                             proc.pid, time.monotonic() - t_start)
         except Exception:
-            log.exception("Transcription failed")
-            await msg.reply_text("⚠️ Sorry, I couldn't transcribe that.")
-            return
+            log.exception("Transcription handler error (audio %.0fs)", audio_dur)
         finally:
+            # Always reap the worker, and BOUND every wait so a wedged reap can't hang us.
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    log.exception("worker kill failed")
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except Exception:
+                    log.exception("worker reap failed/timed out (pid=%s)",
+                                  getattr(proc, "pid", "?"))
             hb.cancel()
             try:
                 await hb
-            except Exception:
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                log.exception("heartbeat shutdown errored")
             try:
                 await context.bot.delete_message(msg.chat_id, prog.message_id)
             except Exception:
-                pass
+                log.warning("could not delete progress bubble", exc_info=True)
     finally:
         try:
             os.remove(tmp_path)  # delete the audio as soon as transcription ends
         except OSError:
             pass
+
+    if stalled:
+        await msg.reply_text(
+            f"⚠️ Transcription stalled (ran past {int(budget)}s) and I killed it. "
+            "Please resend — it usually goes through the second time.")
+        return
+    if result is None:
+        await msg.reply_text("⚠️ Sorry, I couldn't transcribe that.")
+        return
 
     text = result["text"]
     if not text:
@@ -1895,9 +1947,6 @@ def main() -> None:
         signal.signal(signal.SIGUSR1, _dump_tasks)
     except (ValueError, OSError):
         pass
-
-    # Warm up the transcription model before polling so the first voice is fast.
-    get_model()
 
     log.info("claudegram bridge is up. Talk to your bot (voice or text).")
     # drop_pending_updates=False: messages sent while we were offline are held by
