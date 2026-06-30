@@ -57,10 +57,12 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   mutates above the answer), and the `✅ Done · N turns · Ns · ctx X%` summary lands as
   a new message at the bottom.
 - **Watchdog (never silent)**: a continuous monitor of the Claude instance. After ~60 s
-  of Telegram silence it posts the live state — `🟢 working Nm` or `💤 idle`, **plus**
-  (orthogonally) the background shells: `🐚 2 shells: build, tests` or `🐚 no shells`.
-  So you always know whether to **wait** (idle + shells will wake it) or it's **done**
-  (idle + no shells → nothing pending). No more staring at a dead-looking screen.
+  of Telegram silence it shows the live state — `🕐 <datetime> · 🟢 working Nm` or `💤 idle`,
+  **plus** (orthogonally) the background shells: `🐚 2 shells: build, tests` or `🐚 no shells`.
+  It **edits one status message in place** rather than re-posting — same status just bumps a
+  `×N` counter and refreshes the leading **datetime** (a moving clock = proof of life); a
+  changed status starts a fresh message. So you always know whether to **wait** (idle +
+  shells will wake it) or it's **done** (idle + no shells → nothing pending), without spam.
 - **Reports its own background work**: when Claude finishes a turn with a background
   shell still running and then **wakes itself** as the task lands, that follow-up turn is
   relayed to your phone too (`🔔 Claude picked back up…`) — not just lost on the machine.

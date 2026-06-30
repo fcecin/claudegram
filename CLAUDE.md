@@ -38,9 +38,12 @@ continuous reader relays them.
   is free for input* (orthogonal to shells — do NOT gate it on background work).
 - Mashing fix: a tool/thinking between two text blocks would concatenate them
   (`…background:Confirmed…`); the renderer re-inserts `\n\n` (`text_interrupted`).
-- `watchdog_loop` — every ~60s of Telegram **silence**, posts the instance state:
-  `working|idle` PLUS `N shells (what) | no shells`. Speaks only on silence (tracked by
-  `mark_sent()` on every NEW message — edits don't count), declares dead-idle once.
+- `Watchdog` (class) — every ~60s of Telegram **silence**, shows the instance state:
+  `🕐 <datetime> · working|idle` PLUS `N shells (what) | no shells`. It **edits one
+  message in place** with a `×N` counter + a refreshing datetime instead of re-posting the
+  same status; a changed status (or `mark_sent()` flagging that other content was sent
+  below it via `is_latest=False`) starts a fresh message. Dead-idle declared once. Silence
+  tracked by `mark_sent()` on every NEW message (edits don't count).
 
 ## Voiceback (spoken replies)
 A message starting with the word `voice` (`parse_voiceback`) sets `voiceback=True` for

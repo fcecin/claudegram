@@ -178,11 +178,17 @@ controller = ClaudeController(
 # Silence tracker for the watchdog: monotonic ts of the last NEW message sent to the
 # owner. Edits don't count (they don't notify). The 60s watchdog only speaks after a gap.
 _last_tg_send = time.monotonic()
+_watchdog = None  # the Watchdog instance (set in on_startup)
 
 
 def mark_sent() -> None:
+    """Record that a (non-watchdog) message reached the owner. This also tells the
+    watchdog its last status message is no longer the newest, so its next status starts
+    a fresh message instead of editing one now buried above other content."""
     global _last_tg_send
     _last_tg_send = time.monotonic()
+    if _watchdog is not None:
+        _watchdog.is_latest = False
 
 
 # --- message batching: collapse a burst of messages into ONE Claude turn ----------
@@ -1047,59 +1053,98 @@ class SpontaneousRelay:
                 self.cur = None
 
 
-async def watchdog_loop(application) -> None:
-    """Break Telegram silence. About every minute of quiet, post the Claude INSTANCE
-    state so you never stare at a dead screen: working|idle, PLUS (orthogonally) the
-    background shells (how many + what) or none. You read it and decide:
-      • idle + shells  -> wait, it'll wake itself when they land
-      • idle + no shells -> fully done/dead; any 'I'll get back to you' was false — poke it
-    Only speaks on ~60s of silence (so streaming turns aren't interrupted), and declares
-    the dead-idle state just once."""
-    dead_declared = False
-    while True:
-        await asyncio.sleep(20)
-        try:
-            if (time.monotonic() - _last_tg_send) < 58:
-                continue  # not silent — something already reached the phone recently
-            st = controller.status()
-            shells = st["shells"]
-            active = st["active"]
-            if not active and not shells:
-                if dead_declared:
+class Watchdog:
+    """Breaks Telegram silence with the Claude INSTANCE state so you never stare at a
+    dead screen: every ~minute of quiet it shows `🕐 <datetime> · working|idle · shells`.
+    Crucially it does NOT re-post the same status — it EDITS the last one, bumps a `×N`
+    counter, and refreshes the leading datetime (a moving clock = proof of life). A
+    changed status (or anything sent in between) starts a fresh message at the bottom.
+
+    You read it and decide: idle+shells → wait (it'll wake itself when they land);
+    idle+no-shells → nothing pending, poke it."""
+
+    def __init__(self, app):
+        self.app = app
+        self.msg_id = None
+        self.body = None          # dedupe key: status text without stamp/counter
+        self.count = 1
+        self.is_latest = False    # is our status message still the newest in the chat?
+        self.dead_declared = False
+
+    def _chat(self):
+        return sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
+
+    def _compose(self, body, count):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        return f"🕐 {stamp} · {body}" + (f"  ×{count}" if count > 1 else "")
+
+    def _status_body(self, st):
+        if st["active"]:
+            mins = int(st["segment_secs"] // 60)
+            head = f"🟢 working {mins}m" if mins else "🟢 working"
+        else:
+            head = "💤 idle"
+        shells = st["shells"]
+        if shells:
+            descs = ", ".join(_oneline(s.get("desc", "task"), 40) for s in shells[:4])
+            more = f" (+{len(shells) - 4})" if len(shells) > 4 else ""
+            tail = f"🐚 {len(shells)} shell(s): {descs}{more}"
+            if not st["active"]:
+                tail += " — they'll wake me when they land"
+        else:
+            tail = "🐚 no shells"
+        return f"🐕 {head} · {tail}"
+
+    async def loop(self):
+        while True:
+            await asyncio.sleep(20)
+            try:
+                if (time.monotonic() - _last_tg_send) < 55:
+                    continue  # not silent — something already reached the phone recently
+                st = controller.status()
+                if not st["active"] and not st["shells"]:
+                    if self.dead_declared:
+                        continue
+                    self.dead_declared = True
+                    await self._show("💤 idle · 🐚 no shells — nothing is running, nothing "
+                                     "will wake me. Say hi to continue.")
                     continue
-                dead_declared = True
-                await _watchdog_say(
-                    application,
-                    "🐕 💤 idle · 🐚 no shells — nothing is running, nothing will wake me. "
-                    "Say hi to continue.",
-                )
-                continue
-            dead_declared = False
-            if active:
-                mins = int(st["segment_secs"] // 60)
-                head = f"🟢 working {mins}m" if mins else "🟢 working"
-            else:
-                head = "💤 idle"
-            if shells:
-                descs = ", ".join(_oneline(s.get("desc", "task"), 40) for s in shells[:4])
-                more = f" (+{len(shells) - 4})" if len(shells) > 4 else ""
-                tail = f"🐚 {len(shells)} shell(s): {descs}{more}"
-                if not active:
-                    tail += " — they'll wake me when they land"
-            else:
-                tail = "🐚 no shells"
-            await _watchdog_say(application, f"🐕 {head} · {tail}")
-        except Exception:
-            log.exception("watchdog error")
+                self.dead_declared = False
+                await self._show(self._status_body(st))
+            except Exception:
+                log.exception("watchdog error")
 
-
-async def _watchdog_say(application, text: str) -> None:
-    for uid in sorted(ALLOWED_USER_IDS):
+    async def _show(self, body):
+        chat = self._chat()
+        if chat is None:
+            return
+        # Same status AND our message is still the newest -> edit it in place (×N + fresh
+        # datetime), so we never print the same status twice.
+        if self.msg_id is not None and self.is_latest and body == self.body:
+            self.count += 1
+            try:
+                await self.app.bot.edit_message_text(
+                    self._compose(body, self.count), chat_id=chat, message_id=self.msg_id)
+                self._touch()
+                return
+            except Exception as e:
+                if "not modified" not in str(e).lower():
+                    log.info("watchdog edit failed: %r", e)
+                # fall through to a fresh message
+        # New/changed status (or no longer the newest) -> a fresh message at the bottom.
+        self.count = 1
+        self.body = body
         try:
-            await application.bot.send_message(uid, text)
-            mark_sent()
+            m = await self.app.bot.send_message(chat, self._compose(body, 1))
+            self.msg_id = m.message_id
+            self._touch()
         except Exception:
             log.exception("watchdog send failed")
+
+    def _touch(self):
+        global _last_tg_send
+        _last_tg_send = time.monotonic()
+        self.is_latest = True
 
 
 # --- "bot ..." harness commands (intercepted before Claude) ------------------
@@ -1530,9 +1575,12 @@ async def on_startup(application) -> None:
     # Start the IPC inbox so other programs on this machine can ping the phone.
     asyncio.create_task(harness_outbox_loop(application))
     log.info("HARNESS outbox watcher started at %s", HARNESS_OUTBOX)
-    # Start the watchdog: break Telegram silence with the Claude instance's state.
-    asyncio.create_task(watchdog_loop(application))
-    log.info("watchdog started (60s silence-breaker: working/idle + shells)")
+    # Start the watchdog: break Telegram silence with the Claude instance's state
+    # (edits one status in place with ×N + a moving datetime instead of re-posting).
+    global _watchdog
+    _watchdog = Watchdog(application)
+    asyncio.create_task(_watchdog.loop())
+    log.info("watchdog started (silence-breaker: datetime + working/idle + shells, ×N dedupe)")
 
 
 def main() -> None:
