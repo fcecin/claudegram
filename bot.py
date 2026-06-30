@@ -182,6 +182,7 @@ CWD_FILE = HERE / "cwd.path"         # persisted working directory
 LOG_PATH = HERE / "claudegram.log"   # bridge log (written by the tray supervisor)
 AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # transient voice files
 VOICE_TMP = Path(tempfile.gettempdir()) / "claudegram_voiceback"  # transient TTS output
+IMAGE_TMP = Path(tempfile.gettempdir()) / "claudegram_images"  # incoming images (kept until Claude's turn Reads them; swept at startup)
 HARNESS_OUTBOX = HERE / "outbox"     # drop dir: any program leaves a msg -> sent to phone
 HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by the AI here
 controller = ClaudeController(
@@ -415,8 +416,8 @@ def ensure_cghome() -> None:
 
 
 def sweep_audio_tmp() -> None:
-    """Clear leftover temp audio (incoming voice + outgoing TTS) from a prior crash."""
-    for d in (AUDIO_TMP, VOICE_TMP):
+    """Clear leftover temp media (incoming voice/images + outgoing TTS) from a prior crash."""
+    for d in (AUDIO_TMP, VOICE_TMP, IMAGE_TMP):
         try:
             d.mkdir(parents=True, exist_ok=True)
             for f in d.iterdir():
@@ -1903,6 +1904,67 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
     return True
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """An image IS the input — no transcription (unlike audio). Download it and hand Claude
+    the path (+ caption if any); Claude views it with the Read tool. Same state-machinery as
+    the other handlers: auth → sleep → blocked → enqueue. Caption is the instruction when
+    present; otherwise Claude infers the purpose from conversation context. We do NOT batch or
+    wait for anything — you pace it; if the normal batcher happens to fuse it with an adjacent
+    message, that's fine."""
+    msg = update.message
+    if not is_authorized(update):
+        uid = update.effective_user.id if update.effective_user else "?"
+        log.warning("Ignoring image from unauthorized user id=%s", uid)
+        await msg.reply_text("🚫 This is a private bot.")
+        return
+    # Largest rendition of a sent photo, or an image sent as a file (document).
+    media = None
+    if msg.photo:
+        media = msg.photo[-1]
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        media = msg.document
+    if media is None:
+        return
+    # Sleep mode: ignore ALL Telegram input (wake only at the machine).
+    if is_sleeping():
+        log.info("Ignoring image — sleep mode engaged")
+        await msg.reply_text(SLEEP_MSG)
+        return
+    caption = (msg.caption or "").strip()
+    user = msg.from_user
+    log.info("Image from %s (%s): file_id=%s caption=%r",
+             user.full_name if user else "?", user.id if user else "?",
+             media.file_id, caption)
+    if is_blocked():
+        await msg.reply_text(BLOCKED_MSG)
+        return
+    await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    # Download to a dedicated dir. UNLIKE audio we do NOT delete it here: Claude reads the
+    # file during its (later) turn. Leftovers are swept at startup.
+    IMAGE_TMP.mkdir(parents=True, exist_ok=True)
+    ext = ".jpg"
+    fname = getattr(media, "file_name", None)
+    if fname and "." in fname:
+        ext = "." + fname.rsplit(".", 1)[-1].lower()[:8]
+    with tempfile.NamedTemporaryFile(suffix=ext, dir=IMAGE_TMP, delete=False) as tmp:
+        path = tmp.name
+    try:
+        tg_file = await context.bot.get_file(media.file_id)
+        await tg_file.download_to_drive(path)
+    except Exception:
+        log.exception("Image download failed")
+        await msg.reply_text("⚠️ Couldn't download that image.")
+        return
+    if caption:
+        text = (f"[The user sent an image, saved at {path}. Caption: {caption}]\n"
+                "View it with the Read tool, then respond.")
+    else:
+        text = (f"[The user sent an image, saved at {path}, with no caption.]\n"
+                "View it with the Read tool and respond based on our conversation context.")
+    set_no_more_work(False)  # new work from the user re-arms the idle nudger
+    enqueue_for_claude(msg.chat_id, msg.message_id, text, "image", False)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not is_authorized(update):
@@ -2127,6 +2189,9 @@ def main() -> None:
             filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.VIDEO,
             handle_audio,
         )
+    )
+    app.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
