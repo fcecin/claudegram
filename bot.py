@@ -554,6 +554,45 @@ def build_prompt(user_text: str, source: str, voiceback: bool = False) -> str:
     return f"{guard}\n{pre}{user_text}"
 
 
+_TTS_LANGS: set[str] | None = None
+
+
+def _supported_tts_langs() -> set[str]:
+    """gTTS's supported language codes (cached; no network in gtts>=2.5)."""
+    global _TTS_LANGS
+    if _TTS_LANGS is None:
+        try:
+            from gtts.lang import tts_langs
+            _TTS_LANGS = set(tts_langs().keys())
+        except Exception:
+            _TTS_LANGS = {"en"}
+    return _TTS_LANGS
+
+
+def detect_tts_lang(text: str, default: str = "en") -> str:
+    """Best-effort gTTS language code for `text` so speech is spoken in the TEXT's
+    language (not always English). Falls back to `default` (WHISPER_LANGUAGE if set,
+    else en) when detection fails or the language isn't gTTS-supported."""
+    supported = _supported_tts_langs()
+    if default not in supported:
+        default = "en"
+    try:
+        from langdetect import detect, DetectorFactory
+        DetectorFactory.seed = 0            # deterministic
+        code = detect(text)                 # e.g. 'pt', 'en', 'es', 'zh-cn'
+    except Exception:
+        return default
+    if code in supported:
+        return code
+    # normalize case/region: langdetect 'zh-cn' -> gTTS 'zh-CN'; 'pt-br' -> 'pt'
+    base = code.split("-")[0]
+    for cand in (code, base):
+        for s in supported:
+            if s.lower() == cand.lower():
+                return s
+    return default
+
+
 def synthesize_voice(text: str) -> str | None:
     """Blocking: turn text into a Telegram-ready ogg/opus voice file; return its path
     (or None on failure). Uses gTTS (online) -> mp3 -> ffmpeg -> ogg/opus. Run in a
@@ -566,7 +605,9 @@ def synthesize_voice(text: str) -> str | None:
         VOICE_TMP.mkdir(parents=True, exist_ok=True)
         stem = VOICE_TMP / uuid.uuid4().hex
         mp3, ogg = f"{stem}.mp3", f"{stem}.ogg"
-        gTTS(text[:4000]).save(mp3)  # cap very long blocks
+        lang = detect_tts_lang(text[:4000], default=os.environ.get("WHISPER_LANGUAGE") or "en")
+        log.info("voiceback: synthesizing in lang=%s (%d chars)", lang, len(text))
+        gTTS(text[:4000], lang=lang).save(mp3)  # cap very long blocks
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-i", mp3,
              "-c:a", "libopus", "-b:a", "48k", ogg],
@@ -1345,6 +1386,17 @@ class SegmentRenderer:
         if final and sentinel_tripped(final):
             await self.trip("\n".join(final.splitlines()[1:]).strip())
             return
+        # Autonomy: if Claude's reply LEADS WITH the marker it's declaring it's out of work
+        # -> pause idle nudging (re-armed on the user's next message). Done BEFORE the
+        # voiceback branch and with VOICESTART/VOICEEND stripped, because under voiceback
+        # Claude wraps the reply in those markers, so the raw answer starts with
+        # "VOICESTART…" and a naive startswith would never match. startswith, exactly as
+        # the nudge prompt instructs Claude.
+        answer = "".join(self.answer_buf).strip() or final
+        clean = answer.replace("VOICESTART", "").replace("VOICEEND", "").lstrip()
+        if clean.upper().startswith(NO_MORE_WORK_MARKER):
+            set_no_more_work(True)
+            log.info("watchdog: Claude declared NO MORE WORK — idle nudging paused")
         if self.voiceback:
             await self._finalize_voiceback(res, final)
             return
@@ -1353,15 +1405,7 @@ class SegmentRenderer:
             await self.streamer.feed(final)
         await self.streamer.finish()  # remainder + [[END]] (prompt is free for input)
 
-        answer = "".join(self.answer_buf).strip() or final
         log.info("ANSWER (%d chars):\n%s", len(answer), answer)
-        # Autonomy: if Claude's reply LEADS WITH the marker, it's declaring it's out of work
-        # -> pause idle nudging (re-armed when the user next sends something). startswith,
-        # exactly as the nudge prompt instructs Claude.
-        if answer.lstrip().upper().startswith(NO_MORE_WORK_MARKER):
-            set_no_more_work(True)
-            log.info("watchdog: Claude declared NO MORE WORK — idle nudging paused")
-
         await self._compute_ctx(res)
         summary = self._summary(res)
         # Summary where the eye is: a NEW bottom message if the answer streamed below the
