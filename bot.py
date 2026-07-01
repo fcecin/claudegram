@@ -301,6 +301,7 @@ def is_rate_limited(text) -> bool:
     return any(m in t for m in _RATE_LIMIT_MARKERS)
 _pending: list[dict] = []
 _pending_event = asyncio.Event()
+_transcribe_lock = asyncio.Lock()  # serialize audio decoding: ONE at a time, in message order
 _app = None  # the telegram Application; set in on_startup so the worker can send
 _worker_task = None     # the dispatch_worker task (the guard recreates it if it wedges)
 _pending_since = 0.0    # monotonic ts the queue became non-empty (0 = empty)
@@ -315,6 +316,79 @@ def _spawn(coro, name=None):
     _bg_tasks.add(t)
     t.add_done_callback(_bg_tasks.discard)
     return t
+
+
+# --- subscription usage (5h session / weekly), scraped from `claude /usage` ------
+# The Agent SDK doesn't expose subscription utilisation (the CLI sends
+# utilization=None while status=allowed, and the anthropic-ratelimit-unified-*
+# headers live inside the CLI subprocess, out of our reach). But `/usage` renders
+# the numbers as plain text, so usage_worker.py boots a THROWAWAY `claude` TUI in
+# tmux and scrapes them (no prompt sent => no tokens). A background task refreshes
+# the cache every USAGE_REFRESH_SECS; the DONE summary just reads the cache, so a
+# slow ~8s scrape never blocks a turn. The print site is intentionally decoupled
+# (format_usage) so it can move later.
+USAGE_REFRESH_SECS = 600     # 10 min — the 5h/week windows move slowly
+USAGE_SCRAPE_TIMEOUT = 90    # hard cap on one scrape (TUI boot + panel render)
+_usage_cache: dict = {}      # last good scrape: {session_pct, session_reset, week_pct, week_reset, ts}
+
+
+async def _scrape_usage_once() -> None:
+    """Run usage_worker.py as a subprocess and cache the parsed result. Never raises."""
+    global _usage_cache
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(HERE / "usage_worker.py"),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), USAGE_SCRAPE_TIMEOUT)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            log.warning("usage scrape timed out after %ss — keeping last cache", USAGE_SCRAPE_TIMEOUT)
+            return
+        lines = (out or b"").decode("utf-8", "replace").strip().splitlines()
+        data = json.loads(lines[-1]) if lines else {}
+        if data.get("session_pct") is not None and data.get("week_pct") is not None:
+            _usage_cache = data
+            log.info("usage refreshed: session=%s%% (%s) week=%s%% (%s)",
+                     data.get("session_pct"), data.get("session_reset"),
+                     data.get("week_pct"), data.get("week_reset"))
+        else:
+            log.warning("usage scrape returned no numbers: %s", data)
+    except Exception:
+        log.exception("usage scrape failed — keeping last cache")
+
+
+async def usage_collector_loop() -> None:
+    """Refresh the subscription-usage cache every USAGE_REFRESH_SECS, forever."""
+    while True:
+        await _scrape_usage_once()
+        await asyncio.sleep(USAGE_REFRESH_SECS)
+
+
+def _reset_paren(hours, clock) -> str:
+    """`(⟳3.9h)` / `(⟳6.9d)` from hours-until; fall back to the raw clock string."""
+    if hours is None:
+        return f" (⟳{clock})" if clock else ""
+    if hours >= 48:
+        return f" (⟳{hours / 24:.1f}d)"
+    return f" (⟳{hours:.0f}h)" if hours >= 10 else f" (⟳{hours:.1f}h)"
+
+
+def format_usage() -> str:
+    """Compact ` · 5h 15% (⟳3.9h) · wk 4% (⟳6.9d)` for the DONE line; '' if unknown."""
+    u = _usage_cache
+    if not u:
+        return ""
+    parts = []
+    if u.get("session_pct") is not None:
+        parts.append(f"5h {u['session_pct']}%" + _reset_paren(u.get("session_hours"), u.get("session_reset")))
+    if u.get("week_pct") is not None:
+        parts.append(f"wk {u['week_pct']}%" + _reset_paren(u.get("week_hours"), u.get("week_reset")))
+    return (" · " + " · ".join(parts)) if parts else ""
 
 
 def enqueue_for_claude(chat_id, reply_to, text: str, source: str, voiceback: bool) -> None:
@@ -682,27 +756,33 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
 
-    # Download to a dedicated temp dir, transcribe, then DELETE the audio right
-    # away — once we have the text the file has done its job. The (possibly long)
-    # Claude turn happens afterwards, with no audio file lingering on disk.
+    # Serialize transcription: ONE decode at a time, in MESSAGE order. Concurrent updates would
+    # otherwise spawn parallel decoders — a short later clip finishes first (out of order), and
+    # N whisper processes thrash the CPU. Acquire the lock BEFORE downloading so ordering follows
+    # message order, not download-completion order; show "queued" while a previous decode runs.
+    queued = _transcribe_lock.locked()
+    prog = await context.bot.send_message(
+        msg.chat_id,
+        "🎙 Queued — waiting for the current transcription…" if queued else "🎙 Transcribing…",
+        reply_to_message_id=msg.message_id)
+    mark_sent()
+
+    # Download to a dedicated temp dir, transcribe, then DELETE the audio right away.
     AUDIO_TMP.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         suffix=".oga" if msg.voice else ".bin", dir=AUDIO_TMP, delete=False
     ) as tmp:
         tmp_path = tmp.name
+    await _transcribe_lock.acquire()
     try:
+        if queued:  # our turn now — flip the bubble from "queued" to "transcribing"
+            try:
+                await context.bot.edit_message_text(
+                    "🎙 Transcribing…", chat_id=msg.chat_id, message_id=prog.message_id)
+            except Exception:
+                pass
         tg_file = await context.bot.get_file(media.file_id)
         await tg_file.download_to_drive(tmp_path)
-        # Transcription is CPU-bound, blocking, and CAN STALL OR LOOP FOREVER (whisper's
-        # repetition bug; a wedged process). So it runs as a KILLABLE SUBPROCESS
-        # (transcribe_worker.py) — not a thread, because a thread cannot be killed. A
-        # watchdog kills it if it overruns its budget, so a bad clip can never freeze the
-        # bridge. A heartbeat re-edits the bubble on a FIXED clock (moving datetime = the
-        # bridge is alive) with a smooth time-based %/ETA estimate alongside (the numbers
-        # may lie; the moving clock is the truth).
-        prog = await context.bot.send_message(
-            msg.chat_id, "🎙 Transcribing…", reply_to_message_id=msg.message_id)
-        mark_sent()
 
         audio_dur = float(getattr(media, "duration", 0) or 0)
         budget = (max(TRANSCRIBE_MIN_BUDGET, audio_dur * TRANSCRIBE_BUDGET_FACTOR)
@@ -832,6 +912,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             except Exception:
                 log.warning("could not delete progress bubble", exc_info=True)
     finally:
+        _transcribe_lock.release()
         try:
             os.remove(tmp_path)  # delete the audio as soon as transcription ends
         except OSError:
@@ -1303,13 +1384,14 @@ class SegmentRenderer:
 
     def _summary(self, res: dict) -> str:
         ctx = res.get("_ctx_str", "")
+        usage = format_usage()  # ` · 5h N% (⟳..) · wk N% (⟳..)` from the cached scrape
         turns, secs = res.get("turns", "?"), res.get("secs", 0)
         sid8 = (controller.session_id or "")[:8]
         sess = f" · 🧵 {sid8}" if sid8 else ""
         probs = f" · ⚠️ {len(self.problems)} issue(s)" if self.problems else ""
         if res.get("is_error"):
-            return f"⚠️ Ended: {res.get('subtype')} · {turns} turns · {secs:.0f}s{ctx}{sess}"
-        return f"✅ Done · {turns} turns · {secs:.0f}s{ctx}{sess}{probs}"
+            return f"⚠️ Ended: {res.get('subtype')} · {turns} turns · {secs:.0f}s{ctx}{usage}{sess}"
+        return f"✅ Done · {turns} turns · {secs:.0f}s{ctx}{usage}{sess}{probs}"
 
     async def _finalize_voiceback(self, res: dict, final: str) -> None:
         """Spoken reply: freeze the board, show the text (markers stripped), and send one
@@ -2218,6 +2300,9 @@ async def on_startup(application) -> None:
     _watchdog = Watchdog(application)
     _spawn(_watchdog.loop(), name="watchdog")
     log.info("watchdog started (silence-breaker: datetime + working/idle + shells, ×N dedupe)")
+    # Scrape subscription 5h/week usage from `claude /usage` every 10 min → cache → DONE line.
+    _spawn(usage_collector_loop(), name="usage_collector")
+    log.info("usage collector started (refresh %ss via usage_worker.py)", USAGE_REFRESH_SECS)
 
 
 def main() -> None:
