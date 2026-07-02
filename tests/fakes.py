@@ -206,8 +206,8 @@ def reset_registry():
 
 
 def clear_flags():
-    """Remove any lock/sleep flags a test may have written (worktree-local, gitignored)."""
-    for f in (bot.BLOCK_FILE, bot.SLEEP_FILE):
+    """Remove any lock/sleep/mode flags a test may have written (worktree-local, gitignored)."""
+    for f in (bot.BLOCK_FILE, bot.SLEEP_FILE, bot.VOICE_MODE_FILE, bot.NOSTALL_FILE):
         try:
             f.unlink()
         except OSError:

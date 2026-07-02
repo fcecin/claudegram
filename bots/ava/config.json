@@ -1,4 +1,6 @@
 {
+  "icon": "🟣",
+  "aliases": ["avah", "arva", "ahva", "aava"],
   "model": "opus",
   "effort": "xhigh",
   "transcribe": "good",

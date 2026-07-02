@@ -1,4 +1,6 @@
 {
+  "icon": "🔴",
+  "aliases": ["maks", "mac", "mocks", "maxx", "mx"],
   "model": "opus",
   "effort": "max",
   "voice": { "name": "bm_fable" }

@@ -1,4 +1,6 @@
 {
+  "icon": "🟤",
+  "aliases": ["goll", "goal", "gole", "gaul", "gaol", "ghoul", "gall", "gou", "goo"],
   "transcribe": "fast",
   "voice": {
     "name": "am_onyx",

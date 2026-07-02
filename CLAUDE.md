@@ -62,6 +62,9 @@ continuous reader relays them.
   `IDLE_NO_SHELLS_NUDGE` ("continue, or reply starting with `NO MORE WORK`"); if Claude's reply
   leads with `NO_MORE_WORK_MARKER` (detected in `SegmentRenderer.finalize` → `set_no_more_work`,
   cleared on the next user message) → **IDLE_DONE** (one-shot terminal notice, no more nudging).
+  With the **anti-stall guard** on (`bot nostall`), the guard OWNS the idle+no-shells intervention
+  instead of the canned nudge (see *Anti-stall guard*). **`bot park`** forces a session into terminal
+  idle — no nudging AND no anti-stall policing — cleared on the next user message (`session.parked`).
   The loop is fully wrapped (`except: log`) so it can't die silently, and it **skips entirely
   while `transcribe_active()`** (a decode isn't idleness).
 
@@ -114,8 +117,17 @@ One bot can drive several independent Claude sessions in the same channel — an
 single default session. `SessionRegistry`/`Session` give each its own `ClaudeController` (own
 `session.<name>.id`/`cwd`/`effort` files; the DEFAULT `claude` reuses the original `session.id`),
 its own dispatch queue+worker, watchdog, and spontaneous relay — so sessions run **concurrently**.
-Each session has a color badge. A session may carry a `config.json` (read by `bot_config`); the
-per-session contents are not documented here.
+- **Roster is filesystem-driven (no hardcoded palette):** the bot set is scanned from `bots/*/` on
+  boot (`discover_bots`). Each bot's DIRECTORY is its definition — its icon, aliases, model, effort,
+  and the `internal` flag all live in `bots/<name>/config.json` (+ an optional `main.md`). `rm -rf`
+  a bot's dir and it's gone; add a dir and it appears — no code change. `bot_icon`/`selectable_bots`/
+  `session_aliases` all read the scan; `Session.emoji` falls back to a gear if a config has no icon.
+  `ensure_default_bot()` self-heals the DEFAULT bot's dir + `config.json` + `var/.gitkeep` BEFORE the
+  roster is read.
+- **Internal/system bots:** `config.json {"internal": true}` = a system bot: it gets a badge but is
+  NOT selectable (`resolve_session_name` won't return it), NOT listed in `bot sessions`, and does NOT
+  count toward `registry.multiplexing()` (a solo install stays single-session even while one runs in
+  the background).
 - **Progressive disclosure:** while only `claude` exists, `registry.multiplexing()` is False and
   every `registry.badge(session)` is `""` — the bridge renders exactly like the single-session
   version. A 2nd session flips multiplexing on and every bot-authored artifact (board header,
@@ -128,11 +140,28 @@ per-session contents are not documented here.
   `target = registry.current()` at send-time (a mid-decode select can't misroute). `bot sessions`
   lists; `bot end <name>` tears one down (never the default).
 - **Per-session vs global:** each session owns its queue/worker/watchdog/relay AND its own
-  `no_more_work` flag (`set_no_more_work(session, …)`). GLOBAL stays global because it's about the
+  `no_more_work` + `parked` flags (`set_no_more_work(session, …)`). GLOBAL stays global because it's about the
   channel/machine: the `_transcribe_lock` (one whisper at a time — CPU), all security state
   (allowlist, intrusion lock, `BLOCKED.flag`, `SLEEP.flag`), and `_last_tg_send` silence. Intrusion
   kills EVERY session's controller. `mark_sent()`/`Watchdog._touch()` invalidate all watchdogs'
   `is_latest`. One `worker_guard` covers all sessions.
+
+## Anti-stall guard (`bot nostall on|off`) — OPTIONAL, off by default
+A global sticky toggle (`nostall.mode`, presence = on; like voiceback). While on, an INTERNAL guard
+bot reviews any bot that goes idle with **nothing running** and, if it's stalling, forces it back to
+work. bot.py is only PLUMBING — ALL policing logic (what stalling is, how to argue, the output
+contract, a self-growing playbook of failure-mode "patches") lives in the guard bot's `main.md` +
+its `var/`:
+- The watchdog captures each bot's recent answers (`session.recent_answers`). When a bot goes idle +
+  no-shells (declared done, or hit the idle threshold), `Watchdog._police_stall` hands those answers
+  to the guard via `ask_text` (a quiet turn, no channel render), throttled by a per-bot cooldown.
+- The guard replies `NOSTALL_LEGIT_MARKER` (`LEGIT STOP` = release it, let it rest) or a browbeat.
+  The browbeat is posted in the watchdog's voice and injected into the stalling bot as a bare
+  `[anti-stall]` directive — the bot never converses with the guard, it just acts.
+- The guard bot is referenced by NAME (`NOSTALL_BOT`), is `internal` (driven directly — no
+  queue/watchdog/relay, so it's never auto-ended or self-policed), and the guard **can't be enabled
+  unless its bot is installed** (`nostall_bot_available`). `bot park` is the deliberate opt-out for a
+  single bot.
 
 ## Message batching
 Handlers don't call `dispatch_to_claude` directly — they `enqueue_for_claude(session, …)`. A
@@ -210,9 +239,11 @@ because the bridge has exactly **two external edges** and `tests/fakes.py` fakes
   provoke the rare/nondeterministic paths on demand — firewall sentinel trip, the self-started
   (spontaneous) turn, rate-limit, `is_error`, `NO MORE WORK` (incl. under voiceback). Whole
   turns run via `dispatch_to_claude(ctx, session, …)` with a fake session.
-Coverage: `test_multiplex` (registry/routing/badges), `test_render` (badge on every message),
-`test_regressions` (the 2026-07-01 voiceback bugs, pinned), `test_turn` (firewall / spontaneous
-relay / crash via mock-Claude). The runner resets the registry + clears flags between tests.
+Coverage: `test_multiplex` (registry/routing/badges + the scanned roster), `test_render` (badge on
+every message), `test_regressions` (the 2026-07-01 voiceback bugs, pinned), `test_turn` (firewall /
+spontaneous relay / crash via mock-Claude), `test_nostall` (anti-stall guard: discovery, flag,
+config-driven icon, refuse-without-its-bot), `test_park` (`bot park` + un-park). The runner resets
+the registry + clears flags between tests.
 - **Add a test** whenever you touch bridge logic — it's cheap now. Keep the few *real*-Claude
   checks (isolated `ClaudeController(temp_cwd, temp_session_file, effort='low')`) as a thin
   "contract" layer that pins SDK message shapes + the self-wake-on-shell-complete fact; the

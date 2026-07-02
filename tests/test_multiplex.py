@@ -15,11 +15,15 @@ def test_default_is_single_session_untagged():
     assert bot.controller is reg.current().controller
 
 
-def test_palette_is_nine_named():
-    assert len(bot.SESSION_PALETTE) == 9
-    assert [n for n, _ in bot.SESSION_PALETTE] == \
-        ["claude", "blu", "gil", "ava", "ily", "max", "gol", "nyx", "sno"]
-    assert bot.SESSION_EMOJI["gil"] == "🟢" and bot.SESSION_EMOJI["nyx"] == "⚫"
+def test_roster_is_assembled_from_disk_with_config_icons():
+    # The selectable roster is scanned from bots/*/, default 'claude' first, internal bots (jack)
+    # excluded. Icons come from each bot's config, not from code.
+    sel = bot.selectable_bots()
+    assert sel[0] == "claude"                     # default pinned first
+    assert set(sel) == {"claude", "blu", "gil", "ava", "ily", "max", "gol", "nyx", "sno"}
+    assert bot.NOSTALL_BOT not in sel             # internal bot is not selectable
+    assert bot.bot_icon("gil") == "🟢" and bot.bot_icon("nyx") == "⚫"
+    assert bot.Session("gil").emoji == "🟢"        # Session badge derives from config icon
 
 
 async def test_select_creates_switches_and_turns_on_tagging():

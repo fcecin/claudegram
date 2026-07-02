@@ -20,6 +20,7 @@ Configuration (env vars, or a .env file in this directory):
 
 import asyncio
 import atexit
+import collections
 import json
 import logging
 import os
@@ -190,43 +191,43 @@ CMD_INBOX = HERE / "cmd-inbox"       # drop dir: the DRIVEN Claude drops a confi
 # bot-authored artifact is prefixed with "<emoji> <name> · " so an interleaved scroll is
 # legible. Sessions run CONCURRENTLY: each is its own ClaudeController (own session id / cwd /
 # effort) with its own dispatch queue + worker + watchdog + spontaneous relay.
-SESSION_PALETTE = [
-    ("claude", "🟠"), ("blu", "🔵"), ("gil", "🟢"), ("ava", "🟣"), ("ily", "🟡"),
-    ("max", "🔴"), ("gol", "🟤"), ("nyx", "⚫"), ("sno", "⚪"),
-]
-SESSION_EMOJI = dict(SESSION_PALETTE)
-SESSION_ALIASES = {
-    "claud": "claude", "clode": "claude", "cloude": "claude", "claudee": "claude",
-    "clod": "claude", "cloud": "claude", "clawd": "claude", "clawed": "claude",
-    "klaus": "claude", "klaude": "claude",
-    "blue": "blu", "bloo": "blu", "blew": "blu", "bluu": "blu", "blou": "blu",
-    "gill": "gil", "gille": "gil", "jill": "gil", "jil": "gil", "guil": "gil",
-    "guile": "gil", "gyl": "gil", "ghil": "gil", "jheel": "gil",
-    "avah": "ava", "arva": "ava", "ahva": "ava", "aava": "ava",
-    "illy": "ily", "ili": "ily", "ilie": "ily", "ilee": "ily", "eely": "ily",
-    "ealy": "ily", "ellie": "ily", "elle": "ily", "elly": "ily", "eli": "ily",
-    "maks": "max", "mac": "max", "mocks": "max", "maxx": "max", "mx": "max",
-    "goll": "gol", "goal": "gol", "gole": "gol", "gaul": "gol", "gaol": "gol",
-    "ghoul": "gol", "gall": "gol", "gou": "gol", "goo": "gol",
-    "nix": "nyx", "niks": "nyx", "nikes": "nyx", "nyks": "nyx", "nyc": "nyx",
-    "nicks": "nyx", "knicks": "nyx", "nyxx": "nyx",
-    "snow": "sno", "snoh": "sno", "snoo": "sno", "snou": "sno", "snoe": "sno",
+# The roster is scanned from bots/*/ (discover_bots); each bot's directory is its definition —
+# icon, aliases, model, effort, and the internal flag all live in its config.json.
+DEFAULT_SESSION = "claude"    # the default/hidden session; its config lives in bots/claude/
+DEFAULT_ICON = "⚙️"           # badge for a bot whose config declares no icon
+# Seed used to regenerate the default bot's config if bots/claude/config.json goes missing (fresh
+# checkout, accidental deletion). It's only the seed — once the file exists, the file is truth.
+_DEFAULT_CLAUDE_CONFIG = {
+    "icon": "🟠",
+    "aliases": ["claud", "clode", "cloude", "claudee", "clod",
+                "cloud", "clawd", "clawed", "klaus", "klaude"],
 }
+
+# --- anti-stall guard -----------------------------------------------------------------------
+NOSTALL_BOT = "jack"     # the guard bot, by name; its config lives in bots/jack/ (no dir → can't enable)
+NOSTALL_FILE = HERE / "nostall.mode"     # presence = guard ON (global sticky, like voice)
+NOSTALL_FEED_MSGS = 6                     # how many of a bot's latest answers the guard reviews
+NOSTALL_COOLDOWN_SECS = 180              # min seconds between interventions on ONE bot
+NOSTALL_LEGIT_MARKER = "LEGIT STOP"      # verdict meaning "release it — genuinely done"
 
 
 def resolve_session_name(raw: str):
+    """Map a raw (possibly mis-transcribed) token to a currently-available selectable bot, or
+    None. Everything comes from the boot scan: exact name, then a config-declared alias, then a
+    fuzzy match — all against the bots that exist right now."""
     tok = (raw or "").strip().split()
     if not tok:
         return None
     n = tok[0].strip(" .!?,;:'\"").lower()
-    if n in SESSION_EMOJI:
+    sel = selectable_bots()
+    if n in sel:                  # internal/system bots aren't in `sel`, so they never resolve
         return n
-    if n in SESSION_ALIASES:
-        return SESSION_ALIASES[n]
+    aliases = session_aliases()
+    if n in aliases and aliases[n] in sel:
+        return aliases[n]
     import difflib
-    close = difflib.get_close_matches(n, list(SESSION_EMOJI), n=1, cutoff=0.8)
+    close = difflib.get_close_matches(n, sel, n=1, cutoff=0.8)
     return close[0] if close else None
-DEFAULT_SESSION = "claude"
 
 
 def _session_files(name: str):
@@ -240,11 +241,30 @@ def _session_files(name: str):
             str(HERE / f"cwd.{name}.path"))
 
 
+BOTS_DIR = HERE / "bots"    # every bot is a subdirectory here (config.json + optional main.md)
+
+
 def bot_config(name: str) -> dict:
     try:
-        return json.loads((HERE / "bots" / name / "config.json").read_text(encoding="utf-8"))
+        return json.loads((BOTS_DIR / name / "config.json").read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def ensure_default_bot() -> None:
+    """Self-heal the default 'claude' bot before the roster is read: guarantee its dir,
+    config.json, and var/.gitkeep exist, regenerating only what's missing. Scoped to the default
+    bot — other bots are simply whatever is on disk."""
+    d = BOTS_DIR / DEFAULT_SESSION
+    keep = d / "var" / ".gitkeep"
+    if not keep.is_file():
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        keep.touch()
+    cfg = d / "config.json"
+    if not cfg.is_file():
+        cfg.write_text(json.dumps(_DEFAULT_CLAUDE_CONFIG, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        log.info("bootstrap: regenerated %s", cfg)
 
 
 class Session:
@@ -252,9 +272,12 @@ class Session:
 
     def __init__(self, name: str):
         self.name = name
-        self.emoji = SESSION_EMOJI.get(name, "⚪")
         self.config = bot_config(name)
+        self.emoji = self.config.get("icon") or DEFAULT_ICON
+        self.internal = bool(self.config.get("internal"))
         self.empty_reply = self.config.get("empty_reply")
+        # Ring of this bot's most-recent answers — what the guard reviews when it goes idle.
+        self.recent_answers = collections.deque(maxlen=NOSTALL_FEED_MSGS)
         # Live transcription compute: config value at spawn, else None => the code default.
         # `bot transcribe` overrides this in-memory (process-lived); never persisted.
         self.compute = TRANSCRIBE_PRESETS.get((self.config.get("transcribe") or "").lower())
@@ -272,6 +295,7 @@ class Session:
         self.watchdog_task = None
         self.relay = None            # SpontaneousRelay for this session
         self.no_more_work = False    # this session's Claude declared it's out of work
+        self.parked = False          # user forced end-state idle: no nudging, no anti-stall (bot park)
 
     def __repr__(self):
         return f"<Session {self.emoji}{self.name}>"
@@ -296,16 +320,19 @@ class SessionRegistry:
         return self.sessions.get(name)
 
     def multiplexing(self) -> bool:
-        return len(self.sessions) > 1
+        # Internal bots don't count — a solo install stays single-session (no badges) even
+        # while the anti-stall guard is running one in the background.
+        return len([s for s in self.sessions.values() if not s.internal]) > 1
 
     def known(self, name: str) -> bool:
-        return name in SESSION_EMOJI
+        return name in discover_bots()
 
     def badge(self, session: "Session") -> str:
         """Color-bubble tag — '' unless multiplexing, so the default path is untouched."""
         return f"{session.emoji} {session.name} · " if self.multiplexing() else ""
 
 
+ensure_default_bot()   # regenerate bots/claude/ if missing BEFORE the default session reads it
 registry = SessionRegistry()
 registry.ensure_default()
 # `controller` ALWAYS tracks the CURRENT session (reassigned by select_session), so the many
@@ -730,9 +757,6 @@ SELFCONFIG_PREAMBLE = (
 )
 
 
-BOTS_DIR = HERE / "bots"
-
-
 def bot_home(name: str):
     d = BOTS_DIR / name
     return d if (d / "main.md").is_file() else None
@@ -905,6 +929,23 @@ def set_voice_mode(on: bool) -> None:
     else:
         try:
             VOICE_MODE_FILE.unlink()
+        except OSError:
+            pass
+
+
+# The anti-stall guard is a persistent toggle (like voiceback): while on, the guard bot reviews
+# any session that goes idle with nothing running and forces it back to work if it's stalling.
+# Presence of the flag file = on. Default OFF (file absent).
+def nostall_on() -> bool:
+    return NOSTALL_FILE.exists()
+
+
+def set_nostall(on: bool) -> None:
+    if on:
+        NOSTALL_FILE.write_text("on", encoding="utf-8")
+    else:
+        try:
+            NOSTALL_FILE.unlink()
         except OSError:
             pass
 
@@ -1262,6 +1303,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text(BLOCKED_MSG)
         return
     set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
+    target.parked = False            # ...and un-parks it
     enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "audio", False)
 
 
@@ -1670,6 +1712,8 @@ class SegmentRenderer:
         # voiceback branch (under voiceback the answer is collected, not streamed), startswith
         # exactly as the nudge prompt instructs Claude.
         answer = "".join(self.answer_buf).strip() or final
+        if answer and self.session is not None:
+            self.session.recent_answers.append(answer)  # what the guard reviews if this bot stalls
         clean = answer.lstrip()
         if clean.upper().startswith(NO_MORE_WORK_MARKER):
             set_no_more_work(self.session, True)
@@ -1840,6 +1884,80 @@ async def dispatch_to_claude(
         return
 
 
+def discover_bots() -> dict:
+    """Scan `bots/*/` → {name: config}, the entire bot roster. A bot exists on disk if its
+    directory has a config.json or a main.md; its icon, aliases, and internal flag all live in
+    that config. Adding or removing a bot is a filesystem operation, not a code change."""
+    found = {}
+    if BOTS_DIR.is_dir():
+        for d in sorted(BOTS_DIR.iterdir()):
+            if d.is_dir() and ((d / "config.json").is_file() or (d / "main.md").is_file()):
+                found[d.name] = bot_config(d.name)
+    return found
+
+
+def bot_icon(name: str) -> str:
+    """A bot's badge emoji — from its own config; the default gear if it declares none."""
+    return bot_config(name).get("icon") or DEFAULT_ICON
+
+
+def selectable_bots() -> list:
+    """Names a user can `bot select`: the scanned roster minus internal bots, default first."""
+    names = sorted(n for n, c in discover_bots().items() if not c.get("internal"))
+    if DEFAULT_SESSION in names:
+        names.remove(DEFAULT_SESSION)
+        names.insert(0, DEFAULT_SESSION)
+    return names
+
+
+def session_aliases() -> dict:
+    """Fuzzy voice/text aliases → canonical name, assembled from each bot's config `aliases`."""
+    out = {}
+    for name, cfg in discover_bots().items():
+        for a in cfg.get("aliases") or []:
+            out[str(a).strip().lower()] = name
+    return out
+
+
+def nostall_bot_available() -> bool:
+    """The guard can only run if its bot is actually installed (bots/<NOSTALL_BOT>/). bot.py
+    knows the name; the bot supplies its own icon/model/effort via config."""
+    return NOSTALL_BOT in discover_bots()
+
+
+def ensure_nostall_bot():
+    """Ensure the guard's bot exists in the registry when the guard is on. It's driven directly
+    via `ask_text` — NO queue worker, watchdog, or relay — so it never auto-ends, never polices
+    itself, and never flips multiplexing. Its Claude connects lazily on the first consult (session
+    id persisted like any other bot). Returns the Session, or None if the guard is off / the bot
+    isn't installed. Idempotent."""
+    if not nostall_on() or not nostall_bot_available():
+        return None
+    s = registry.sessions.get(NOSTALL_BOT)
+    if s is None:
+        s = Session(NOSTALL_BOT)
+        registry.sessions[NOSTALL_BOT] = s
+        log.info("nostall: %s activated (%s)", NOSTALL_BOT, _model_label(s.controller))
+    return s
+
+
+async def ask_text(session, prompt: str, timeout: float = 240) -> str:
+    """Run ONE quiet turn on a session's controller and return its final answer text — no
+    channel rendering, no board. Used to consult the guard bot. Best-effort: returns '' on any
+    error/timeout so a stalled consult can never wedge the caller (the watchdog)."""
+    box = {"text": ""}
+
+    async def sink(msg):
+        if isinstance(msg, ResultMessage):
+            box["text"] = (getattr(msg, "result", "") or "").strip()
+
+    try:
+        await asyncio.wait_for(session.controller.ask(prompt, sink), timeout)
+    except Exception:
+        log.exception("ask_text failed for %s", session.name)
+    return box["text"]
+
+
 class SpontaneousRelay:
     """Renders the turns Claude starts on its OWN (a background shell completed) to the
     owner's chat — a fresh segment each time, posted at the bottom. This is what makes
@@ -1897,6 +2015,7 @@ class Watchdog:
         self.count = 1
         self.is_latest = False    # is our status message still the newest in the chat?
         self.done_declared = False  # IDLE_DONE one-shot guard (Claude said NO MORE WORK)
+        self._nostall_last = 0.0    # monotonic ts of the last anti-stall intervention (cooldown)
 
     def _chat(self):
         return sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
@@ -1935,6 +2054,15 @@ class Watchdog:
                     continue
                 st = self.session.controller.status()
                 idle_no_shells = (not st["active"]) and (not st["shells"])
+                if self.session.parked:
+                    # Parked (bot park): intentional end-state idle. Never auto-ended, nudged, or
+                    # policed by the anti-stall guard. Announce once when it settles, then stay
+                    # silent until the user sends it something (which un-parks it).
+                    if idle_no_shells and not self.done_declared:
+                        self.done_declared = True
+                        await self._show("🅿️ parked — end-state idle, no nudging or anti-stall. "
+                                         "Send anything to wake it.")
+                    continue
                 background = (self.session.name != DEFAULT_SESSION
                              and registry.current() is not self.session)
                 if idle_no_shells and background:
@@ -1955,6 +2083,7 @@ class Watchdog:
                         asyncio.create_task(end_session(self.session.name))
                         return
                     continue
+                policing = nostall_on() and not self.session.internal
                 if idle_no_shells and is_no_more_work(self.session):
                     # IDLE_DONE: Claude declared it's out of work. One-shot + terminal — no
                     # nudging — until the user sends something (which clears the flag). Input
@@ -1962,15 +2091,25 @@ class Watchdog:
                     if self.done_declared:
                         continue
                     self.done_declared = True
+                    if policing:
+                        # Anti-stall on: don't just accept "done" — let the guard second-guess it.
+                        # If the guard agrees it's genuinely finished, fall through to the ✅ notice;
+                        # otherwise it has already kicked the bot back to work, so stay quiet.
+                        if not await self._police_stall("it declared NO MORE WORK"):
+                            continue
                     await self._show("✅ idle · done — you said NO MORE WORK. "
                                      "Say hi whenever there's more.")
                     continue
                 self.done_declared = False
                 if idle_no_shells:
-                    # IDLE_NO_SHELLS: accumulate ×N (refreshing datetime), and at ×30 nudge
-                    # Claude to continue or declare done (reply leading with NO MORE WORK).
+                    # IDLE_NO_SHELLS: accumulate ×N (refreshing datetime). With the anti-stall
+                    # guard ON, it owns the intervention (from ×30, throttled by its own
+                    # cooldown); otherwise Claude gets the canned continue-or-declare-done nudge.
                     await self._show("💤 idle · 🐚 no shells — nothing running.")
-                    if self.count == IDLE_NO_SHELLS_NUDGE_AT:
+                    if policing:
+                        if self.count >= IDLE_NO_SHELLS_NUDGE_AT:
+                            await self._police_stall("it went quiet with nothing left running")
+                    elif self.count == IDLE_NO_SHELLS_NUDGE_AT:
                         await self._nudge_idle_no_shells()
                     continue
                 idle_with_shells = (not st["active"]) and bool(st["shells"])
@@ -1980,6 +2119,59 @@ class Watchdog:
                     await self._nudge_idle_shells()
             except Exception:
                 log.exception("watchdog error")
+
+    async def _police_stall(self, reason: str) -> bool:
+        """Anti-stall: hand this bot's most-recent answers to the guard bot and let it judge
+        whether the stop is genuine or a stall. Returns True if the guard rules it a legitimate
+        stop (the caller should let the bot rest), False if the guard browbeat it (already posted +
+        re-queued as the bot's next turn) OR the consult was skipped. Cooldown-throttled per bot so
+        a stubborn bot can't spin the guard in a tight loop. Only ever called idle + no shells."""
+        now = time.monotonic()
+        if (now - self._nostall_last) < NOSTALL_COOLDOWN_SECS:
+            return False
+        chat = self._chat()
+        recent = [a for a in list(self.session.recent_answers) if a.strip()]
+        if chat is None or not recent:
+            return False
+        guard = ensure_nostall_bot()
+        if guard is None or guard is self.session:
+            return False
+        self._nostall_last = now
+
+        def _cap(a: str) -> str:
+            return a if len(a) <= 2000 else a[:2000] + " …[truncated]"
+
+        convo = "\n\n--- next message ---\n\n".join(_cap(a) for a in recent)
+        # Pure plumbing: hand the guard the raw material and let its main.md / var/ define the whole
+        # policing protocol (what stalling is, how to argue, and the LEGIT STOP output contract).
+        prompt = (
+            bot_boot_pointer(guard.name)
+            + f'The bot "{self.session.name}" just stopped with nothing running ({reason}). '
+            "Its most recent messages, oldest first:\n\n"
+            f"{convo}"
+        )
+        log.warning("nostall: policing %s (%s)", self.session.name, reason)
+        verdict = (await ask_text(guard, prompt)).strip()
+        if not verdict:
+            return False
+        if verdict.upper().startswith(NOSTALL_LEGIT_MARKER):
+            log.info("nostall: cleared %s — genuinely done", self.session.name)
+            return True
+        # Stalling: show the intervention (in the watchdog's own voice) and kick the bot back.
+        log.warning("nostall: %s was stalling — kicking it back", self.session.name)
+        try:
+            await self.app.bot.send_message(
+                chat, registry.badge(self.session) + "🐕 caught it stalling — back to work 👇")
+            await reply_chunked_bot(self.app.bot, chat, None, verdict)
+            mark_sent()
+        except Exception:
+            log.exception("nostall: posting the intervention failed")
+        set_no_more_work(self.session, False)
+        # The bot never converses with the guard — it just receives the order and acts on it.
+        # Inject as a bare anti-stall directive (no persona to reply to) so it resumes.
+        enqueue_for_claude(self.session, chat, None,
+                           "[anti-stall] " + verdict, "text", False)
+        return False
 
     async def _nudge_idle_shells(self):
         """~30 min idle with shells still running: ask Claude to continue, check for stuck
@@ -2116,12 +2308,13 @@ BOT_HELP = (
     "• bot restart — restart the bridge process\n"
     "• bot echo <text> — echo text back (not sent to Claude)\n"
     "• bot voice [on|off] — spoken replies for EVERYTHING (toggle)\n"
+    "• bot nostall [on|off] — anti-stall guard: forces idle bots back to work if they stall\n"
+    "• bot park — force THIS bot into intentional end-state idle (no nudging, no anti-stall)\n"
     "• bot harness <text> (or bot h) — message the AI working on this machine\n"
     "• bot status — bridge, effort, session & context\n"
     "• bot session — current session id\n"
     "• bot sessions — list parallel sessions (multiplexing)\n"
-    "• bot select <name> — switch to / create a parallel Claude "
-    "(claude·blu·gil·ava·ily·max·gol·nyx·sno)\n"
+    "• bot select <name> — switch to / create a parallel Claude (names: bot sessions)\n"
     "• bot end <name> — tear down a parallel session\n"
     "• bot help — this list\n"
     'Anything not starting with "bot" is sent to Claude.'
@@ -2181,8 +2374,13 @@ async def _status_text() -> str:
     lines.append(f"📂 cwd: {ctrl.get_cwd()}")
     lines.append(f"🎙 transcribe: {MODEL_SIZE}/{sc} ({_PRESET_BY_COMPUTE.get(sc, '?')})")
     lines.append(f"🔊 voice replies: {'on' if voice_mode_on() else 'off'}")
+    if nostall_on():
+        lines.append("🐕 anti-stall: on")
+    if cur.parked:
+        lines.append("🅿️ parked (end-state idle)")
     if registry.multiplexing():
-        others = " ".join(f"{s.emoji}{s.name}" for s in registry.sessions.values())
+        others = " ".join(f"{s.emoji}{s.name}" for s in registry.sessions.values()
+                          if not s.internal)
         lines.append(f"🗂 sessions: {others}")
     if is_blocked():
         lines.append("🔒 LOCKED — unblock at the machine to resume")
@@ -2227,13 +2425,15 @@ def _sessions_overview() -> str:
     """Human list of all live sessions (for `bot sessions` / `bot select` with no name)."""
     lines = []
     for name, s in registry.sessions.items():
+        if s.internal:
+            continue  # internal/system bots are not part of the user-facing session list
         cur = " ← current" if name == registry.current_name else ""
         busy = "working" if s.controller.busy else "idle"
         sid = (s.controller.session_id or "")[:8] or "new"
         mdl = _model_label(s.controller)
         lines.append(f"{s.emoji} {s.name} · {busy} · {mdl} · 🧵 {sid} · 📂 {s.controller.get_cwd()}{cur}")
     body = "\n".join(lines)
-    pal = ", ".join(f"{e}{n}" for n, e in SESSION_PALETTE)
+    pal = ", ".join(f"{bot_icon(n)}{n}" for n in selectable_bots())
     if registry.multiplexing():
         body += f"\n\nSwitch: bot select <name> · End: bot end <name>\nNames: {pal}"
     else:
@@ -2395,6 +2595,49 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         )
         return True
 
+    # "bot nostall [on|off]" — the anti-stall guard. While ON, a background policing bot reviews
+    # any bot that goes idle with nothing running and forces it back to work if it's stalling.
+    # Global sticky like `bot voice`; toggles with no argument. Can't be turned on if its bot
+    # isn't installed.
+    m = re.match(r"^(?:nostall|antistall|anti-?stall|no-?stall)\b\s*(.*)$", rest.strip(), re.IGNORECASE)
+    if m:
+        arg = m.group(1).strip().strip(" .!?,;:").lower()
+        if arg in ("on", "yes"):
+            state = True
+        elif arg in ("off", "no", "stop"):
+            state = False
+        else:
+            state = not nostall_on()  # no/unknown arg → toggle
+        if state and not nostall_bot_available():
+            await reply(f"⚠️ Can't turn on anti-stall — the '{NOSTALL_BOT}' bot isn't installed "
+                        f"(bots/{NOSTALL_BOT}/ is missing).")
+            return True
+        set_nostall(state)
+        if state:
+            ensure_nostall_bot()
+        elif NOSTALL_BOT in registry.sessions:
+            asyncio.create_task(end_session(NOSTALL_BOT))
+        log.info("bot command: nostall -> %s", "on" if state else "off")
+        await reply(
+            "🐕 Anti-stalling guard is ON — a bot that stops with nothing running gets reviewed "
+            "and forced back to work if it's stalling. Turn off with: bot nostall off"
+            if state else "🐕 Anti-stalling guard is OFF."
+        )
+        return True
+
+    # "bot park" — force the current bot into intentional end-state idle: the watchdog stops
+    # nudging it AND the anti-stall guard leaves it alone. It's deliberate rest, not a stall.
+    # Cleared automatically the moment you send it anything. Doesn't interrupt a running turn —
+    # it takes effect once the bot next goes idle (use `bot stop` to halt active work first).
+    if re.match(r"^park\b", rest.strip(), re.IGNORECASE):
+        target = registry.current()
+        target.parked = True
+        log.info("bot command: park -> %s", target.name)
+        who = f"{target.emoji} {target.name}" if registry.multiplexing() else "Claude"
+        await reply(f"🅿️ Parked {who} — end-state idle, no nudging and no anti-stall policing. "
+                    "Send it anything to wake it up.")
+        return True
+
     # "bot logs [n]" — last N lines of the bridge log.
     m = re.match(r"^logs?\b\s*(\d*)$", rest.strip(), re.IGNORECASE)
     if m:
@@ -2417,7 +2660,7 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         if not raw:
             await reply(_sessions_overview())
         elif name is None:
-            pal = ", ".join(f"{e} {n}" for n, e in SESSION_PALETTE)
+            pal = ", ".join(f"{bot_icon(n)} {n}" for n in selectable_bots())
             await reply(f'🎨 Unknown session "{raw}". Pick one of: {pal}')
         else:
             existed = name in registry.sessions
@@ -2606,6 +2849,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "View it with the Read tool and respond based on our conversation context.")
     target = registry.current()
     set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
+    target.parked = False            # ...and un-parks it
     enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "image", False)
 
 
@@ -2631,6 +2875,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     target = registry.current()
     set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
+    target.parked = False            # ...and un-parks it
     enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "text", False)
 
 
@@ -2861,6 +3106,9 @@ async def on_startup(application) -> None:
     # spontaneous relay (turns Claude starts on its own), and its silence-breaker watchdog.
     # Extra sessions are activated on `bot select`. One guard covers all sessions.
     _activate_session(registry.current())
+    log.info("bots discovered on disk: %s", ", ".join(discover_bots()) or "(none)")
+    if nostall_on():
+        ensure_nostall_bot()  # anti-stall guard was left on — bring its bot up at startup
     _spawn(worker_guard(), name="worker_guard")
     log.info("default session activated (worker + relay + watchdog); guard started "
              "(debounce %.1fs)", BATCH_DEBOUNCE)

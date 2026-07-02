@@ -9,11 +9,15 @@ def test_config_resolution():
     assert sno["model"] == "haiku" and sno["transcribe"] == "fast" and sno["effort"] == "medium"
     assert bot.bot_config("ily")["effort"] == "high"
     assert bot.bot_config("ava")["effort"] == "xhigh"
-    assert bot.bot_config("nyx") == {"model": "opus", "effort": "max", "voiceback": False}
+    nyx = bot.bot_config("nyx")
+    assert nyx["model"] == "opus" and nyx["effort"] == "max" and nyx["voiceback"] is False
     assert bot.bot_config("blu")["effort"] == "xhigh"
-    assert bot.bot_config("max") == {"model": "opus", "effort": "max", "voice": {"name": "bm_fable"}}
-    assert bot.bot_config("claude") == {}
-    assert bot.bot_config("gil") == {"transcribe": "good"}
+    mx = bot.bot_config("max")
+    assert mx["model"] == "opus" and mx["effort"] == "max" and mx["voice"] == {"name": "bm_fable"}
+    assert bot.bot_config("gil")["transcribe"] == "good"
+    # Every bot now carries its own icon in config (roster + badges are config-driven).
+    for name in ("claude", "blu", "gil", "ava", "ily", "max", "gol", "nyx", "sno"):
+        assert bot.bot_config(name).get("icon"), name
 
 
 def test_forced_model_is_per_session():

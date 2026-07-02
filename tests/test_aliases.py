@@ -16,8 +16,15 @@ def test_alias_resolution():
 
 
 def test_canonical_names_resolve_to_self():
-    for n in bot.SESSION_EMOJI:
+    for n in bot.selectable_bots():
         assert bot.resolve_session_name(n) == n
+
+
+def test_internal_bots_are_not_selectable():
+    # The anti-stall bot exists on disk and is internal, but must NEVER resolve via `bot select`
+    # — it is driven internally, not chosen by the user.
+    assert bot.NOSTALL_BOT in bot.discover_bots()
+    assert bot.resolve_session_name(bot.NOSTALL_BOT) is None
 
 
 def test_unknown_and_empty_return_none():

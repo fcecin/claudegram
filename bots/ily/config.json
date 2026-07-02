@@ -1,4 +1,6 @@
 {
+  "icon": "🟡",
+  "aliases": ["illy", "ili", "ilie", "ilee", "eely", "ealy", "ellie", "elle", "elly", "eli"],
   "model": "sonnet",
   "transcribe": "fast",
   "effort": "high",

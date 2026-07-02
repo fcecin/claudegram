@@ -1,4 +1,6 @@
 {
+  "icon": "⚪",
+  "aliases": ["snow", "snoh", "snoo", "snou", "snoe"],
   "model": "haiku",
   "transcribe": "fast",
   "effort": "medium",

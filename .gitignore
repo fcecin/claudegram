@@ -8,6 +8,7 @@ effort.level
 cwd.path
 compute.type
 voice.mode
+nostall.mode
 BLOCKED.flag
 SLEEP.flag
 INTRUSION_OFF.flag

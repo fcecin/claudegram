@@ -43,7 +43,8 @@ def test_nyx_is_a_mute_image_bot():
     assert home is not None
     assert (home / "tools" / "send").is_file()
     assert "tools/send" in (home / "main.md").read_text()
-    assert bot.bot_config("nyx") == {"model": "opus", "effort": "max", "voiceback": False}
+    cfg = bot.bot_config("nyx")
+    assert cfg["model"] == "opus" and cfg["effort"] == "max" and cfg["voiceback"] is False
 
 
 async def test_voiceback_opt_out_config():

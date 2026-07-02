@@ -1,4 +1,6 @@
 {
+  "icon": "⚫",
+  "aliases": ["nix", "niks", "nikes", "nyks", "nyc", "nicks", "knicks", "nyxx"],
   "model": "opus",
   "effort": "max",
   "voiceback": false
