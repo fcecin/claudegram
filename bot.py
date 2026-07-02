@@ -2103,12 +2103,12 @@ class Watchdog:
                 self.done_declared = False
                 if idle_no_shells:
                     # IDLE_NO_SHELLS: accumulate ×N (refreshing datetime). With the anti-stall
-                    # guard ON, it owns the intervention (from ×30, throttled by its own
-                    # cooldown); otherwise Claude gets the canned continue-or-declare-done nudge.
+                    # guard ON, it reviews the bot AS SOON AS this status appears (the first idle+
+                    # no-shells tick) — `_police_stall`'s own cooldown stops it from re-reviewing
+                    # too fast. With the guard OFF, Claude gets the canned nudge only at ×30.
                     await self._show("💤 idle · 🐚 no shells — nothing running.")
                     if policing:
-                        if self.count >= IDLE_NO_SHELLS_NUDGE_AT:
-                            await self._police_stall("it went quiet with nothing left running")
+                        await self._police_stall("it's idle with nothing running")
                     elif self.count == IDLE_NO_SHELLS_NUDGE_AT:
                         await self._nudge_idle_no_shells()
                     continue
