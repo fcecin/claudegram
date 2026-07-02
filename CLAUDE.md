@@ -65,15 +65,20 @@ continuous reader relays them.
   The loop is fully wrapped (`except: log`) so it can't die silently, and it **skips entirely
   while `transcribe_active()`** (a decode isn't idleness).
 
-## Voiceback (spoken replies) — a persistent toggle, no per-message cue
+## Voiceback (spoken replies) — a persistent toggle, Kokoro TTS
 `bot voice on`/`off` toggles `VOICE_MODE_FILE` (`voice.mode`, presence = on; `voice_mode_on()`),
-and the dispatcher OR's it into `voiceback` for every turn. (The old per-message `voice`/`voz`
-prefix was finicky over transcription and was **removed** — `parse_voiceback` is gone; the
-toggle is GUI/keyboard-set, reliable.) When on: `build_prompt` injects `VOICEBACK_PREAMBLE`, the
-`SegmentRenderer` does NOT stream (collects `answer_buf`), and `_finalize_voiceback` parses
-`VOICESTART…VOICEEND` blocks → `synthesize_voice` (gTTS → mp3 → ffmpeg ogg/opus) →
-`bot.send_voice`, one per block, plus the text (markers stripped) and `[[END]]`. gTTS is
-online — swap to piper for offline if asked.
+and the dispatcher OR's it into `voiceback` for every turn. When on: `build_prompt` injects
+`VOICEBACK_PREAMBLE` (be brief, no code/paths/lists — the whole reply is spoken), the
+`SegmentRenderer` does NOT stream (collects `answer_buf`), and `_finalize_voiceback` sends the
+whole answer as ONE voice message (no text transcript) + `[[END]]`.
+- **TTS = Kokoro** (offline ONNX, no torch, no network): `models/kokoro-v1.0.onnx` +
+  `voices-v1.0.bin` (gitignored, fetched by `./fetch-kokoro.sh`; `pip install kokoro-onnx
+  soundfile`). `synthesize_voice` → wav → ffmpeg → ogg/opus. Lazy-loaded singleton `_get_kokoro`.
+- A session's `voice` config selects a Kokoro voice + optional ffmpeg effects (`_voice_filters`).
+  `_resolve_voice` switches to a native voice for non-English text (pt/es/fr/it/hi/ja/zh); with no
+  `voice` config a session uses `DEFAULT_VOICE`.
+- `voiceback: false` in a session's config opts it out entirely — it never speaks even when
+  voiceback is globally on (`dispatch_to_claude` forces it off). For image-only sessions.
 
 ## Transcription (killable subprocess + watchdog)
 Voice → `handle_audio` downloads the audio, then runs the decode as a **subprocess**
@@ -104,13 +109,38 @@ status). Gated by `INTRUSION_OFF_FILE` (`INTRUSION_OFF.flag`, presence = OFF; **
 absent). The toggle lives ONLY in the GUI (`gui.py` 🛡 switch creates/deletes the flag) — **never
 a `bot` command**, so it can't be disabled remotely over Telegram (like physical-unlock-only).
 
+## Multi-session multiplexing (ONE Telegram bot, N concurrent sessions)
+One bot can drive several independent Claude sessions in the same channel — an alternative to the
+single default session. `SessionRegistry`/`Session` give each its own `ClaudeController` (own
+`session.<name>.id`/`cwd`/`effort` files; the DEFAULT `claude` reuses the original `session.id`),
+its own dispatch queue+worker, watchdog, and spontaneous relay — so sessions run **concurrently**.
+Each session has a color badge. A session may carry a `config.json` (read by `bot_config`); the
+per-session contents are not documented here.
+- **Progressive disclosure:** while only `claude` exists, `registry.multiplexing()` is False and
+  every `registry.badge(session)` is `""` — the bridge renders exactly like the single-session
+  version. A 2nd session flips multiplexing on and every bot-authored artifact (board header,
+  each streamed answer message, `[[END]]`, alerts, watchdog line, transcription bubble, voiceback)
+  is prefixed `"<emoji> <name> · "` so an interleaved scroll self-identifies per message. You
+  CANNOT edit the user's own messages via the Bot API, so the tag rides the bot's reply-anchored
+  ack (the board replies to your message), never your message.
+- **Routing:** `bot select <name>` (aliases switch/use) creates-on-first-use + sets the CURRENT
+  session (reassigns the module `controller`); bare input goes to current. Handlers capture
+  `target = registry.current()` at send-time (a mid-decode select can't misroute). `bot sessions`
+  lists; `bot end <name>` tears one down (never the default).
+- **Per-session vs global:** each session owns its queue/worker/watchdog/relay AND its own
+  `no_more_work` flag (`set_no_more_work(session, …)`). GLOBAL stays global because it's about the
+  channel/machine: the `_transcribe_lock` (one whisper at a time — CPU), all security state
+  (allowlist, intrusion lock, `BLOCKED.flag`, `SLEEP.flag`), and `_last_tg_send` silence. Intrusion
+  kills EVERY session's controller. `mark_sent()`/`Watchdog._touch()` invalidate all watchdogs'
+  `is_latest`. One `worker_guard` covers all sessions.
+
 ## Message batching
-Handlers don't call `dispatch_to_claude` directly — they `enqueue_for_claude`. A single
-`dispatch_worker` (started in on_startup) drains the queue after a `BATCH_DEBOUNCE` window
-and sends the WHOLE burst as ONE combined prompt (`\n\n`-joined). voiceback/source are
-OR'd across the batch. This also serializes user turns (one at a time); messages arriving
-mid-turn batch into the next. `bot compact` still dispatches directly (serialized by the
-controller lock).
+Handlers don't call `dispatch_to_claude` directly — they `enqueue_for_claude(session, …)`. A
+per-session `session_worker` (started via `_activate_session` in on_startup / on `bot select`)
+drains that session's queue after a `BATCH_DEBOUNCE` window and sends the WHOLE burst as ONE
+combined prompt (`\n\n`-joined). voiceback/source are OR'd across the batch. This also serializes
+that session's user turns (one at a time); messages arriving mid-turn batch into the next. `bot
+compact` still dispatches directly to the current session (serialized by the controller lock).
 
 **Dispatcher robustness (hard-won):** the worker can wedge/vanish after `bot stop`
 (interrupt) — py-spy showed the loop healthy but the `dispatch_worker` task gone. Defenses:
@@ -170,12 +200,24 @@ control; subscription is forced (`force_subscription_env` strips `ANTHROPIC_API_
 - **NEVER** `pkill -f "claudegram/bot.py"` — the pattern matches the killing shell's own
   argv and it self-kills. Kill by explicit PID.
 
-## TESTING (do not break the user's live session)
-- **Never** run a turn against the module-level `controller` — it writes the real
-  `session.id`. Use a throwaway `ClaudeController(temp_cwd, temp_session_file, …)`, or
-  monkeypatch `bot.controller` with a fake bot that records `send_message`/
-  `edit_message_text`. Use `effort=low` for speed. See the integration pattern: fake bot
-  + isolated controller + a `run_in_background` shell to exercise the spontaneous relay.
+## TESTING (`./test.sh` — offline, no Telegram, no real Claude)
+Run `./test.sh` (→ `tests/run.py`, a deps-free runner; no pytest). It's fast + deterministic
+because the bridge has exactly **two external edges** and `tests/fakes.py` fakes BOTH:
+- **Telegram** → `FakeBot`/`FakeApp` record `send_message`/`edit_message_text`/… (no token,
+  no network). Assert against `fakebot.sent`.
+- **Claude** → `FakeController` whose `ask()` drives a **scripted list of SDK messages** into
+  the renderer (factories: `sys_init`/`stream_text`/`assistant_tool`/`result_msg`/…). Lets you
+  provoke the rare/nondeterministic paths on demand — firewall sentinel trip, the self-started
+  (spontaneous) turn, rate-limit, `is_error`, `NO MORE WORK` (incl. under voiceback). Whole
+  turns run via `dispatch_to_claude(ctx, session, …)` with a fake session.
+Coverage: `test_multiplex` (registry/routing/badges), `test_render` (badge on every message),
+`test_regressions` (the 2026-07-01 voiceback bugs, pinned), `test_turn` (firewall / spontaneous
+relay / crash via mock-Claude). The runner resets the registry + clears flags between tests.
+- **Add a test** whenever you touch bridge logic — it's cheap now. Keep the few *real*-Claude
+  checks (isolated `ClaudeController(temp_cwd, temp_session_file, effort='low')`) as a thin
+  "contract" layer that pins SDK message shapes + the self-wake-on-shell-complete fact; the
+  fakes assume those shapes, so a contract test catches an SDK change the fakes would miss.
+- **Never** run a turn against the module-level `controller` — it writes the real `session.id`.
 
 ## Logging
 Everything (request / thinking / each tool + result / answer / blocks) → `claudegram.log`

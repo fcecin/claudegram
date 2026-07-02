@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GOL="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+WORKSPACE="$GOL/var/workspace"
+WALK_DIR="$WORKSPACE/.walk"
+FILE_LIST="$WALK_DIR/files.txt"
+CURSOR="$WALK_DIR/cursor"
+PROCESSED="$WALK_DIR/processed.txt"
+SKIPPED="$WALK_DIR/skipped.txt"
+LOG="$WORKSPACE/log.md"
+
+log() { mkdir -p "$WORKSPACE"; echo "$(date +%s) [walk] $*" >> "$LOG"; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  init)
+    root="${1:?usage: walk init <root> [--pattern <glob>] [--exclude <path>]... [--maxdepth N] [--force]}"; shift
+    force=false; maxdepth=""; pattern="*"; excludes=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --force) force=true; shift ;;
+        --maxdepth) maxdepth="$2"; shift 2 ;;
+        --pattern) pattern="$2"; shift 2 ;;
+        --exclude) excludes+=("-not" "-path" "$2"); shift 2 ;;
+        *) echo "unknown option: $1" >&2; exit 1 ;;
+      esac
+    done
+    root="$(readlink -f "$root")" || { echo "walk: no such root" >&2; exit 1; }
+    if [ -f "$CURSOR" ] && [ "$force" != true ]; then
+      pos=$(cat "$CURSOR"); total=$(wc -l < "$FILE_LIST")
+      log "init RESUMING $pos/$total"
+      echo "RESUMING: $((total - pos)) of $total remaining. --force to restart."
+      exit 0
+    fi
+    mkdir -p "$WALK_DIR"
+    depth=(); [ -n "$maxdepth" ] && depth=(-maxdepth "$maxdepth")
+    find "$root" "${depth[@]}" -type f -name "$pattern" "${excludes[@]}" | sort > "$FILE_LIST"
+    echo 0 > "$CURSOR"; : > "$PROCESSED"; : > "$SKIPPED"
+    total=$(wc -l < "$FILE_LIST"); log "init $root — $total files"
+    echo "initialized: $total files from $root"
+    ;;
+  next)
+    [ -f "$CURSOR" ] || { echo "no walk initialized" >&2; exit 1; }
+    pos=$(cat "$CURSOR"); total=$(wc -l < "$FILE_LIST")
+    [ "$pos" -ge "$total" ] && { log "next DONE"; echo DONE; exit 0; }
+    file=$(sed -n "$((pos + 1))p" "$FILE_LIST"); log "next $file ($((pos + 1))/$total)"
+    echo "$file"
+    ;;
+  done)
+    [ -f "$CURSOR" ] || { echo "no walk initialized" >&2; exit 1; }
+    pos=$(cat "$CURSOR"); file=$(sed -n "$((pos + 1))p" "$FILE_LIST")
+    echo "$file" >> "$PROCESSED"; echo $((pos + 1)) > "$CURSOR"
+    rem=$(( $(wc -l < "$FILE_LIST") - pos - 1 )); log "done $file"
+    echo "[$(date +%s)] OK ($rem remaining). Append results to $WORKSPACE/report.md and $LOG via $GOL/tools/append. Do not read those files."
+    ;;
+  skip)
+    [ -f "$CURSOR" ] || { echo "no walk initialized" >&2; exit 1; }
+    pos=$(cat "$CURSOR"); file=$(sed -n "$((pos + 1))p" "$FILE_LIST")
+    echo "$file" >> "$SKIPPED"; echo $((pos + 1)) > "$CURSOR"
+    rem=$(( $(wc -l < "$FILE_LIST") - pos - 1 )); log "skip $file"
+    echo "[$(date +%s)] skipped ($rem remaining)"
+    ;;
+  status)
+    [ -f "$CURSOR" ] || { echo "no walk initialized" >&2; exit 1; }
+    pos=$(cat "$CURSOR"); total=$(wc -l < "$FILE_LIST")
+    echo "total: $total | processed: $(wc -l < "$PROCESSED") | skipped: $(wc -l < "$SKIPPED") | remaining: $((total - pos))"
+    ;;
+  reset)
+    [ -f "$CURSOR" ] || { echo "no walk initialized" >&2; exit 1; }
+    echo 0 > "$CURSOR"; : > "$PROCESSED"; : > "$SKIPPED"; log reset
+    echo "reset. $(wc -l < "$FILE_LIST") files."
+    ;;
+  index)
+    [ -f "$FILE_LIST" ] || { echo "no walk initialized" >&2; exit 1; }
+    cat "$FILE_LIST"
+    ;;
+  *)
+    echo "usage: walk {init <root>|next|done|skip|status|reset|index}"
+    ;;
+esac

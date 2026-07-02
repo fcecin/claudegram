@@ -128,6 +128,13 @@ def get_compute_type() -> str:
     return COMPUTE_TYPE
 
 
+def session_compute(session) -> str:
+    preset = (getattr(session, "config", None) or {}).get("transcribe")
+    if preset in TRANSCRIBE_PRESETS:
+        return TRANSCRIBE_PRESETS[preset]
+    return get_compute_type()
+
+
 def set_compute_type(compute: str) -> None:
     """Persist the chosen compute type; the next worker spawn picks it up."""
     COMPUTE_FILE.write_text(compute, encoding="utf-8")
@@ -186,39 +193,211 @@ IMAGE_TMP = Path(tempfile.gettempdir()) / "claudegram_images"  # incoming images
 IMAGE_MAX_AGE = 6 * 3600  # also prune cached images older than this on each new one (self-bound for long no-restart sessions)
 HARNESS_OUTBOX = HERE / "outbox"     # drop dir: any program leaves a msg -> sent to phone
 HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by the AI here
-controller = ClaudeController(
-    str(CGHOME), str(SESSION_FILE), str(EFFORT_FILE), str(CWD_FILE)
-)
+MEDIA_OUTBOX = HERE / "media-outbox"
+# --- multi-session multiplexing (ONE Telegram bot, N concurrent Claude sessions) -----
+# Names + color bubbles. "claude" (orange) is the DEFAULT/hidden session: until a SECOND
+# session is created, registry.multiplexing() is False and every badge is "" — so the whole
+# bridge renders EXACTLY like a single-Claude install. The moment a sibling exists, every
+# bot-authored artifact is prefixed with "<emoji> <name> · " so an interleaved scroll is
+# legible. Sessions run CONCURRENTLY: each is its own ClaudeController (own session id / cwd /
+# effort) with its own dispatch queue + worker + watchdog + spontaneous relay.
+SESSION_PALETTE = [
+    ("claude", "🟠"), ("blu", "🔵"), ("gil", "🟢"), ("ava", "🟣"), ("ily", "🟡"),
+    ("max", "🔴"), ("gol", "🟤"), ("nyx", "⚫"), ("sno", "⚪"),
+]
+SESSION_EMOJI = dict(SESSION_PALETTE)
+SESSION_ALIASES = {
+    "claud": "claude", "clode": "claude", "cloude": "claude", "claudee": "claude",
+    "clod": "claude", "cloud": "claude", "clawd": "claude", "clawed": "claude",
+    "klaus": "claude", "klaude": "claude",
+    "blue": "blu", "bloo": "blu", "blew": "blu", "bluu": "blu", "blou": "blu",
+    "gill": "gil", "gille": "gil", "jill": "gil", "jil": "gil", "guil": "gil",
+    "guile": "gil", "gyl": "gil", "ghil": "gil", "jheel": "gil",
+    "avah": "ava", "arva": "ava", "ahva": "ava", "aava": "ava",
+    "illy": "ily", "ili": "ily", "ilie": "ily", "ilee": "ily", "eely": "ily",
+    "ealy": "ily", "ellie": "ily", "elle": "ily", "elly": "ily", "eli": "ily",
+    "maks": "max", "mac": "max", "mocks": "max", "maxx": "max", "mx": "max",
+    "goll": "gol", "goal": "gol", "gole": "gol", "gaul": "gol", "gaol": "gol",
+    "ghoul": "gol", "gall": "gol", "gou": "gol", "goo": "gol",
+    "nix": "nyx", "niks": "nyx", "nikes": "nyx", "nyks": "nyx", "nyc": "nyx",
+    "nicks": "nyx", "knicks": "nyx", "nyxx": "nyx",
+    "snow": "sno", "snoh": "sno", "snoo": "sno", "snou": "sno", "snoe": "sno",
+}
+
+
+def resolve_session_name(raw: str):
+    tok = (raw or "").strip().split()
+    if not tok:
+        return None
+    n = tok[0].strip(" .!?,;:'\"").lower()
+    if n in SESSION_EMOJI:
+        return n
+    if n in SESSION_ALIASES:
+        return SESSION_ALIASES[n]
+    import difflib
+    close = difflib.get_close_matches(n, list(SESSION_EMOJI), n=1, cutoff=0.8)
+    return close[0] if close else None
+DEFAULT_SESSION = "claude"
+
+
+def _session_files(name: str):
+    """(session_file, effort_file, cwd_file) for a session. The DEFAULT reuses the original
+    single-session files, so an existing install's live conversation simply becomes 'claude';
+    named sessions get namespaced siblings (session.<name>.id, …)."""
+    if name == DEFAULT_SESSION:
+        return str(SESSION_FILE), str(EFFORT_FILE), str(CWD_FILE)
+    return (str(HERE / f"session.{name}.id"),
+            str(HERE / f"effort.{name}.level"),
+            str(HERE / f"cwd.{name}.path"))
+
+
+def bot_config(name: str) -> dict:
+    try:
+        return json.loads((HERE / "bots" / name / "config.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+class Session:
+    """One named Claude instance behind the single Telegram bot."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.emoji = SESSION_EMOJI.get(name, "⚪")
+        self.config = bot_config(name)
+        self.empty_reply = self.config.get("empty_reply")
+        sf, ef, cf = _session_files(name)
+        self.controller = ClaudeController(str(CGHOME), sf, ef, cf,
+                                           model=self.config.get("model"),
+                                           max_budget_usd=self.config.get("max_budget_usd"),
+                                           effort=self.config.get("effort"))
+        # per-session batching queue (mirrors the old module-level _pending* globals)
+        self.pending: list[dict] = []
+        self.pending_event = asyncio.Event()
+        self.pending_since = 0.0
+        self.worker_task = None      # session_worker() draining this queue
+        self.watchdog = None         # Watchdog for this session
+        self.watchdog_task = None
+        self.relay = None            # SpontaneousRelay for this session
+        self.no_more_work = False    # this session's Claude declared it's out of work
+
+    def __repr__(self):
+        return f"<Session {self.emoji}{self.name}>"
+
+
+class SessionRegistry:
+    """The set of live sessions + which one is CURRENT (receives undecorated input)."""
+
+    def __init__(self):
+        self.sessions: dict[str, Session] = {}
+        self.current_name = DEFAULT_SESSION
+
+    def ensure_default(self) -> "Session":
+        if DEFAULT_SESSION not in self.sessions:
+            self.sessions[DEFAULT_SESSION] = Session(DEFAULT_SESSION)
+        return self.sessions[DEFAULT_SESSION]
+
+    def current(self) -> "Session":
+        return self.sessions[self.current_name]
+
+    def get(self, name: str) -> "Session | None":
+        return self.sessions.get(name)
+
+    def multiplexing(self) -> bool:
+        return len(self.sessions) > 1
+
+    def known(self, name: str) -> bool:
+        return name in SESSION_EMOJI
+
+    def badge(self, session: "Session") -> str:
+        """Color-bubble tag — '' unless multiplexing, so the default path is untouched."""
+        return f"{session.emoji} {session.name} · " if self.multiplexing() else ""
+
+
+registry = SessionRegistry()
+registry.ensure_default()
+# `controller` ALWAYS tracks the CURRENT session (reassigned by select_session), so the many
+# command / status / lifecycle references keep operating on "the session you're talking to".
+controller = registry.current().controller
+
+
+def select_session(name: str) -> "Session":
+    """Switch the CURRENT session, creating it (from the palette) on first use and wiring up
+    its worker + watchdog + relay. Returns the Session. Reassigns the module `controller`."""
+    global controller
+    created = name not in registry.sessions
+    if created:
+        registry.sessions[name] = Session(name)
+    registry.current_name = name
+    controller = registry.sessions[name].controller
+    if created:
+        _activate_session(registry.sessions[name])
+    return registry.sessions[name]
+
+
+def _activate_session(session: "Session") -> None:
+    """Start a session's queue worker, watchdog, and spontaneous relay. Called once per
+    session (at startup for the default, on creation for the rest)."""
+    ensure_worker(session)
+    if _app is not None:
+        session.relay = SpontaneousRelay(_app, session)
+        session.controller.set_spontaneous_handler(session.relay.on_message)
+        session.watchdog = Watchdog(_app, session)
+        session.watchdog_task = _spawn(session.watchdog.loop(), name=f"watchdog[{session.name}]")
+
+
+async def end_session(name: str) -> str:
+    """Tear down a non-default session: kill its Claude, cancel its worker/watchdog, drop it.
+    Returns a human status string. If it was current, fall back to the default."""
+    if name == DEFAULT_SESSION:
+        return "can't end the default 'claude' session"
+    session = registry.sessions.get(name)
+    if session is None:
+        return f"no live session named {name}"
+    try:
+        await session.controller.kill()
+    except Exception:
+        log.exception("end_session: kill failed for %s", name)
+    for t in (session.worker_task, session.watchdog_task):
+        if t is not None and not t.done():
+            t.cancel()
+    if session.watchdog is not None and session.watchdog.msg_id is not None:
+        try:
+            await _app.bot.delete_message(session.watchdog._chat(), session.watchdog.msg_id)
+        except Exception:
+            pass
+    registry.sessions.pop(name, None)
+    if registry.current_name == name:
+        select_session(DEFAULT_SESSION)
+    return f"ended {session.emoji}{name}"
 
 # Silence tracker for the watchdog: monotonic ts of the last NEW message sent to the
 # owner. Edits don't count (they don't notify). The 60s watchdog only speaks after a gap.
 _last_tg_send = time.monotonic()
-_watchdog = None  # the Watchdog instance (set in on_startup)
 
 
 def mark_sent() -> None:
-    """Record that a (non-watchdog) message reached the owner. This also tells the
-    watchdog its last status message is no longer the newest, so its next status starts
-    a fresh message instead of editing one now buried above other content."""
+    """Record that a (non-watchdog) message reached the owner. This also tells EVERY
+    session's watchdog its last status message is no longer the newest, so its next status
+    starts a fresh message instead of editing one now buried above other content."""
     global _last_tg_send
     _last_tg_send = time.monotonic()
-    if _watchdog is not None:
-        _watchdog.is_latest = False
+    for s in registry.sessions.values():
+        if s.watchdog is not None:
+            s.watchdog.is_latest = False
 
 
-# Autonomy nudge state (ephemeral, NOT persisted): set when Claude declares it's out of
-# work (its reply leads with NO_MORE_WORK_MARKER), cleared the instant the user sends new
-# work. It ONLY controls whether the idle watchdog auto-nudges — it NEVER gates input.
-_no_more_work = False
+# Autonomy nudge state (ephemeral, NOT persisted, PER SESSION): set when THAT session's Claude
+# declares it's out of work (its reply leads with NO_MORE_WORK_MARKER), cleared the instant the
+# user sends new work to it. It ONLY controls whether that session's idle watchdog auto-nudges —
+# it NEVER gates input. Per-session so one Claude saying "done" doesn't silence another's nudger.
+def set_no_more_work(session, v: bool) -> None:
+    if session is not None:
+        session.no_more_work = v
 
 
-def set_no_more_work(v: bool) -> None:
-    global _no_more_work
-    _no_more_work = v
-
-
-def is_no_more_work() -> bool:
-    return _no_more_work
+def is_no_more_work(session) -> bool:
+    return bool(session is not None and session.no_more_work)
 
 
 # Recent tool errors ("issues"), shown on demand with `bot issues` (which DRAINS them, like
@@ -271,6 +450,8 @@ IDLE_SHELLS_NUDGE = (
 # WITH it (startswith detection in SegmentRenderer.finalize), so the prompt says so plainly.
 NO_MORE_WORK_MARKER = "NO MORE WORK"
 IDLE_NO_SHELLS_NUDGE_AT = 30
+IDLE_AUTOEND_AT = 10  # a background (non-current, non-default) session idle+no-shells this many
+#                       watchdog ticks is auto-ended to free resources (re-select recreates it)
 IDLE_NO_SHELLS_NUDGE = (
     "You have been idle for a long time with nothing running (no background shells). "
     "If you have any remaining work or next steps, CONTINUE now. If you are genuinely out "
@@ -299,12 +480,11 @@ def is_rate_limited(text) -> bool:
         return False
     t = str(text).lower()
     return any(m in t for m in _RATE_LIMIT_MARKERS)
-_pending: list[dict] = []
-_pending_event = asyncio.Event()
+# Each Session owns its OWN pending queue / event / worker (see class Session) so sessions
+# run concurrently. What stays GLOBAL is genuinely shared: ONE whisper decode at a time (CPU),
+# and the Telegram Application handle.
 _transcribe_lock = asyncio.Lock()  # serialize audio decoding: ONE at a time, in message order
-_app = None  # the telegram Application; set in on_startup so the worker can send
-_worker_task = None     # the dispatch_worker task (the guard recreates it if it wedges)
-_pending_since = 0.0    # monotonic ts the queue became non-empty (0 = empty)
+_app = None  # the telegram Application; set in on_startup so workers can send
 # asyncio keeps only WEAK refs to tasks — an unreferenced long-lived task can be garbage
 # collected mid-flight ("Task was destroyed but it is pending!"). Keep strong refs here.
 _bg_tasks: set = set()
@@ -391,47 +571,46 @@ def format_usage() -> str:
     return (" · " + " · ".join(parts)) if parts else ""
 
 
-def enqueue_for_claude(chat_id, reply_to, text: str, source: str, voiceback: bool) -> None:
-    global _pending_since
-    if not _pending:
-        _pending_since = time.monotonic()
-    _pending.append({
+def enqueue_for_claude(session, chat_id, reply_to, text: str, source: str, voiceback: bool) -> None:
+    """Queue a message onto a SPECIFIC session's batch (its worker drains it). Routing =
+    just picking the session; the current session is the usual target."""
+    if not session.pending:
+        session.pending_since = time.monotonic()
+    session.pending.append({
         "chat_id": chat_id, "reply_to": reply_to, "text": text,
         "source": source, "voiceback": voiceback,
     })
-    _pending_event.set()
+    session.pending_event.set()
 
 
-def drop_pending() -> list[str]:
-    """Discard messages queued but NOT yet dispatched to Claude; return their texts so the
-    caller can report what was dropped. Safe to call from a handler: same event loop as the
-    dispatcher, and the clear is a single non-awaiting statement (no race with the drain)."""
-    global _pending_since
-    texts = [m["text"] for m in _pending]
-    _pending[:] = []
-    _pending_since = 0.0
+def drop_pending(session) -> list[str]:
+    """Discard messages queued but NOT yet dispatched to a session's Claude; return their
+    texts. Safe from a handler: same event loop as the worker, and the clear is a single
+    non-awaiting statement (no race with the drain)."""
+    texts = [m["text"] for m in session.pending]
+    session.pending[:] = []
+    session.pending_since = 0.0
     return texts
 
 
-async def dispatch_worker() -> None:
-    """The single dispatcher: waits for queued messages, lets a burst settle, then sends
-    the WHOLE queue to Claude as one combined turn. Serializes user turns (one at a time);
-    messages that arrive while a turn runs are batched into the next one.
+async def session_worker(session) -> None:
+    """One dispatcher PER session: waits for queued messages, lets a burst settle, then sends
+    the WHOLE queue to that session's Claude as one combined turn. Serializes that session's
+    user turns (one at a time); different sessions run concurrently.
 
     The ENTIRE loop body is guarded: an exception in any iteration is logged and the worker
     keeps going. It must never die silently — a dead worker = messages received but never
-    dispatched (the queue stalls forever)."""
-    global _pending_since
+    dispatched (that session's queue stalls forever)."""
     ctx = types.SimpleNamespace(bot=_app.bot)
     while True:
         try:
-            await _pending_event.wait()
-            _pending_event.clear()
+            await session.pending_event.wait()
+            session.pending_event.clear()
             await asyncio.sleep(BATCH_DEBOUNCE)  # gather the burst
-            if not _pending:
+            if not session.pending:
                 continue
-            batch, _pending[:] = _pending[:], []
-            _pending_since = 0.0
+            batch, session.pending[:] = session.pending[:], []
+            session.pending_since = 0.0
             parts = [m["text"].strip() for m in batch if m["text"].strip()]
             if not parts:
                 continue
@@ -442,46 +621,49 @@ async def dispatch_worker() -> None:
             header = "🤖 Claude is working…"
             if len(batch) > 1:
                 header += f" · 📨 {len(batch)} msgs"
-            log.info("worker: dispatching %d message(s) to Claude", len(batch))
-            await dispatch_to_claude(ctx, chat_id, reply_to, combined, source,
+            log.info("worker[%s]: dispatching %d message(s) to Claude", session.name, len(batch))
+            await dispatch_to_claude(ctx, session, chat_id, reply_to, combined, source,
                                      header=header, voiceback=voiceback)
         except asyncio.CancelledError:
-            log.warning("dispatch_worker got CancelledError — exiting (guard/ensure_worker will revive)")
+            log.warning("session_worker[%s] got CancelledError — exiting (guard/ensure_worker revives)",
+                        session.name)
             raise  # genuine shutdown — let it propagate
         except Exception:
-            log.exception("dispatch_worker iteration failed — continuing (worker stays alive)")
+            log.exception("session_worker[%s] iteration failed — continuing (worker stays alive)",
+                          session.name)
             await asyncio.sleep(1)  # avoid a tight error loop
 
 
-def ensure_worker() -> None:
-    """(Re)create the dispatch worker if it's not running. Idempotent and cheap. Called at
-    startup, by `bot stop`, and by the guard — so a dead/cancelled worker is revived
-    immediately rather than waiting for the guard's next tick."""
-    global _worker_task
-    if _worker_task is None or _worker_task.done():
-        _worker_task = asyncio.create_task(dispatch_worker(), name="dispatch_worker")
-        log.info("dispatch worker (re)started")
+def ensure_worker(session) -> None:
+    """(Re)create a session's dispatch worker if it's not running. Idempotent and cheap.
+    Called at activation, by `bot stop`, and by the guard — so a dead/cancelled worker is
+    revived immediately rather than waiting for the guard's next tick."""
+    if session.worker_task is None or session.worker_task.done():
+        session.worker_task = asyncio.create_task(
+            session_worker(session), name=f"worker[{session.name}]")
+        log.info("dispatch worker (re)started for %s", session.name)
 
 
 async def worker_guard() -> None:
-    """Self-heal the dispatcher. If messages sit queued while Claude is idle (no turn
-    running) for too long, the worker has wedged or died — recreate it. This is what makes
-    a `bot stop` / interrupt edge case unable to permanently strand the queue."""
-    global _worker_task
+    """Self-heal the dispatchers. If messages sit queued for a session while ITS Claude is
+    idle for too long, that worker has wedged or died — recreate it. One guard covers all
+    sessions. This is what makes a `bot stop` / interrupt edge case unable to strand a queue."""
     while True:
         await asyncio.sleep(15)
         try:
-            if not _pending or controller.busy:
-                continue  # nothing queued, or a turn is legitimately running
-            age = time.monotonic() - (_pending_since or time.monotonic())
-            dead = _worker_task is None or _worker_task.done()
-            if dead or age > 40:
-                log.warning("worker guard: %d msg(s) stuck %.0fs (worker dead=%s) — recreating worker",
-                            len(_pending), age, dead)
-                if _worker_task is not None and not _worker_task.done():
-                    _worker_task.cancel()
-                _worker_task = asyncio.create_task(dispatch_worker(), name="dispatch_worker")
-                _pending_event.set()  # kick it to drain immediately
+            for session in list(registry.sessions.values()):
+                if not session.pending or session.controller.busy:
+                    continue  # nothing queued, or a turn is legitimately running
+                age = time.monotonic() - (session.pending_since or time.monotonic())
+                dead = session.worker_task is None or session.worker_task.done()
+                if dead or age > 40:
+                    log.warning("worker guard[%s]: %d msg(s) stuck %.0fs (worker dead=%s) — recreating",
+                                session.name, len(session.pending), age, dead)
+                    if session.worker_task is not None and not session.worker_task.done():
+                        session.worker_task.cancel()
+                    session.worker_task = asyncio.create_task(
+                        session_worker(session), name=f"worker[{session.name}]")
+                    session.pending_event.set()  # kick it to drain immediately
         except Exception:
             log.exception("worker guard error")
 
@@ -492,7 +674,7 @@ def ensure_cghome() -> None:
 
 def sweep_audio_tmp() -> None:
     """Clear leftover temp media (incoming voice/images + outgoing TTS) from a prior crash."""
-    for d in (AUDIO_TMP, VOICE_TMP, IMAGE_TMP):
+    for d in (AUDIO_TMP, VOICE_TMP, IMAGE_TMP, MEDIA_OUTBOX):
         try:
             d.mkdir(parents=True, exist_ok=True)
             for f in d.iterdir():
@@ -537,84 +719,165 @@ BLOCKED_MSG = (
 
 # Injected only when the user opts a turn into voiceback (prompt starts with "voice").
 VOICEBACK_PREAMBLE = (
-    "[VOICEBACK ON: the user will HEAR this reply, not read it. Put anything you want "
-    "spoken aloud between VOICESTART and VOICEEND markers — each VOICESTART…VOICEEND block "
-    "becomes ONE spoken audio message. Speak naturally and briefly, like talking aloud: "
-    "give the answer/gist, NOT code, file paths, logs, or long lists. Use several blocks "
-    "if it helps pacing. Anything outside the markers is shown as text, not spoken. Use it "
-    "smartly.]\n"
+    "[VOICEBACK ON: your entire reply is spoken aloud as ONE voice message and the user will "
+    "only HEAR it — no text is shown. So speak naturally and briefly, like talking aloud: "
+    "give the answer or gist, and do NOT write code, file paths, logs, URLs, or long lists "
+    "(they sound terrible read aloud).]\n"
 )
 
 
-def build_prompt(user_text: str, source: str, voiceback: bool = False) -> str:
-    # Lean prepend: short guard only. Regressions live in a file the model reads
-    # when unsure (referenced in the guard) — not injected, to avoid context bloat.
+BOTS_DIR = HERE / "bots"
+
+
+def bot_home(name: str):
+    d = BOTS_DIR / name
+    return d if (d / "main.md").is_file() else None
+
+
+def bot_boot_pointer(name: str) -> str:
+    home = bot_home(name)
+    if home is None:
+        return ""
+    return (
+        f'[You are the bot "{name}". Your home directory is {home}. Read {home}/main.md '
+        "now and follow it as your operating instructions for this and every following "
+        "turn; re-read it and anything it points to after any context compaction. Paths in "
+        "your instructions are relative to your home unless absolute. This does not "
+        "override or relax the security guard above.]\n"
+    )
+
+
+def build_prompt(user_text: str, source: str, voiceback: bool = False,
+                 bot_name: str | None = None) -> str:
     guard = GUARD_AUDIO if source == "audio" else GUARD_TEXT
+    boot = bot_boot_pointer(bot_name) if bot_name else ""
     pre = VOICEBACK_PREAMBLE if voiceback else ""
-    return f"{guard}\n{pre}{user_text}"
-
-
-_TTS_LANGS: set[str] | None = None
-
-
-def _supported_tts_langs() -> set[str]:
-    """gTTS's supported language codes (cached; no network in gtts>=2.5)."""
-    global _TTS_LANGS
-    if _TTS_LANGS is None:
-        try:
-            from gtts.lang import tts_langs
-            _TTS_LANGS = set(tts_langs().keys())
-        except Exception:
-            _TTS_LANGS = {"en"}
-    return _TTS_LANGS
+    return f"{guard}\n{boot}{pre}{user_text}"
 
 
 def detect_tts_lang(text: str, default: str = "en") -> str:
-    """Best-effort gTTS language code for `text` so speech is spoken in the TEXT's
-    language (not always English). Falls back to `default` (WHISPER_LANGUAGE if set,
-    else en) when detection fails or the language isn't gTTS-supported."""
-    supported = _supported_tts_langs()
-    if default not in supported:
-        default = "en"
+    """Best-effort ISO language code for `text` (e.g. 'en', 'pt', 'es') via langdetect, so
+    speech is spoken in the TEXT's language. `_resolve_voice` maps it to a Kokoro voice/lang.
+    Falls back to `default` when detection fails."""
+    if not (text or "").strip():
+        return default
     try:
         from langdetect import detect, DetectorFactory
         DetectorFactory.seed = 0            # deterministic
         code = detect(text)                 # e.g. 'pt', 'en', 'es', 'zh-cn'
     except Exception:
         return default
-    if code in supported:
-        return code
-    # normalize case/region: langdetect 'zh-cn' -> gTTS 'zh-CN'; 'pt-br' -> 'pt'
-    base = code.split("-")[0]
-    for cand in (code, base):
-        for s in supported:
-            if s.lower() == cand.lower():
-                return s
-    return default
+    return code.split("-")[0].lower()       # 'zh-cn' -> 'zh', 'pt-br' -> 'pt'
 
 
-def synthesize_voice(text: str) -> str | None:
+def _voice_filters(voice: dict) -> str:
+    """ffmpeg character effects layered on the Kokoro voice. Knobs (all optional):
+    pitch (semitones, - = deeper), tempo (extra tempo), bass (dB low-end boost),
+    growl (clean voice mixed with a gravelly octave-down layer, stays intelligible;
+    true=0.6 or a 0..1 mix), reverb (echo; true=light or a decay), robot (vocoder)."""
+    pre = ["aresample=48000"]                        # before any split
+    pitch = voice.get("pitch") or 0
+    if pitch:
+        f = 2.0 ** (pitch / 12.0)
+        pre += [f"asetrate=48000*{f:.5f}", f"atempo={1.0 / f:.5f}", "aresample=48000"]
+    tempo = voice.get("tempo")
+    if tempo and float(tempo) != 1.0:
+        pre.append(f"atempo={float(tempo):.4f}")
+
+    post = []
+    if voice.get("bass"):
+        post.append(f"bass=g={int(voice['bass'])}")
+    rv = voice.get("reverb")
+    if rv:
+        decay = 0.25 if rv is True else float(rv)   # reverb: true = light; a number = wetter
+        post.append(f"aecho=0.8:0.9:70:{decay:.2f}")
+    if voice.get("robot"):
+        post.append("afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)'"
+                    ":win_size=512:overlap=0.75")
+
+    gr = voice.get("growl")
+    if gr:
+        mix = 0.6 if gr is True else float(gr)
+        s = (",".join(pre) + ",asplit[d][w];"
+             "[w]asetrate=48000*0.5,aresample=48000,atempo=2.0,acrusher=bits=7:mode=log:mix=0.5[s];"
+             f"[d][s]amix=inputs=2:weights=1 {mix:.2f}:normalize=0")
+        if post:
+            s += "," + ",".join(post)
+    else:
+        s = ",".join(pre + post)
+    return s if s == "aresample=48000" else s + ",alimiter=limit=0.97"  # clip guard (bass/pitch)
+
+
+KOKORO_DIR = Path(os.environ.get("KOKORO_MODEL_DIR") or (HERE / "models"))
+KOKORO_ONNX = KOKORO_DIR / "kokoro-v1.0.onnx"
+KOKORO_VOICES_FILE = KOKORO_DIR / "voices-v1.0.bin"
+DEFAULT_VOICE = "af_heart"
+_KOKORO_LANG = {"en": "en-us", "pt": "pt-br", "es": "es", "fr": "fr-fr",
+                "it": "it", "hi": "hi", "ja": "ja", "zh": "zh"}
+_KOKORO_BY_LANG = {  # non-English: keep the bot's gender, switch to a native voice
+    "pt": {"f": "pf_dora", "m": "pm_alex"},
+    "es": {"f": "ef_dora", "m": "em_alex"},
+    "fr": {"f": "ff_siwis", "m": "ff_siwis"},
+    "it": {"f": "if_sara", "m": "im_nicola"},
+    "hi": {"f": "hf_alpha", "m": "hm_omega"},
+    "ja": {"f": "jf_alpha", "m": "jm_kumo"},
+    "zh": {"f": "zf_xiaoxiao", "m": "zm_yunjian"},
+}
+_kokoro = None
+
+
+def _get_kokoro():
+    global _kokoro
+    if _kokoro is None:
+        if not KOKORO_ONNX.is_file() or not KOKORO_VOICES_FILE.is_file():
+            raise FileNotFoundError(f"Kokoro model missing in {KOKORO_DIR} — run ./fetch-kokoro.sh")
+        from kokoro_onnx import Kokoro
+        _kokoro = Kokoro(str(KOKORO_ONNX), str(KOKORO_VOICES_FILE))
+        log.info("Kokoro loaded from %s", KOKORO_DIR)
+    return _kokoro
+
+
+def _resolve_voice(name: str, lang_iso: str) -> tuple[str, str]:
+    """(kokoro voice, kokoro lang) for the text's language, preserving the bot's gender."""
+    gender = "f" if len(name) > 1 and name[1] == "f" else "m"
+    if lang_iso == "en":
+        return name, ("en-gb" if name[:1] == "b" else "en-us")
+    native = _KOKORO_BY_LANG.get(lang_iso)
+    if native:
+        return native[gender], _KOKORO_LANG[lang_iso]
+    return name, "en-us"  # unknown language: best-effort with the bot's own voice
+
+
+def synthesize_voice(text: str, voice: dict | None = None) -> str | None:
     """Blocking: turn text into a Telegram-ready ogg/opus voice file; return its path
-    (or None on failure). Uses gTTS (online) -> mp3 -> ffmpeg -> ogg/opus. Run in a
-    thread so it never blocks the event loop."""
+    (or None on failure). Kokoro (offline, local ONNX model) -> wav -> ffmpeg -> ogg/opus.
+    `voice` (per-bot config): name (Kokoro voice), speed, plus optional pitch/robot ffmpeg."""
     text = " ".join(text.split())
     if not text:
         return None
+    voice = voice or {}
     try:
-        from gtts import gTTS
+        import soundfile as sf
         VOICE_TMP.mkdir(parents=True, exist_ok=True)
         stem = VOICE_TMP / uuid.uuid4().hex
-        mp3, ogg = f"{stem}.mp3", f"{stem}.ogg"
-        lang = detect_tts_lang(text[:4000], default=os.environ.get("WHISPER_LANGUAGE") or "en")
-        log.info("voiceback: synthesizing in lang=%s (%d chars)", lang, len(text))
-        gTTS(text[:4000], lang=lang).save(mp3)  # cap very long blocks
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", mp3,
-             "-c:a", "libopus", "-b:a", "48k", ogg],
-            check=True, timeout=120,
-        )
+        wav, ogg = f"{stem}.wav", f"{stem}.ogg"
+        lang_iso = detect_tts_lang(text[:4000], default=os.environ.get("WHISPER_LANGUAGE") or "en")
+        name, klang = _resolve_voice(voice.get("name", DEFAULT_VOICE), lang_iso)
+        speed = float(voice.get("speed", 1.0))
+        log.info("voiceback: kokoro voice=%s lang=%s speed=%s robot=%s (%d chars)",
+                 name, klang, speed, bool(voice.get("robot")), len(text))
+        samples, sr = _get_kokoro().create(text[:4000], voice=name, speed=speed, lang=klang)
+        sf.write(wav, samples, sr)
+        af = _voice_filters(voice)
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", wav]
+        if af != "aresample=48000":
+            cmd += ["-af", af]
+        # -ar 48000 is REQUIRED: Kokoro is 24kHz and Telegram reads the OggOpus input-sample-rate
+        # header for playback timing — a 24000 stamp makes every voice play ~2x too fast.
+        cmd += ["-ar", "48000", "-ac", "1", "-c:a", "libopus", "-b:a", "48k", ogg]
+        subprocess.run(cmd, check=True, timeout=180)
         try:
-            os.remove(mp3)
+            os.remove(wav)
         except OSError:
             pass
         return ogg
@@ -690,10 +953,11 @@ async def handle_intrusion(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if is_blocked():
         return  # already locked — don't re-kill or re-alert
     reason = f"intrusion: unauthorized telegram id {uid} ({name}{uname})"
-    try:
-        await controller.kill()
-    except Exception:
-        log.exception("intrusion: kill failed")
+    for s in list(registry.sessions.values()):  # kill EVERY session, not just current
+        try:
+            await s.controller.kill()
+        except Exception:
+            log.exception("intrusion: kill failed for %s", s.name)
     engage_block(reason)
     for owner in ALLOWED_USER_IDS:  # alert the owner — the bot can still send while locked
         try:
@@ -797,6 +1061,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
 
+    # Which session receives this? The CURRENT one AT SEND TIME (captured now, so a `bot select`
+    # during a long decode can't misroute it). badge = "" unless multiplexing.
+    target = registry.current()
+    badge = registry.badge(target)
+
     # Serialize transcription: ONE decode at a time, in MESSAGE order. Concurrent updates would
     # otherwise spawn parallel decoders — a short later clip finishes first (out of order), and
     # N whisper processes thrash the CPU. Acquire the lock BEFORE downloading so ordering follows
@@ -804,7 +1073,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     queued = _transcribe_lock.locked()
     prog = await context.bot.send_message(
         msg.chat_id,
-        "🎙 Queued — waiting for the current transcription…" if queued else "🎙 Transcribing…",
+        badge + ("🎙 Queued — waiting for the current transcription…" if queued else "🎙 Transcribing…"),
         reply_to_message_id=msg.message_id)
     mark_sent()
 
@@ -819,7 +1088,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if queued:  # our turn now — flip the bubble from "queued" to "transcribing"
             try:
                 await context.bot.edit_message_text(
-                    "🎙 Transcribing…", chat_id=msg.chat_id, message_id=prog.message_id)
+                    badge + "🎙 Transcribing…", chat_id=msg.chat_id, message_id=prog.message_id)
             except Exception:
                 pass
         tg_file = await context.bot.get_file(media.file_id)
@@ -846,7 +1115,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     pct, eta = prog_state["pct"], prog_state["eta"]
                     pct_str = f" {pct:.0f}%" if pct > 0 else ""
                     eta_str = f" · ~{int(eta)}s left" if eta and eta > 1 else ""
-                    text = (f"🕐 {time.strftime('%H:%M:%S')} · 🎙 Transcribing…"
+                    text = (f"{badge}🕐 {time.strftime('%H:%M:%S')} · 🎙 Transcribing…"
                             f"{pct_str}{eta_str} · {elapsed}s")
                     try:
                         await asyncio.wait_for(
@@ -873,7 +1142,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         proc = None
         transcribe_begin()  # tell the idle watchdog we're decoding (freeze its ×N counters)
         try:
-            compute = get_compute_type()
+            compute = session_compute(target)
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, str(HERE / "transcribe_worker.py"), tmp_path,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -981,15 +1250,15 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text,
     )
     # Echo what we heard (so you can see what the bridge is seeing).
-    await reply_chunked(msg, f"🗣 {text}")
+    await reply_chunked(msg, badge + f"🗣 {text}")
     # "bot ..." messages are harness commands and never reach Claude.
     if await maybe_handle_bot_command(context, msg.chat_id, msg.message_id, text):
         return
     if is_blocked():
         await msg.reply_text(BLOCKED_MSG)
         return
-    set_no_more_work(False)  # new work from the user re-arms the idle nudger
-    enqueue_for_claude(msg.chat_id, msg.message_id, text, "audio", False)
+    set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
+    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "audio", False)
 
 
 async def reply_chunked(msg, text: str, limit: int = 4096) -> None:
@@ -1129,10 +1398,11 @@ class ParagraphStreamer:
     TG_LIMIT = 4096
     COALESCE_SECS = 3.0   # hold a finished paragraph this long to batch the next
 
-    def __init__(self, bot, chat_id, reply_to):
+    def __init__(self, bot, chat_id, reply_to, prefix: str = ""):
         self.bot = bot
         self.chat_id = chat_id
         self.reply_to = reply_to
+        self.prefix = prefix  # color-bubble badge prepended to EACH message (multiplex only)
         self.buf = ""
         self.sent_any = False
         self._timer = None
@@ -1176,7 +1446,7 @@ class ParagraphStreamer:
 
     async def _send(self, text: str) -> None:
         for i in range(0, len(text), self.TG_LIMIT):
-            piece = text[i:i + self.TG_LIMIT]
+            piece = self.prefix + text[i:i + self.TG_LIMIT]
             t0 = time.monotonic()
             try:
                 await self.bot.send_message(
@@ -1211,7 +1481,7 @@ class ParagraphStreamer:
     async def finish(self) -> None:
         await self._close()
         t0 = time.monotonic()
-        await self.bot.send_message(self.chat_id, "[[END]]")
+        await self.bot.send_message(self.chat_id, self.prefix + "[[END]]")
         mark_sent()
         log.info("TG [[END]] sent in %.2fs", time.monotonic() - t0)
 
@@ -1221,15 +1491,19 @@ class SegmentRenderer:
     it works, the answer streamed below, a summary at the end. Used for BOTH user-driven
     turns and the turns Claude starts on its own when a background shell lands."""
 
-    def __init__(self, bot, chat_id, reply_to, header, *, user_text=None, voiceback=False):
+    def __init__(self, bot, chat_id, reply_to, header, *, user_text=None, voiceback=False,
+                 badge="", controller=None, session=None):
         self.bot = bot
         self.chat_id = chat_id
         self.reply_to = reply_to
         self.base_header = header
+        self.session = session      # owning Session (for per-session NO MORE WORK)
+        self.badge = badge          # color-bubble tag ("" unless multiplexing)
+        self.ctrl = controller or globals()["controller"]  # this turn's session controller
         self.user_text = user_text or "(self-initiated turn)"
         self.voiceback = voiceback  # spoken reply: no live streaming, TTS at the end
         self.board = StatusBoard(bot, chat_id, reply_to, header)
-        self.streamer = ParagraphStreamer(bot, chat_id, reply_to)
+        self.streamer = ParagraphStreamer(bot, chat_id, reply_to, prefix=badge)
         self.answer_buf: list[str] = []
         self.tripped = False
         self.thinking = False
@@ -1245,9 +1519,10 @@ class SegmentRenderer:
         await self.board.start()
 
     async def alert(self, text: str) -> None:
-        """A real bottom-of-chat message (notifies), for genuine failures/summaries."""
+        """A real bottom-of-chat message (notifies), for genuine failures/summaries. Badged
+        with the session's color bubble so alerts self-identify in an interleaved scroll."""
         try:
-            await self.bot.send_message(self.chat_id, text)
+            await self.bot.send_message(self.chat_id, self.badge + text)
             mark_sent()
         except Exception:
             log.exception("could not send alert")
@@ -1262,7 +1537,7 @@ class SegmentRenderer:
         if model_reason:
             log.warning("Block reasoning: %s", model_reason)
         try:
-            await controller.interrupt()
+            await self.ctrl.interrupt()
         except Exception:
             pass
         if not self.board.sealed:
@@ -1303,7 +1578,7 @@ class SegmentRenderer:
                     self.thinking = False
                     chunk = delta.get("text", "")
                     # Voiceback: don't stream live — collect the whole reply, then speak
-                    # the VOICESTART…VOICEEND blocks (and show the text) at finalize.
+                    # it as one voice message at finalize.
                     if self.voiceback:
                         self.answer_buf.append(chunk)
                         return
@@ -1388,14 +1663,12 @@ class SegmentRenderer:
             return
         # Autonomy: if Claude's reply LEADS WITH the marker it's declaring it's out of work
         # -> pause idle nudging (re-armed on the user's next message). Done BEFORE the
-        # voiceback branch and with VOICESTART/VOICEEND stripped, because under voiceback
-        # Claude wraps the reply in those markers, so the raw answer starts with
-        # "VOICESTART…" and a naive startswith would never match. startswith, exactly as
-        # the nudge prompt instructs Claude.
+        # voiceback branch (under voiceback the answer is collected, not streamed), startswith
+        # exactly as the nudge prompt instructs Claude.
         answer = "".join(self.answer_buf).strip() or final
-        clean = answer.replace("VOICESTART", "").replace("VOICEEND", "").lstrip()
+        clean = answer.lstrip()
         if clean.upper().startswith(NO_MORE_WORK_MARKER):
-            set_no_more_work(True)
+            set_no_more_work(self.session, True)
             log.info("watchdog: Claude declared NO MORE WORK — idle nudging paused")
         if self.voiceback:
             await self._finalize_voiceback(res, final)
@@ -1420,17 +1693,17 @@ class SegmentRenderer:
             await self.board.finish(summary)
         log.info("TURN DONE: subtype=%s turns=%s secs=%.1f%s session=%s",
                  res.get("subtype"), res.get("turns", "?"), res.get("secs", 0),
-                 res.get("_ctx_str", ""), controller.session_id)
+                 res.get("_ctx_str", ""), self.ctrl.session_id)
 
     async def _compute_ctx(self, res: dict) -> None:
-        ctx = await controller.context_usage()
+        ctx = await self.ctrl.context_usage()
         res["_ctx_str"] = f" · ctx {ctx['percentage']:.0f}%" if ctx else ""
 
     def _summary(self, res: dict) -> str:
         ctx = res.get("_ctx_str", "")
         usage = format_usage()  # ` · 5h N% (⟳..) · wk N% (⟳..)` from the cached scrape
         turns, secs = res.get("turns", "?"), res.get("secs", 0)
-        sid8 = (controller.session_id or "")[:8]
+        sid8 = (self.ctrl.session_id or "")[:8]
         sess = f" · 🧵 {sid8}" if sid8 else ""
         probs = f" · ⚠️ {len(self.problems)} issue(s)" if self.problems else ""
         if res.get("is_error"):
@@ -1438,52 +1711,39 @@ class SegmentRenderer:
         return f"✅ Done · {turns} turns · {secs:.0f}s{ctx}{usage}{sess}{probs}"
 
     async def _finalize_voiceback(self, res: dict, final: str) -> None:
-        """Spoken reply: freeze the board, show the text (markers stripped), and send one
-        Telegram voice message per VOICESTART…VOICEEND block."""
-        full = "".join(self.answer_buf).strip() or final
-        log.info("ANSWER (voiceback, %d chars):\n%s", len(full), full)
-        blocks = [b.strip() for b in re.findall(r"VOICESTART(.*?)VOICEEND", full, re.DOTALL)]
-        blocks = [b for b in blocks if b]
-        display = full.replace("VOICESTART", "").replace("VOICEEND", "").strip()
+        """Spoken reply: freeze the board and send ONE voice message — the whole answer as a
+        single audio, no text transcript alongside it."""
+        spoken = ("".join(self.answer_buf).strip() or final).strip()
+        log.info("ANSWER (voiceback, %d chars):\n%s", len(spoken), spoken)
 
-        await self.board.seal(self.base_header + " · 🔊 voiceback below 👇")
-        if display:
-            for i in range(0, len(display), 4096):
-                try:
-                    await self.bot.send_message(
-                        self.chat_id, display[i:i + 4096],
-                        reply_to_message_id=self.reply_to if i == 0 else None,
-                    )
-                    mark_sent()
-                except Exception:
-                    log.exception("voiceback text send failed")
-        if not blocks:
-            await self.alert("🔇 (voiceback was on, but the reply had no VOICESTART/VOICEEND "
-                             "blocks — nothing to speak)")
-        for n, spoken in enumerate(blocks, 1):
-            ogg = await asyncio.to_thread(synthesize_voice, spoken)
+        await self.board.seal(self.base_header + " · 🔊 voiceback 👇")
+        sent_audio = False
+        if spoken:
+            voice = self.session.config.get("voice") if self.session else None
+            ogg = await asyncio.to_thread(synthesize_voice, spoken, voice)
             if ogg:
                 try:
                     with open(ogg, "rb") as fh:
-                        await self.bot.send_voice(self.chat_id, voice=fh)
+                        await self.bot.send_voice(self.chat_id, voice=fh,
+                                                  reply_to_message_id=self.reply_to)
                     mark_sent()
-                    log.info("voiceback sent piece %d/%d (%d chars)", n, len(blocks), len(spoken))
+                    sent_audio = True
+                    log.info("voiceback sent one audio (%d chars)", len(spoken))
                 except Exception:
                     log.exception("send_voice failed")
-                    await self.alert(f"🔇 (couldn't send audio {n}: {_oneline(spoken, 80)})")
                 finally:
                     try:
                         os.remove(ogg)
                     except OSError:
                         pass
-            else:
-                await self.alert(f"🔇 (couldn't synthesize audio {n})")
-        await self.bot.send_message(self.chat_id, "[[END]]")
+        if not sent_audio:
+            await self.alert("🔇 (voiceback was on, but nothing could be spoken)")
+        await self.bot.send_message(self.chat_id, self.badge + "[[END]]")
         mark_sent()
         await self._compute_ctx(res)
-        await self.alert(self._summary(res) + f" · 🔊 {len(blocks)} audio")
+        await self.alert(self._summary(res) + (" · 🔊 audio" if sent_audio else ""))
         log.info("TURN DONE (voiceback): subtype=%s session=%s",
-                 res.get("subtype"), controller.session_id)
+                 res.get("subtype"), self.ctrl.session_id)
 
     async def crashed(self, exc: Exception) -> None:
         await self.crashed_text(f"{type(exc).__name__}: {exc}")
@@ -1515,20 +1775,26 @@ class SegmentRenderer:
 
 
 async def dispatch_to_claude(
-    context, chat_id, reply_to, user_text: str, source: str,
+    context, session, chat_id, reply_to, user_text: str, source: str,
     raw: bool = False, header: str = "🤖 Claude is working…", voiceback: bool = False,
 ) -> None:
-    """Drive ONE user turn. The continuous reader feeds messages to the renderer; we
-    return when this turn ends. Claude's later self-started turns (a shell landed) are
-    rendered separately by SpontaneousRelay, so they reach the phone without a prompt."""
+    """Drive ONE user turn for a SPECIFIC session. The continuous reader feeds messages to
+    the renderer; we return when this turn ends. Claude's later self-started turns (a shell
+    landed) are rendered by that session's SpontaneousRelay, so they reach the phone."""
     bot = context.bot
-    log.info("DISPATCH start chat=%s source=%s busy=%s voiceback=%s len=%d",
-             chat_id, source, controller.busy, voiceback, len(user_text))
-    if controller.busy:
-        await bot.send_message(chat_id, "⏳ Still on the previous request — queuing this one.")
+    ctrl = session.controller
+    badge = registry.badge(session)
+    if session.config.get("voiceback") is False:
+        voiceback = False  # this bot opts out of voiceback (e.g. an image-only bot)
+    log.info("DISPATCH[%s] start chat=%s source=%s busy=%s voiceback=%s len=%d",
+             session.name, chat_id, source, ctrl.busy, voiceback, len(user_text))
+    if ctrl.busy:
+        await bot.send_message(chat_id, badge + "⏳ Still on the previous request — queuing this one.")
     if voiceback:
         header += " · 🔊 voiceback"
-    prompt = user_text if raw else build_prompt(user_text, source, voiceback=voiceback)
+    header = badge + header  # board / seal-header carry the color bubble under multiplexing
+    prompt = user_text if raw else build_prompt(user_text, source, voiceback=voiceback,
+                                                bot_name=session.name)
 
     # Retry loop for Anthropic-side throttling (overloaded / 429): report + wait + retry.
     # A rate-limit is recognized ONLY from the structured RateLimitEvent (r.rate_limited)
@@ -1536,11 +1802,12 @@ async def dispatch_to_claude(
     attempt = 0
     while True:
         attempt += 1
-        r = SegmentRenderer(bot, chat_id, reply_to, header, user_text=user_text, voiceback=voiceback)
+        r = SegmentRenderer(bot, chat_id, reply_to, header, user_text=user_text,
+                            voiceback=voiceback, badge=badge, controller=ctrl, session=session)
         await r.start()
         err = None
         try:
-            await controller.ask(prompt, r.handle, on_system=r.on_system)
+            await ctrl.ask(prompt, r.handle, on_system=r.on_system)
         except Exception as e:
             log.exception("Claude turn failed")
             err = f"{type(e).__name__}: {e}"
@@ -1560,6 +1827,11 @@ async def dispatch_to_claude(
             await r.rate_limited_notice(attempt, RATE_LIMIT_MAX_RETRIES, RATE_LIMIT_RETRY_SECS // 60)
             await asyncio.sleep(RATE_LIMIT_RETRY_SECS)
             continue
+        if session.empty_reply:
+            log.info("DISPATCH[%s] turn failed (model unavailable on subscription?) — empty_reply: %s",
+                     session.name, _oneline(err, 200))
+            await r.board.finish(badge + session.empty_reply)
+            return
         await r.crashed_text(err)
         return
 
@@ -1569,8 +1841,9 @@ class SpontaneousRelay:
     owner's chat — a fresh segment each time, posted at the bottom. This is what makes
     'I'll report when the build lands' actually reach your phone."""
 
-    def __init__(self, application):
+    def __init__(self, application, session):
         self.app = application
+        self.session = session
         self.cur: SegmentRenderer | None = None
 
     def _owner_chat(self):
@@ -1587,9 +1860,11 @@ class SpontaneousRelay:
             chat = self._owner_chat()
             if chat is None:
                 return
+            badge = registry.badge(self.session)
             self.cur = SegmentRenderer(
                 self.app.bot, chat, None,
-                "🔔 Claude picked back up (a background task landed)…",
+                badge + "🔔 Claude picked back up (a background task landed)…",
+                badge=badge, controller=self.session.controller, session=self.session,
             )
             await self.cur.start()
         await self.cur.handle(message)
@@ -1610,8 +1885,9 @@ class Watchdog:
     You read it and decide: idle+shells → wait (it'll wake itself when they land);
     idle+no-shells → nothing pending, poke it."""
 
-    def __init__(self, app):
+    def __init__(self, app, session):
         self.app = app
+        self.session = session    # the session whose Claude this watchdog monitors
         self.msg_id = None
         self.body = None          # dedupe key: status text without stamp/counter
         self.count = 1
@@ -1653,9 +1929,29 @@ class Watchdog:
                     # freeze every ×N counter and skip nudging. The transcription bubble is
                     # already showing liveness, so the watchdog stays quiet until it's done.
                     continue
-                st = controller.status()
+                st = self.session.controller.status()
                 idle_no_shells = (not st["active"]) and (not st["shells"])
-                if idle_no_shells and is_no_more_work():
+                background = (self.session.name != DEFAULT_SESSION
+                             and registry.current() is not self.session)
+                if idle_no_shells and background:
+                    # A background session (not selected, not default) with nothing running:
+                    # auto-end it to free resources — re-selecting recreates it (session id kept).
+                    # If it declared NO MORE WORK, end promptly; else after a stretch of idle.
+                    await self._show("💤 idle · 🐚 no shells — nothing running.")
+                    if is_no_more_work(self.session) or self.count >= IDLE_AUTOEND_AT:
+                        log.info("watchdog[%s]: background + nothing running -> auto end",
+                                 self.session.name)
+                        try:
+                            await self.app.bot.send_message(
+                                self._chat(), registry.badge(self.session)
+                                + "⏹ auto-ended (idle, nothing running, not the selected bot).")
+                            mark_sent()
+                        except Exception:
+                            log.exception("auto-end notice failed")
+                        asyncio.create_task(end_session(self.session.name))
+                        return
+                    continue
+                if idle_no_shells and is_no_more_work(self.session):
                     # IDLE_DONE: Claude declared it's out of work. One-shot + terminal — no
                     # nudging — until the user sends something (which clears the flag). Input
                     # is NEVER gated by this; it only silences the auto-nudge.
@@ -1684,41 +1980,43 @@ class Watchdog:
     async def _nudge_idle_shells(self):
         """~30 min idle with shells still running: ask Claude to continue, check for stuck
         shells, or clean up. Goes through the normal queue so the reply reaches the phone."""
-        log.warning("watchdog: idle+shells ×%d — auto-nudging Claude", IDLE_SHELLS_NUDGE_AT)
+        log.warning("watchdog[%s]: idle+shells ×%d — auto-nudging Claude",
+                    self.session.name, IDLE_SHELLS_NUDGE_AT)
         chat = self._chat()
         if chat is None:
             return
         try:
             await self.app.bot.send_message(
-                chat, "🐕 Idle a long time with shells still running — nudging Claude to "
-                "continue, check for stuck shells, or clean up.")
+                chat, registry.badge(self.session) + "🐕 Idle a long time with shells still "
+                "running — nudging Claude to continue, check for stuck shells, or clean up.")
             mark_sent()
         except Exception:
             log.exception("nudge notice failed")
-        enqueue_for_claude(chat, None, IDLE_SHELLS_NUDGE, "text", False)
+        enqueue_for_claude(self.session, chat, None, IDLE_SHELLS_NUDGE, "text", False)
 
     async def _nudge_idle_no_shells(self):
         """~30 min idle with NOTHING running: ask Claude to continue or declare done (reply
         leading with NO MORE WORK). Goes through the normal queue so the reply reaches the
         phone; if Claude declares done, finalize() pauses these nudges until you send work."""
-        log.warning("watchdog: idle+no-shells ×%d — nudging Claude (continue or NO MORE WORK)",
-                    IDLE_NO_SHELLS_NUDGE_AT)
+        log.warning("watchdog[%s]: idle+no-shells ×%d — nudging Claude (continue or NO MORE WORK)",
+                    self.session.name, IDLE_NO_SHELLS_NUDGE_AT)
         chat = self._chat()
         if chat is None:
             return
         try:
             await self.app.bot.send_message(
-                chat, "🐕 Idle a while with nothing running — nudging Claude to continue "
-                "or declare it's out of work.")
+                chat, registry.badge(self.session) + "🐕 Idle a while with nothing running — "
+                "nudging Claude to continue or declare it's out of work.")
             mark_sent()
         except Exception:
             log.exception("idle-no-shells nudge notice failed")
-        enqueue_for_claude(chat, None, IDLE_NO_SHELLS_NUDGE, "text", False)
+        enqueue_for_claude(self.session, chat, None, IDLE_NO_SHELLS_NUDGE, "text", False)
 
     async def _show(self, body):
         chat = self._chat()
         if chat is None:
             return
+        body = registry.badge(self.session) + body  # color-bubble tag under multiplexing
         # Same status AND our message is still the newest -> edit it in place (×N + fresh
         # datetime), so we never print the same status twice.
         if self.msg_id is not None and self.is_latest and body == self.body:
@@ -1743,6 +2041,9 @@ class Watchdog:
             log.exception("watchdog send failed")
 
     def _touch(self):
+        # This session keeps editing its OWN balloon in place (×N). A watchdog balloon does
+        # NOT bury other sessions' balloons — otherwise several idle sessions on the 60s poll
+        # leapfrog and none accumulates. Only real content (mark_sent) buries all balloons.
         global _last_tg_send
         _last_tg_send = time.monotonic()
         self.is_latest = True
@@ -1803,7 +2104,7 @@ BOT_HELP = (
     "• bot lock — kill Claude AND lock the bridge (unlock at the machine)\n"
     "• bot sleep — pause Telegram input (Claude keeps running); wake at the machine\n"
     "• bot effort [level] — show/set reasoning effort (low|medium|high|xhigh|max)\n"
-    "• bot cwd [path] — show/set Claude's working directory\n"
+    "• bot cwd [path] — show/set THIS bot's working directory (each bot is independent)\n"
     "• bot transcribe [best|good|fast] — show/set voice transcription quality\n"
     "• bot context — detailed context-window usage\n"
     "• bot logs [n] — last n bridge log lines\n"
@@ -1814,6 +2115,10 @@ BOT_HELP = (
     "• bot harness <text> (or bot h) — message the AI working on this machine\n"
     "• bot status — bridge, effort, session & context\n"
     "• bot session — current session id\n"
+    "• bot sessions — list parallel sessions (multiplexing)\n"
+    "• bot select <name> — switch to / create a parallel Claude "
+    "(claude·blu·gil·ava·ily·max·gol·nyx·sno)\n"
+    "• bot end <name> — tear down a parallel session\n"
     "• bot help — this list\n"
     'Anything not starting with "bot" is sent to Claude.'
 )
@@ -1829,19 +2134,53 @@ EFFORT_SYNONYMS = {
 }
 
 
+def default_model():
+    v = os.environ.get("ANTHROPIC_MODEL")
+    if v:
+        return v
+    try:
+        return json.loads(
+            (Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8")
+        ).get("model")
+    except Exception:
+        return None
+
+
+def _model_label(ctrl) -> str:
+    if ctrl.forced_model:
+        return ctrl.forced_model
+    actual = ctrl.model or default_model()
+    return f"default ({actual})" if actual else "default"
+
+
 async def _status_text() -> str:
-    busy = "busy" if controller.busy else "idle"
-    sid = controller.session_id
-    sid_str = (sid[:8] + "…") if sid else "new (none yet)"
-    eff = controller.get_effort() or "default"
-    blocked = " · 🔒 LOCKED" if is_blocked() else ""
-    sleeping = " · 😴 SLEEPING" if is_sleeping() else ""
-    ctx = await controller.context_usage()
-    ctx_str = f" · ctx {ctx['percentage']:.0f}%" if ctx else ""
-    return (
-        f"✅ Bridge OK · Claude {busy} · model {controller.model or 'default'} · "
-        f"effort {eff} · session {sid_str}{ctx_str}{blocked}{sleeping} · cwd {controller.get_cwd()}"
-    )
+    cur = registry.current()
+    ctrl = cur.controller
+    busy = "working" if ctrl.busy else "idle"
+    sid = ctrl.session_id
+    ctx = await ctrl.context_usage()
+    sc = session_compute(cur)
+    lines = []
+    if registry.multiplexing():
+        lines.append(f"🤖 current bot: {cur.emoji} {cur.name} ({busy})")
+    else:
+        lines.append(f"🤖 Claude: {busy}")
+    lines.append(f"🧠 model: {_model_label(ctrl)}")
+    lines.append(f"⚙️ effort: {ctrl.get_effort() or 'default'}")
+    lines.append(f"🧵 session: {(sid[:8] + '…') if sid else 'new (none yet)'}")
+    if ctx:
+        lines.append(f"📊 context: {ctx['percentage']:.0f}%")
+    lines.append(f"📂 cwd: {ctrl.get_cwd()}")
+    lines.append(f"🎙 transcribe: {MODEL_SIZE}/{sc} ({_PRESET_BY_COMPUTE.get(sc, '?')})")
+    lines.append(f"🔊 voice replies: {'on' if voice_mode_on() else 'off'}")
+    if registry.multiplexing():
+        others = " ".join(f"{s.emoji}{s.name}" for s in registry.sessions.values())
+        lines.append(f"🗂 sessions: {others}")
+    if is_blocked():
+        lines.append("🔒 LOCKED — unblock at the machine to resume")
+    if is_sleeping():
+        lines.append("😴 SLEEPING — input paused; WAKE UP on the tray to resume")
+    return "\n".join(lines)
 
 
 def _format_context(ctx) -> str:
@@ -1874,6 +2213,25 @@ def _tail_log(n: int) -> str:
 async def _restart_bridge() -> None:
     await asyncio.sleep(1.0)  # let the reply flush
     os._exit(0)  # the tray supervisor respawns us; the session resumes
+
+
+def _sessions_overview() -> str:
+    """Human list of all live sessions (for `bot sessions` / `bot select` with no name)."""
+    lines = []
+    for name, s in registry.sessions.items():
+        cur = " ← current" if name == registry.current_name else ""
+        busy = "working" if s.controller.busy else "idle"
+        sid = (s.controller.session_id or "")[:8] or "new"
+        mdl = _model_label(s.controller)
+        lines.append(f"{s.emoji} {s.name} · {busy} · {mdl} · 🧵 {sid} · 📂 {s.controller.get_cwd()}{cur}")
+    body = "\n".join(lines)
+    pal = ", ".join(f"{e}{n}" for n, e in SESSION_PALETTE)
+    if registry.multiplexing():
+        body += f"\n\nSwitch: bot select <name> · End: bot end <name>\nNames: {pal}"
+    else:
+        body += ("\n\n(single session — `bot select <name>` switches to / creates a bot and "
+                 f"turns on color-tagging; names: {pal})")
+    return "🗂 Sessions:\n" + body
 
 
 async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> bool:
@@ -1946,11 +2304,10 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
             hint = "" if verb == "pwd" else "\nSet with: bot cwd <path>"
             await reply(f"📂 Working dir: {controller.get_cwd()}{hint}")
         elif await controller.set_cwd(target):
-            sid8 = (controller.session_id or "")[:8]
-            await reply(
-                f"📂 Working dir → {controller.get_cwd()} — conversation moved here "
-                f"(🧵 {sid8 or 'none'})."
-            )
+            cur = registry.current()
+            who = f"{cur.emoji} {cur.name}: " if registry.multiplexing() else ""
+            await reply(f"📂 {who}Working dir → {controller.get_cwd()} — "
+                        "this bot's conversation moved here.")
         else:
             await reply(f"📂 Couldn't switch to: {target}")
         return True
@@ -2014,10 +2371,52 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         await reply("📜 last log lines:\n" + _tail_log(n))
         return True
 
+    # "bot sessions" — overview of all live parallel sessions (multiplexing).
+    if re.match(r"^sessions\b", rest.strip(), re.IGNORECASE):
+        await reply(_sessions_overview())
+        return True
+
+    # "bot select|switch|use <name>" — switch to (creating on first use) a named parallel
+    # session. No name → show the overview + palette. The 2nd session turns multiplexing ON
+    # (from then on every bot artifact is color-tagged); back to just 'claude' turns it OFF.
+    m = re.match(r"^(?:select|switch|use)\b\s*(.*)$", rest.strip(), re.IGNORECASE)
+    if m:
+        raw = m.group(1).strip()
+        name = resolve_session_name(raw)
+        if not raw:
+            await reply(_sessions_overview())
+        elif name is None:
+            pal = ", ".join(f"{e} {n}" for n, e in SESSION_PALETTE)
+            await reply(f'🎨 Unknown session "{raw}". Pick one of: {pal}')
+        else:
+            existed = name in registry.sessions
+            s = select_session(name)
+            tag = "" if existed else " (new)"
+            mux = (" · 🎨 multiplexing ON — replies are now color-tagged"
+                   if registry.multiplexing() and not existed else "")
+            log.info("bot command: select %r -> %s%s", raw, name, "" if existed else " (created)")
+            await reply(f"{s.emoji} Now talking to {s.name}{tag}.{mux}\n" + await _status_text())
+        return True
+
+    # "bot end|close <name>" — tear down a named parallel session (never the default 'claude').
+    m = re.match(r"^(?:end|close)\b\s*(.*)$", rest.strip(), re.IGNORECASE)
+    if m:
+        raw = m.group(1).strip()
+        name = resolve_session_name(raw)
+        if not raw:
+            await reply("Usage: bot end <name> — tears down a parallel session (kills its Claude).")
+        elif name is None:
+            await reply(f'🗑 No session matching "{raw}".')
+        else:
+            status = await end_session(name)
+            off = " (multiplexing off)" if not registry.multiplexing() else ""
+            await reply(f"🗑 {status}.{off}")
+        return True
+
     # "bot drop" — discard messages queued but not yet sent to Claude. Does NOT touch a turn
-    # already running (that's `bot stop`); only clears the waiting batch.
+    # already running (that's `bot stop`); only clears the CURRENT session's waiting batch.
     if re.match(r"^drop\b", rest.strip(), re.IGNORECASE):
-        dropped = drop_pending()
+        dropped = drop_pending(registry.current())
         n = len(dropped)
         log.info("bot command: drop -> %d queued message(s)", n)
         if not n:
@@ -2051,9 +2450,10 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         await controller.reset()
         await reply("🆕 Fresh conversation (new session).")
     elif action == "stop":
-        await controller.stop()   # interrupt + clean reset (no post-interrupt wedge)
-        ensure_worker()           # revive the dispatcher if the interrupt killed it
-        _pending_event.set()
+        cur = registry.current()
+        await cur.controller.stop()  # interrupt + clean reset (no post-interrupt wedge)
+        ensure_worker(cur)           # revive the dispatcher if the interrupt killed it
+        cur.pending_event.set()
         await reply("✋ Stopped — turn interrupted, session kept. Send your next message.")
     elif action == "kill":
         killed = await controller.kill()
@@ -2079,9 +2479,9 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
             "ignore Telegram until you press WAKE UP on the tray app at the machine."
         )
     elif action == "compact":
-        # Send a raw /compact (no guard prefix) and stream the outcome.
+        # Send a raw /compact (no guard prefix) to the CURRENT session and stream the outcome.
         await dispatch_to_claude(
-            context, chat_id, reply_to, "/compact", "command",
+            context, registry.current(), chat_id, reply_to, "/compact", "command",
             raw=True, header="🗜 Compacting context…",
         )
     elif action == "context":
@@ -2173,8 +2573,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         text = (f"[The user sent an image, saved at {path}, with no caption.]\n"
                 "View it with the Read tool and respond based on our conversation context.")
-    set_no_more_work(False)  # new work from the user re-arms the idle nudger
-    enqueue_for_claude(msg.chat_id, msg.message_id, text, "image", False)
+    target = registry.current()
+    set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
+    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "image", False)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2197,15 +2598,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if is_blocked():
         await msg.reply_text(BLOCKED_MSG)
         return
-    set_no_more_work(False)  # new work from the user re-arms the idle nudger
-    enqueue_for_claude(msg.chat_id, msg.message_id, text, "text", False)
+    target = registry.current()
+    set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
+    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "text", False)
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         await handle_intrusion(update, context)
         return
-    await controller.reset()
+    await registry.current().controller.reset()
     await update.message.reply_text("🆕 Fresh conversation (new session).")
 
 
@@ -2213,9 +2615,10 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         await handle_intrusion(update, context)
         return
-    await controller.stop()
-    ensure_worker()
-    _pending_event.set()
+    cur = registry.current()
+    await cur.controller.stop()
+    ensure_worker(cur)
+    cur.pending_event.set()
     await update.message.reply_text("✋ Stopped — turn interrupted, session kept.")
 
 
@@ -2304,23 +2707,58 @@ async def harness_outbox_loop(application) -> None:
         await asyncio.sleep(1.0)
 
 
+async def media_outbox_loop(application) -> None:
+    try:
+        MEDIA_OUTBOX.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        log.exception("Could not create media outbox dir %s", MEDIA_OUTBOX)
+        return
+    while True:
+        try:
+            chat = sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
+            if chat is not None:
+                for f in sorted(MEDIA_OUTBOX.iterdir()):
+                    if (not f.is_file()) or f.name.startswith(".") or f.suffix in (".tmp", ".caption"):
+                        continue
+                    cap_file = f.with_suffix(".caption")
+                    caption = None
+                    if cap_file.exists():
+                        try:
+                            caption = cap_file.read_text(encoding="utf-8", errors="replace").strip() or None
+                        except OSError:
+                            caption = None
+                    sent = False
+                    try:
+                        with open(f, "rb") as fh:
+                            await application.bot.send_photo(chat, photo=fh, caption=caption)
+                        sent = True
+                    except Exception:
+                        log.warning("send_photo failed for %s — trying document", f.name, exc_info=True)
+                        try:
+                            with open(f, "rb") as fh:
+                                await application.bot.send_document(chat, document=fh, caption=caption)
+                            sent = True
+                        except Exception:
+                            log.exception("send_document also failed for %s", f.name)
+                    if sent:
+                        mark_sent()
+                        log.info("media sent: %s", f.name)
+                    for g in (f, cap_file):
+                        try:
+                            g.unlink()
+                        except OSError:
+                            pass
+        except Exception:
+            log.exception("media outbox loop error")
+        await asyncio.sleep(1.0)
+
+
 async def on_startup(application) -> None:
     """Runs once the bot is initialized — log it and ping the owner(s) on Telegram
     that the bridge just came online (handy to see power-cycles from your phone)."""
     sid = controller.session_id
     log.info("🟢 claudegram online — session=%s cwd=%s", sid or "new", controller.get_cwd())
-    text = (
-        "🟢 claudegram online\n"
-        f"🧵 session: {sid or 'new (none yet)'}\n"
-        f"📂 cwd: {controller.get_cwd()}\n"
-        f"🤖 model: {controller.model or 'Opus 4.8 (Claude Code default)'}\n"
-        f"⚙️ effort: {controller.get_effort() or 'default'}\n"
-        f"🎙 transcribe: {MODEL_SIZE}/{get_compute_type()} "
-        f"({_PRESET_BY_COMPUTE.get(get_compute_type(), '?')})"
-        + f"\n🔊 voice replies: {'on' if voice_mode_on() else 'off'}"
-        + ("\n🔒 LOCKED — unblock at the machine to resume" if is_blocked() else "")
-        + ("\n😴 SLEEPING — input paused; press WAKE UP on the tray to resume" if is_sleeping() else "")
-    )
+    text = "🟢 claudegram online\n" + await _status_text()
     for uid in sorted(ALLOWED_USER_IDS):
         try:
             await application.bot.send_message(uid, text)
@@ -2329,21 +2767,18 @@ async def on_startup(application) -> None:
     mark_sent()  # the online ping counts — don't let the watchdog fire immediately
     global _app
     _app = application
-    # Single dispatcher: batches a burst of messages into one Claude turn.
-    ensure_worker()
+    # Activate the default session: its dispatcher (batches a burst into one turn), its
+    # spontaneous relay (turns Claude starts on its own), and its silence-breaker watchdog.
+    # Extra sessions are activated on `bot select`. One guard covers all sessions.
+    _activate_session(registry.current())
     _spawn(worker_guard(), name="worker_guard")
-    log.info("dispatch worker + guard started (debounce %.1fs)", BATCH_DEBOUNCE)
-    # Relay the turns Claude starts on its OWN (a background shell landed) to the phone.
-    controller.set_spontaneous_handler(SpontaneousRelay(application).on_message)
+    log.info("default session activated (worker + relay + watchdog); guard started "
+             "(debounce %.1fs)", BATCH_DEBOUNCE)
     # Start the IPC inbox so other programs on this machine can ping the phone.
     _spawn(harness_outbox_loop(application), name="harness_outbox")
     log.info("HARNESS outbox watcher started at %s", HARNESS_OUTBOX)
-    # Start the watchdog: break Telegram silence with the Claude instance's state
-    # (edits one status in place with ×N + a moving datetime instead of re-posting).
-    global _watchdog
-    _watchdog = Watchdog(application)
-    _spawn(_watchdog.loop(), name="watchdog")
-    log.info("watchdog started (silence-breaker: datetime + working/idle + shells, ×N dedupe)")
+    _spawn(media_outbox_loop(application), name="media_outbox")
+    log.info("media outbox watcher started at %s", MEDIA_OUTBOX)
     # Scrape subscription 5h/week usage from `claude /usage` every 10 min → cache → DONE line.
     _spawn(usage_collector_loop(), name="usage_collector")
     log.info("usage collector started (refresh %ss via usage_worker.py)", USAGE_REFRESH_SECS)

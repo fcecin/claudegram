@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GOL="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+WORKSPACE="$GOL/var/workspace"
+CONCERN_DIR="$WORKSPACE/.concern"
+CONCERN_LIST="$CONCERN_DIR/concerns.txt"
+CURSOR="$CONCERN_DIR/cursor"
+PROCESSED="$CONCERN_DIR/processed.txt"
+SKIPPED="$CONCERN_DIR/skipped.txt"
+LOG="$WORKSPACE/log.md"
+
+log() { mkdir -p "$WORKSPACE"; echo "$(date +%s) [concern] $*" >> "$LOG"; }
+
+trim() { sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  init)
+    file="${1:?usage: concern init <file> [--force]}"
+    force=false; [ "${2:-}" = "--force" ] && force=true
+    if [ -f "$CURSOR" ] && [ "$force" != true ]; then
+      pos=$(cat "$CURSOR"); total=$(wc -l < "$CONCERN_LIST"); log "init RESUMING $pos/$total"
+      echo "RESUMING: $((total - pos)) of $total remaining. --force to restart."; exit 0
+    fi
+    mkdir -p "$CONCERN_DIR"
+    grep -v '^#' "$file" | grep -v '^[[:space:]]*$' > "$CONCERN_LIST"
+    echo 0 > "$CURSOR"; : > "$PROCESSED"; : > "$SKIPPED"
+    log "init $file — $(wc -l < "$CONCERN_LIST") concerns"
+    echo "initialized: $(wc -l < "$CONCERN_LIST") concerns from $file"
+    ;;
+  next)
+    [ -f "$CURSOR" ] || { echo "no concerns initialized" >&2; exit 1; }
+    pos=$(cat "$CURSOR"); total=$(wc -l < "$CONCERN_LIST")
+    [ "$pos" -ge "$total" ] && { log "next DONE"; echo DONE; exit 0; }
+    raw=$(sed -n "$((pos + 1))p" "$CONCERN_LIST")
+    name=$(printf '%s' "$raw" | cut -d'|' -f1 | trim)
+    rest="${raw#*|}"
+    desc=$(printf '%s' "$rest" | cut -d'|' -f1 | trim)
+    if [[ "$rest" == *"|"* ]]; then verify=$(printf '%s' "${rest#*|}" | trim); else verify=""; fi
+    log "next $name ($((pos + 1))/$total)"
+    echo "[$(date +%s)] CONCERN: $name"; echo "DESCRIPTION: $desc"
+    target="${1:-}"
+    if [ -n "$verify" ] && [ -n "$target" ]; then
+      actual="${verify//\{file\}/$target}"
+      echo ""; echo "VERIFY: $actual"
+      out=$(eval "$actual" 2>&1 || true); n=${#out}
+      if [ "$n" -eq 0 ]; then
+        echo "VERIFY RESULT: (no output — concern likely does not apply)"
+      else
+        echo "VERIFY RESULT ($n chars):"; echo "$out"
+      fi
+      log "verify $name \$ $actual output=$n"
+    fi
+    ;;
+  done)
+    [ -f "$CURSOR" ] || { echo "no concerns initialized" >&2; exit 1; }
+    pos=$(cat "$CURSOR"); name=$(sed -n "$((pos + 1))p" "$CONCERN_LIST" | cut -d'|' -f1 | trim)
+    sed -n "$((pos + 1))p" "$CONCERN_LIST" >> "$PROCESSED"; echo $((pos + 1)) > "$CURSOR"
+    rem=$(( $(wc -l < "$CONCERN_LIST") - pos - 1 )); log "done $name"
+    echo "[$(date +%s)] OK ($rem remaining). Append to $WORKSPACE/report.md and $LOG via $GOL/tools/append. Do not read those files."
+    ;;
+  skip)
+    [ -f "$CURSOR" ] || { echo "no concerns initialized" >&2; exit 1; }
+    pos=$(cat "$CURSOR"); name=$(sed -n "$((pos + 1))p" "$CONCERN_LIST" | cut -d'|' -f1 | trim)
+    sed -n "$((pos + 1))p" "$CONCERN_LIST" >> "$SKIPPED"; echo $((pos + 1)) > "$CURSOR"
+    rem=$(( $(wc -l < "$CONCERN_LIST") - pos - 1 )); log "skip $name"
+    echo "[$(date +%s)] skipped ($rem remaining)"
+    ;;
+  status)
+    [ -f "$CURSOR" ] || { echo "no concerns initialized" >&2; exit 1; }
+    pos=$(cat "$CURSOR"); total=$(wc -l < "$CONCERN_LIST")
+    echo "total: $total | processed: $(wc -l < "$PROCESSED") | skipped: $(wc -l < "$SKIPPED") | remaining: $((total - pos))"
+    ;;
+  reset)
+    [ -f "$CURSOR" ] || { echo "no concerns initialized" >&2; exit 1; }
+    echo 0 > "$CURSOR"; : > "$PROCESSED"; : > "$SKIPPED"; log reset
+    echo "reset. $(wc -l < "$CONCERN_LIST") concerns."
+    ;;
+  index)
+    [ -f "$CONCERN_LIST" ] || { echo "no concerns initialized" >&2; exit 1; }
+    cat "$CONCERN_LIST"
+    ;;
+  *)
+    echo "usage: concern {init <file>|next [<file>]|done|skip|status|reset|index}"
+    ;;
+esac

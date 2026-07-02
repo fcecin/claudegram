@@ -1,0 +1,8 @@
+{
+  "model": "haiku",
+  "transcribe": "fast",
+  "effort": "medium",
+  "voice": {
+    "name": "am_adam"
+  }
+}

@@ -11,6 +11,11 @@ voice.mode
 BLOCKED.flag
 SLEEP.flag
 INTRUSION_OFF.flag
+session.*.id
+effort.*.level
+cwd.*.path
+bots/*/var/*
+!bots/*/var/.gitkeep
 
 # --- logs ---
 claudegram.log*
@@ -24,3 +29,6 @@ __pycache__/
 # HARNESS IPC drop dir (runtime messages)
 outbox/
 inbox/
+media-outbox/
+models
+/var/

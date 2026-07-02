@@ -47,9 +47,8 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   image in the context of your conversation.
 - **Voice replies (voiceback)**: **`bot voice on`** makes **every** reply come back as
   **spoken audio** until **`bot voice off`** — a reliable toggle set at the keyboard, not a
-  fragile per-message cue. That turn doesn't stream; Claude wraps what to say in
-  `VOICESTART…VOICEEND` (each block = one voice message), is told to speak naturally and skip
-  code/paths/logs, and the text is shown too. (TTS via `gTTS` — online.)
+  fragile per-message cue. The whole reply is spoken as one voice message, no text transcript.
+  (TTS via Kokoro — offline; run `./fetch-kokoro.sh` once to get the model.)
 - **Message batching**: fire several messages in a row and the bridge collapses the whole
   queue into **one** Claude turn (combined prompt) instead of answering each separately —
   including anything you send while it's mid-turn (batched into the next one).
@@ -143,7 +142,7 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `bot context` | detailed context-window usage breakdown |
 | `bot logs [n]` | last n bridge log lines |
 | `bot transcribe [best\|good\|fast]` | transcription quality: float32 / int8_float32 / int8 (live, no restart) |
-| `bot voice [on\|off]` | spoken replies for **everything** until off (replaces the old per-message `voice` cue) |
+| `bot voice [on\|off]` | spoken replies for **everything** until off |
 | `bot drop` | discard messages queued but not yet sent to Claude |
 | `bot issues` | list **and clear** recent tool errors (the `⚠️ N issue(s)` detail) |
 | `bot restart` | restart the bridge process (supervisor respawns it) |

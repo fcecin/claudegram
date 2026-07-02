@@ -43,6 +43,7 @@ echo "$XDG_CURRENT_DESKTOP"         # a desktop session (tray icon needs it)
 - **Claude Code must be logged into a subscription** (`claude` interactive login done;
   `~/.claude/` present). The bundled SDK reuses this — **do not set `ANTHROPIC_API_KEY`**
   (that would bill the metered API; claudegram strips it at boot anyway).
+- **ffmpeg** is required (encodes voice notes and voiceback audio): `which ffmpeg` — `sudo apt install ffmpeg` if missing.
 - On **GNOME**, the system tray needs the AppIndicator extension (default-on in Ubuntu).
   Confirm with `gsettings get org.gnome.shell enabled-extensions | grep -i appindicator`.
 - Ensure the project files are in a directory (e.g. `~/claudegram`). `cd` there.
@@ -90,6 +91,13 @@ First run creates the virtualenv, installs deps, and downloads the `large-v3` mo
 (~3 GB, once). It then starts the tray app, which supervises the bot. Watch
 `claudegram.log` (or the tray console) for `claudegram bridge is up.`
 
+For spoken replies (voiceback), fetch the offline voice model once:
+```bash
+./fetch-kokoro.sh    # ~336 MB into models/ (gitignored); needed only for `bot voice on`
+```
+Skip it if they won't use voiceback — the bridge still runs and text is unaffected; voiceback
+just falls back to a "nothing could be spoken" notice until the model is present.
+
 If the user wants it on every login:
 ```bash
 ./install-autostart.sh     # undo with ./uninstall-autostart.sh
@@ -128,7 +136,8 @@ Tell the user:
 - **Sleep**: `bot sleep` pauses ALL Telegram input (Claude keeps running); the only way
   back is the **WAKE UP** button on the tray. Distinct from lock (security) and kill.
 - **Voiceback**: `bot voice on` → every reply comes back as spoken audio until `bot voice
-  off`. Uses `gTTS` (online).
+  off`. Offline TTS (Kokoro) — needs the model (`./fetch-kokoro.sh`, STEP 4); without it,
+  voiceback says "nothing could be spoken" and text is unaffected.
 - **Images**: send a photo (with or without a caption) and Claude reads it (multimodal in).
 - **Intrusion lock** (tray toggle, default ON): if anyone who isn't them messages the bot it
   hard-locks and alerts them; toggle only at the tray (the 🛡 switch), never remotely.

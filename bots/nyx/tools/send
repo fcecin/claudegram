@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)"
+OUTBOX="$ROOT/media-outbox"
+mkdir -p "$OUTBOX"
+
+src="${1:?usage: send <image-file> [caption]}"
+shift || true
+caption="$*"
+
+[ -f "$src" ] || { echo "send: no such file: $src" >&2; exit 1; }
+
+base="$(basename "$src")"
+ext="${base##*.}"
+[ "$ext" = "$base" ] && ext=png
+
+stamp="$(date +%s)-$$-$RANDOM"
+[ -n "$caption" ] && printf '%s' "$caption" > "$OUTBOX/${stamp}.caption"
+tmp="$OUTBOX/.${stamp}.tmp"
+final="$OUTBOX/${stamp}.${ext}"
+cp "$src" "$tmp"
+mv "$tmp" "$final"
+echo "sent: $final"

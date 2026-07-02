@@ -1,0 +1,8 @@
+{
+  "model": "sonnet",
+  "transcribe": "good",
+  "effort": "high",
+  "voice": {
+    "name": "bf_emma"
+  }
+}

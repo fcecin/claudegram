@@ -147,14 +147,19 @@ class ClaudeController:
     """A long-lived, multi-turn Claude Code session that resumes across restarts."""
 
     def __init__(self, cwd: str, session_file: str, effort_file: str | None = None,
-                 cwd_file: str | None = None) -> None:
+                 cwd_file: str | None = None, model: str | None = None,
+                 max_budget_usd: float | None = None, effort: str | None = None) -> None:
         self.session_file = Path(session_file)
         self.effort_file = Path(effort_file) if effort_file else None
         self.cwd_file = Path(cwd_file) if cwd_file else None
         self._default_cwd = str(cwd)
         self.cwd = self._load_cwd() or str(cwd)
         self.session_id = self._load_session()
-        self.effort = self._load_effort() or DEFAULT_EFFORT  # always a concrete level
+        self.effort = (self._load_effort()
+                       or (effort if effort in VALID_EFFORTS else None)
+                       or DEFAULT_EFFORT)
+        self.forced_model = model
+        self.max_budget_usd = max_budget_usd
         self.model = None  # actual model, captured from the init message
         self._client: ClaudeSDKClient | None = None
         self._lock = asyncio.Lock()  # serializes USER turns (not the reader)
@@ -248,6 +253,9 @@ class ClaudeController:
         the SAME session id resumes there. The conversation follows you across dirs
         and never resets on a move. Returns False on error."""
         p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = Path(self.cwd).expanduser() / p
+        p = p.resolve()
         try:
             p.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -306,6 +314,8 @@ class ClaudeController:
             permission_mode="bypassPermissions",
             resume=self.session_id,  # None => fresh session
             effort=self.effort,  # None => model/CLI default
+            model=self.forced_model,  # None => whatever the user's env/CLI default is
+            max_budget_usd=self.max_budget_usd,  # None => no cap; 0 => never spend money
             include_partial_messages=True,  # stream text deltas for live output
             hooks={"PreCompact": [HookMatcher(hooks=[self._pre_compact_hook])]},
         )

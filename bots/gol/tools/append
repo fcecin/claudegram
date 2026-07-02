@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+GOL="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+file="${1:?usage: append <file> <text>   |   append <file> - <<'EOF'}"
+shift
+dir="$(dirname "$file")"
+mkdir -p "$dir"
+absdir="$(cd "$dir" && pwd)"
+case "$absdir/" in
+    "$GOL/var/"*) ;;
+    *) echo "append: refusing to write outside $GOL/var (got $file)" >&2; exit 1 ;;
+esac
+target="$absdir/$(basename "$file")"
+if [ "${1:-}" = "-" ]; then
+    cat >> "$target"
+else
+    printf '%s\n' "$*" >> "$target"
+fi
