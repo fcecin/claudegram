@@ -13,7 +13,7 @@ def test_config_resolution():
     assert bot.bot_config("blu")["effort"] == "xhigh"
     assert bot.bot_config("max") == {"model": "opus", "effort": "max", "voice": {"name": "bm_fable"}}
     assert bot.bot_config("claude") == {}
-    assert bot.bot_config("gil") == {}
+    assert bot.bot_config("gil") == {"transcribe": "good"}
 
 
 def test_forced_model_is_per_session():

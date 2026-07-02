@@ -1,6 +1,7 @@
 {
   "model": "opus",
   "effort": "xhigh",
+  "transcribe": "good",
   "voice": {
     "name": "af_bella"
   }
