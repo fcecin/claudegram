@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Drop a claudegram self-config command into the bridge's command inbox.
+# Usage: cg-cmd <command>     e.g.  cg-cmd effort high   |   cg-cmd voice on
+# The bridge runs it through the ordinary bot-command handler (safe config subset only).
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+INBOX="$HERE/cmd-inbox"
+mkdir -p "$INBOX"
+cmd="$*"
+if [ -z "$cmd" ]; then
+  echo "usage: cg-cmd <command>   (e.g. cg-cmd effort high)" >&2
+  exit 1
+fi
+stamp="$(date +%s%N)"
+tmp="$INBOX/.$stamp.tmp"
+printf '%s' "$cmd" > "$tmp"
+mv "$tmp" "$INBOX/$stamp.cmd"   # atomic: the bridge never reads a partial file
+echo "queued: $cmd"

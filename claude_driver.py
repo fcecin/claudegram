@@ -294,6 +294,20 @@ class ClaudeController:
                 self._client = None
         return True
 
+    async def set_model(self, model: str | None) -> bool:
+        """Override the model for subsequent turns (None => revert to the default).
+        Like set_effort, drops the client under the lock so it reconnects (resuming the
+        same session) AFTER any in-flight turn — never mid-turn. Returns True."""
+        async with self._lock:
+            self.forced_model = model or None
+            if self._client is not None:
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    pass
+                self._client = None
+        return True
+
     # --- compaction hook ------------------------------------------------------
     async def _pre_compact_hook(self, input_data, tool_use_id, context):
         if self._on_system is not None:

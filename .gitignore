@@ -32,3 +32,4 @@ inbox/
 media-outbox/
 models
 /var/
+cmd-inbox/

@@ -194,6 +194,8 @@ IMAGE_MAX_AGE = 6 * 3600  # also prune cached images older than this on each new
 HARNESS_OUTBOX = HERE / "outbox"     # drop dir: any program leaves a msg -> sent to phone
 HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by the AI here
 MEDIA_OUTBOX = HERE / "media-outbox"
+CMD_INBOX = HERE / "cmd-inbox"       # drop dir: the DRIVEN Claude drops a config command
+                                     # (via ./cg-cmd) -> run through the bot-command handler
 # --- multi-session multiplexing (ONE Telegram bot, N concurrent Claude sessions) -----
 # Names + color bubbles. "claude" (orange) is the DEFAULT/hidden session: until a SECOND
 # session is created, registry.multiplexing() is False and every badge is "" — so the whole
@@ -726,6 +728,18 @@ VOICEBACK_PREAMBLE = (
 )
 
 
+# Teaches every turn that the bot can reconfigure claudegram itself when ASKED. Small on
+# purpose (rides every prompt). The `cg-cmd` helper drops a command into cmd-inbox/, which a
+# loop here runs through the ordinary bot-command handler (safe config subset only).
+SELFCONFIG_PREAMBLE = (
+    "[claudegram self-config: if the user asks you to change a bridge setting, run the shell "
+    f"command `{HERE / 'cg-cmd'} <command>`. Available commands: effort <low|medium|high|xhigh|"
+    "max>, model <opus|sonnet|haiku|default>, voice <on|off>, transcribe <best|good|fast>, "
+    "cwd <path>, status. Run it ONLY when they actually ask to change a setting, then confirm "
+    "briefly in words. Changes take effect on the next turn, not this one.]\n"
+)
+
+
 BOTS_DIR = HERE / "bots"
 
 
@@ -752,7 +766,7 @@ def build_prompt(user_text: str, source: str, voiceback: bool = False,
     guard = GUARD_AUDIO if source == "audio" else GUARD_TEXT
     boot = bot_boot_pointer(bot_name) if bot_name else ""
     pre = VOICEBACK_PREAMBLE if voiceback else ""
-    return f"{guard}\n{boot}{pre}{user_text}"
+    return f"{guard}\n{boot}{SELFCONFIG_PREAMBLE}{pre}{user_text}"
 
 
 def detect_tts_lang(text: str, default: str = "en") -> str:
@@ -2134,6 +2148,10 @@ EFFORT_SYNONYMS = {
 }
 
 
+VALID_MODELS = {"opus", "sonnet", "haiku", "opusplan"}  # NOT fable — it can bill; keep it
+MODEL_RESET = {"default", "none", "reset", "auto"}      # config-only (never a live command)
+
+
 def default_model():
     v = os.environ.get("ANTHROPIC_MODEL")
     if v:
@@ -2294,6 +2312,26 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
                 await reply(
                     f'⚙️ Unknown effort "{raw}". Use one of: {", ".join(VALID_EFFORTS)}.'
                 )
+        return True
+
+    # "bot model [name]" — show or override the model for this session (applies next turn).
+    m = re.match(r"^model\b\s*(.*)$", rest.strip(), re.IGNORECASE)
+    if m:
+        raw = m.group(1).strip().strip(" .!?,;:")
+        log.info("bot command: model %r", raw)
+        if not raw:
+            await reply(f"🧠 Model: {_model_label(controller)}\n"
+                        "Set with: bot model <opus|sonnet|haiku|default>")
+        else:
+            name = raw.lower()
+            if name in MODEL_RESET:
+                await controller.set_model(None)
+                await reply("🧠 Model → default (applies going forward).")
+            elif name in VALID_MODELS or name.startswith("claude-"):
+                await controller.set_model(name)
+                await reply(f"🧠 Model set to: {name} (applies going forward).")
+            else:
+                await reply(f'🧠 Unknown model "{raw}". Try: opus, sonnet, haiku, or default.')
         return True
 
     # "bot cwd [path]" / "bot pwd" — show or set Claude's working directory.
@@ -2672,6 +2710,65 @@ async def deliver_harness(application, body: str) -> None:
     log.info("HARNESS -> %s: %s", sorted(ALLOWED_USER_IDS), _oneline(body, 200))
 
 
+# The DRIVEN Claude may only reconfigure itself through these (the safe subset — the first
+# word of the command). Everything else (new/clear/stop/kill/sleep/restart/lock/harness…) is
+# refused, so a misheard request can't wipe, silence, or unlock the bridge. Security state
+# (firewall/intrusion) isn't a bot command at all, so it's untouchable regardless.
+SELFCONFIG_ALLOWED = {
+    "effort", "model", "voice", "transcribe", "transcription", "quality", "tx",
+    "cwd", "chdir", "workdir", "pwd", "status", "context", "ctx",
+}
+
+
+async def _run_selfconfig(bot, chat, cmd: str) -> None:
+    """Run ONE self-config command (from the driven Claude) through the ordinary
+    bot-command handler, gated to the safe subset and attributed visibly to the bot."""
+    verb = cmd.split(None, 1)[0].lower() if cmd else ""
+    if verb not in SELFCONFIG_ALLOWED:
+        log.warning("SELFCONFIG refused: %s", _oneline(cmd, 120))
+        await bot.send_message(chat, f"🔧 self-config: refused `{cmd}` — not a settable config.")
+        return
+    log.info("SELFCONFIG <- claude: %s", _oneline(cmd, 200))
+    await bot.send_message(chat, f"🔧 self-config (by the bot): `{cmd}`")
+    try:
+        await maybe_handle_bot_command(types.SimpleNamespace(bot=bot), chat, None, f"bot {cmd}")
+    except Exception:
+        log.exception("self-config command failed: %s", cmd)
+        await bot.send_message(chat, "🔧 self-config: that command errored.")
+
+
+async def cmd_inbox_loop(application) -> None:
+    """Self-config channel — fully in-bridge, no harness involved. The DRIVEN Claude drops a
+    command in cmd-inbox/ (via ./cg-cmd), and we run it through the SAME bot-command handler
+    the owner uses, limited to the safe config subset. Atomic drop (.tmp then rename) so we
+    never read a partial; consume-once (delete before running)."""
+    try:
+        CMD_INBOX.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        log.exception("Could not create cmd inbox dir %s", CMD_INBOX)
+        return
+    while True:
+        try:
+            chat = sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
+            if chat is not None:
+                for f in sorted(CMD_INBOX.iterdir()):
+                    if (not f.is_file()) or f.suffix != ".cmd":
+                        continue
+                    try:
+                        cmd = f.read_text(encoding="utf-8", errors="replace").strip()
+                    except OSError:
+                        continue
+                    try:
+                        f.unlink()  # consume-once: delete before running
+                    except OSError:
+                        pass
+                    if cmd:
+                        await _run_selfconfig(application.bot, chat, cmd)
+        except Exception:
+            log.exception("cmd inbox loop error")
+        await asyncio.sleep(1.0)
+
+
 async def harness_outbox_loop(application) -> None:
     """IPC inbox for OTHER programs on this machine. Anything (an AI like Claude Code
     working here, a cron job, a build script) can ping the phone by dropping a message
@@ -2779,6 +2876,8 @@ async def on_startup(application) -> None:
     log.info("HARNESS outbox watcher started at %s", HARNESS_OUTBOX)
     _spawn(media_outbox_loop(application), name="media_outbox")
     log.info("media outbox watcher started at %s", MEDIA_OUTBOX)
+    _spawn(cmd_inbox_loop(application), name="cmd_inbox")
+    log.info("self-config command inbox started at %s", CMD_INBOX)
     # Scrape subscription 5h/week usage from `claude /usage` every 10 min → cache → DONE line.
     _spawn(usage_collector_loop(), name="usage_collector")
     log.info("usage collector started (refresh %ss via usage_worker.py)", USAGE_REFRESH_SECS)
