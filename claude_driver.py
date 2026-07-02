@@ -25,6 +25,21 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 
 log = logging.getLogger("claudegram")
 
+# Task statuses that mean a background task (a run_in_background shell / agent) has FINISHED and must
+# be cleared from the live "N shell(s)" picture. This spans both lifecycle vocabularies: a
+# task_notification reports "stopped" (the CLI's mapped form of a killed task) while a task_updated
+# patch reports the raw "killed" -- and a terminal state can arrive via EITHER message (a TaskStop'd
+# task sometimes reports only task_updated status="killed", with the notification suppressed). Prefer
+# the SDK's own constant so new statuses are tracked automatically; fall back to the full union for an
+# older SDK. (The previous hand-rolled set missed "stopped", so every stopped/killed background shell
+# leaked into the status line forever -- it said "2 shell(s) ... they'll wake me when they land" for
+# builds that had already ended.)
+try:
+    from claude_agent_sdk import TERMINAL_TASK_STATUSES as _SDK_TERMINAL
+except Exception:  # older SDK without the exported constant
+    _SDK_TERMINAL = None
+TERMINAL_TASK_STATUSES = frozenset(_SDK_TERMINAL or {"completed", "failed", "stopped", "killed"})
+
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # The SDK doesn't expose Claude Code's unset/default effort as a value, so we pin an
 # explicit default — "effort" is then always a concrete, known level (override: bot effort).
@@ -401,17 +416,33 @@ class ClaudeController:
         if sid and sid != self.session_id:
             self.session_id = sid
             self._save_session()
+        # Task fields are direct dataclass attributes on the SDK message; the SystemMessage base also
+        # mirrors them into `data`. Prefer the attribute, fall back to `data`, so a payload shape
+        # change on either side does not silently drop tracking.
         if kind == "TaskStartedMessage":
-            tid = data.get("task_id")
+            tid = getattr(message, "task_id", None) or data.get("task_id")
             if tid:
                 self.shells[tid] = {
-                    "desc": data.get("description") or "(task)",
-                    "type": data.get("task_type") or "task",
+                    "desc": getattr(message, "description", None) or data.get("description") or "(task)",
+                    "type": getattr(message, "task_type", None) or data.get("task_type") or "task",
                 }
-        elif kind in ("TaskUpdatedMessage", "TaskNotificationMessage"):
-            tid = data.get("task_id")
-            status = data.get("status") or (data.get("patch") or {}).get("status")
-            if tid and status in ("completed", "failed", "cancelled", "killed", "error"):
+        elif kind == "TaskNotificationMessage":
+            # Every TaskNotificationStatus (completed / failed / stopped) is terminal, so a
+            # notification for a task ALWAYS means it has ended -- clear it unconditionally.
+            tid = getattr(message, "task_id", None) or data.get("task_id")
+            if tid:
+                self.shells.pop(tid, None)
+        elif kind == "TaskUpdatedMessage":
+            # A task_updated carries lifecycle changes; clear only on a terminal status (which is how
+            # a TaskStop'd task -- status="killed" -- reports when its notification is suppressed).
+            tid = getattr(message, "task_id", None) or data.get("task_id")
+            status = (
+                getattr(message, "status", None)
+                or data.get("status")
+                or (getattr(message, "patch", None) or data.get("patch") or {}).get("status")
+            )
+            status = str(status).lower() if status else None
+            if tid and status in TERMINAL_TASK_STATUSES:
                 self.shells.pop(tid, None)
 
     async def _read_loop(self) -> None:
