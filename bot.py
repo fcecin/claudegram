@@ -101,14 +101,9 @@ def load_token() -> str:
 # can switch quality at runtime with no restart. WHISPER_LANGUAGE is inherited by the worker.
 MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3").strip()
 DEVICE = os.environ.get("WHISPER_DEVICE", "cpu").strip()
-COMPUTE_TYPE = os.environ.get(
-    "WHISPER_COMPUTE_TYPE", "float32" if DEVICE == "cpu" else "float16"
-).strip()
-COMPUTE_FILE = HERE / "compute.type"  # persisted runtime quality choice (survives restarts)
-
-# Friendly transcription-quality presets, toggled live via `bot transcribe <name>`. The
-# change takes effect on the NEXT voice message — the worker reads its compute type fresh on
-# every spawn, so nothing needs restarting.
+# Friendly transcription-quality presets, toggled live per-bot via `bot transcribe <name>`.
+# The change takes effect on the NEXT voice message — the worker reads its compute type fresh
+# on every spawn, so nothing needs restarting.
 TRANSCRIBE_PRESETS = {       # name -> ctranslate2 compute type
     "best": "float32",       # large-v3 full precision — slowest, most accurate
     "good": "int8_float32",  # ~2x faster, near-best accuracy
@@ -116,28 +111,20 @@ TRANSCRIBE_PRESETS = {       # name -> ctranslate2 compute type
 }
 _PRESET_BY_COMPUTE = {v: k for k, v in TRANSCRIBE_PRESETS.items()}
 
+# Immutable code default for transcription (best/float32 — fully ours, always available).
+# A bot without a `transcribe` config inherits this at spawn; `bot transcribe` overrides a
+# bot's live value for the process only (never touches this default, never persists).
+DEFAULT_COMPUTE = TRANSCRIBE_PRESETS["best"]
+
 
 def get_compute_type() -> str:
-    """Current whisper compute type: the persisted runtime choice if set, else the env/default."""
-    try:
-        saved = COMPUTE_FILE.read_text(encoding="utf-8").strip()
-        if saved:
-            return saved
-    except OSError:
-        pass
-    return COMPUTE_TYPE
+    """The immutable global default compute type (best). Bots override live via bot transcribe."""
+    return DEFAULT_COMPUTE
 
 
 def session_compute(session) -> str:
-    preset = (getattr(session, "config", None) or {}).get("transcribe")
-    if preset in TRANSCRIBE_PRESETS:
-        return TRANSCRIBE_PRESETS[preset]
-    return get_compute_type()
-
-
-def set_compute_type(compute: str) -> None:
-    """Persist the chosen compute type; the next worker spawn picks it up."""
-    COMPUTE_FILE.write_text(compute, encoding="utf-8")
+    """A bot's live compute: its own runtime/config value if set, else the code default."""
+    return getattr(session, "compute", None) or DEFAULT_COMPUTE
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -268,6 +255,9 @@ class Session:
         self.emoji = SESSION_EMOJI.get(name, "⚪")
         self.config = bot_config(name)
         self.empty_reply = self.config.get("empty_reply")
+        # Live transcription compute: config value at spawn, else None => the code default.
+        # `bot transcribe` overrides this in-memory (process-lived); never persisted.
+        self.compute = TRANSCRIBE_PRESETS.get((self.config.get("transcribe") or "").lower())
         sf, ef, cf = _session_files(name)
         self.controller = ClaudeController(str(CGHOME), sf, ef, cf,
                                            model=self.config.get("model"),
@@ -2350,34 +2340,37 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
             await reply(f"📂 Couldn't switch to: {target}")
         return True
 
-    # "bot transcribe [best|good|fast]" — show or set transcription quality. Takes effect on
-    # the NEXT voice message (the decoder subprocess reads its compute type fresh each spawn).
+    # "bot transcribe [best|good|fast]" — show or set THIS bot's transcription quality. Live for
+    # the process (never persisted); takes effect on its NEXT voice message (the decoder reads
+    # the compute type fresh each spawn). The current session's live value only.
     m = re.match(r"^(?:transcribe|transcription|quality|tx)\b\s*(.*)$",
                  rest.strip(), re.IGNORECASE)
     if m:
         raw = m.group(1).strip().strip(" .!?,;:").lower()
         log.info("bot command: transcribe %r", raw)
-        cur = get_compute_type()
+        cur_sess = registry.current()
+        who = f"{cur_sess.emoji} {cur_sess.name}: " if registry.multiplexing() else ""
+        cur = session_compute(cur_sess)
         cur_name = _PRESET_BY_COMPUTE.get(cur, cur)
         menu = ("best — float32, most accurate (slowest)\n"
                 "good — int8_float32, ~2× faster, near-best\n"
                 "fast — int8, ~3-4× faster, slight accuracy loss")
         if not raw:
             await reply(
-                f"🎚 Transcription quality: {cur_name} ({cur})\n{menu}\n"
+                f"🎚 {who}Transcription quality: {cur_name} ({cur})\n{menu}\n"
                 "Set with: bot transcribe <best|good|fast>"
             )
         elif raw in TRANSCRIBE_PRESETS:
-            set_compute_type(TRANSCRIBE_PRESETS[raw])
+            cur_sess.compute = TRANSCRIBE_PRESETS[raw]
             await reply(
-                f"🎚 Quality → {raw} ({TRANSCRIBE_PRESETS[raw]}). "
-                "Applies to your next voice message."
+                f"🎚 {who}Quality → {raw} ({TRANSCRIBE_PRESETS[raw]}) for this bot. "
+                "Applies to its next voice message."
             )
         elif raw in _PRESET_BY_COMPUTE:  # they typed the raw compute type itself
-            set_compute_type(raw)
+            cur_sess.compute = raw
             await reply(
-                f"🎚 Quality → {_PRESET_BY_COMPUTE[raw]} ({raw}). "
-                "Applies to your next voice message."
+                f"🎚 {who}Quality → {_PRESET_BY_COMPUTE[raw]} ({raw}) for this bot. "
+                "Applies to its next voice message."
             )
         else:
             await reply(f'🎚 Unknown quality "{raw}".\n{menu}')

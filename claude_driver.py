@@ -155,9 +155,10 @@ class ClaudeController:
         self._default_cwd = str(cwd)
         self.cwd = self._load_cwd() or str(cwd)
         self.session_id = self._load_session()
-        self.effort = (self._load_effort()
-                       or (effort if effort in VALID_EFFORTS else None)
-                       or DEFAULT_EFFORT)
+        # Spawn value: config effort if valid, else the immutable code default. Runtime
+        # `bot effort` changes it in-memory only (process-lived) — never persisted, so a
+        # restart reverts to config/default. Uniform with model and transcribe.
+        self.effort = (effort if effort in VALID_EFFORTS else None) or DEFAULT_EFFORT
         self.forced_model = model
         self.max_budget_usd = max_budget_usd
         self.model = None  # actual model, captured from the init message
@@ -276,14 +277,14 @@ class ClaudeController:
         return True
 
     async def set_effort(self, level: str) -> bool:
-        """Set the reasoning effort for subsequent turns. Reconnects (resuming the
-        same session) so it takes effect going forward. Returns False if invalid."""
+        """Set the reasoning effort for subsequent turns (in-memory, process-lived — not
+        persisted, so a restart reverts to config/default). Reconnects (resuming the same
+        session) so it takes effect going forward. Returns False if invalid."""
         level = (level or "").strip().lower()
         if level not in VALID_EFFORTS:
             return False
         async with self._lock:
             self.effort = level
-            self._save_effort()
             # Drop the client so the next turn reconnects with the new effort,
             # resuming the same conversation.
             if self._client is not None:
