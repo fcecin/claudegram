@@ -296,6 +296,7 @@ class Session:
         self.relay = None            # SpontaneousRelay for this session
         self.no_more_work = False    # this session's Claude declared it's out of work
         self.parked = False          # user forced end-state idle: no nudging, no anti-stall (bot park)
+        self.nostall_cleared = False # guard reviewed this idle episode and ruled it genuinely done
 
     def __repr__(self):
         return f"<Session {self.emoji}{self.name}>"
@@ -1714,6 +1715,7 @@ class SegmentRenderer:
         answer = "".join(self.answer_buf).strip() or final
         if answer and self.session is not None:
             self.session.recent_answers.append(answer)  # what the guard reviews if this bot stalls
+            self.session.nostall_cleared = False        # new output — let the guard review again
         clean = answer.lstrip()
         if clean.upper().startswith(NO_MORE_WORK_MARKER):
             set_no_more_work(self.session, True)
@@ -2107,7 +2109,7 @@ class Watchdog:
                     # no-shells tick) — `_police_stall`'s own cooldown stops it from re-reviewing
                     # too fast. With the guard OFF, Claude gets the canned nudge only at ×30.
                     await self._show("💤 idle · 🐚 no shells — nothing running.")
-                    if policing:
+                    if policing and not self.session.nostall_cleared:
                         await self._police_stall("it's idle with nothing running")
                     elif self.count == IDLE_NO_SHELLS_NUDGE_AT:
                         await self._nudge_idle_no_shells()
@@ -2156,6 +2158,15 @@ class Watchdog:
             return False
         if verdict.upper().startswith(NOSTALL_LEGIT_MARKER):
             log.info("nostall: cleared %s — genuinely done", self.session.name)
+            self.session.nostall_cleared = True  # one-shot: don't re-review until it works again
+            reason = verdict[len(NOSTALL_LEGIT_MARKER):].lstrip(" .:—–-").strip()
+            note = ("🐕 anti-stall: reviewed it and it's genuinely done — standing down."
+                    if not reason else f"🐕 anti-stall: it's genuinely done — {reason}")
+            try:
+                await self.app.bot.send_message(chat, registry.badge(self.session) + note)
+                mark_sent()
+            except Exception:
+                log.exception("nostall: posting the done notice failed")
             return True
         # Stalling: show the intervention (in the watchdog's own voice) and kick the bot back.
         log.warning("nostall: %s was stalling — kicking it back", self.session.name)

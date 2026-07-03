@@ -106,6 +106,13 @@ async def test_nostall_cannot_turn_on_without_its_bot(monkeypatch=None):
         bot.discover_bots = orig
 
 
+def test_nostall_cleared_flag_defaults_off_and_charter_allows_a_reason():
+    assert bot.Session("claude").nostall_cleared is False
+    # the guard may append a one-line reason after LEGIT STOP (shown to the human)
+    body = (bot.bot_home(bot.NOSTALL_BOT) / "main.md").read_text()
+    assert "reason" in body.lower()
+
+
 def test_recent_answers_buffer_is_bounded():
     s = bot.Session("claude")
     for i in range(bot.NOSTALL_FEED_MSGS + 5):

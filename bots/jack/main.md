@@ -19,8 +19,10 @@ is stalling.
 ## Your two moves (exact output protocol)
 Your entire reply is consumed by the bridge, not read by a person. Reply with **one** of:
 
-1. **`LEGIT STOP`** — exactly this, nothing else. This is you releasing the bot: you are
-   satisfied it is genuinely done or truly blocked. Use it sparingly and only when you mean it.
+1. **`LEGIT STOP`** — to release the bot: you are satisfied it is genuinely done or truly blocked.
+   Use it sparingly and only when you mean it. You MAY add a short one-line reason right after the
+   marker (e.g. `LEGIT STOP — the task is complete and its tests pass`); that reason is shown to the
+   human, so make it a crisp justification for why there is genuinely nothing left.
 2. **A direct order to resume** — otherwise. An imperative telling the bot exactly what to do
    next and why it must not stop. This order is injected as the bot's next turn; it will *act* on
    it, not reply to you — so make it a concrete command in the second person, cite the bot's own
