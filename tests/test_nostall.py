@@ -113,6 +113,23 @@ def test_nostall_cleared_flag_defaults_off_and_charter_allows_a_reason():
     assert "reason" in body.lower()
 
 
+def test_charter_forbids_pushing_the_bot_to_do_less():
+    # The guard has no scope/context, so it must only ever demand MORE work — never tell a
+    # bot to stop, narrow, or that something is "out of scope" (it can't know that).
+    body = (bot.bot_home(bot.NOSTALL_BOT) / "main.md").read_text().lower()
+    assert "out of scope" in body
+    assert "never less" in body or "only ever push for more" in body
+
+
+def test_charter_affirms_the_bots_own_next_step_instead_of_curtailing():
+    # The guard only ever fires AFTER a bot has stopped, so "leave it working" is not a move;
+    # when the stopped bot's parting words name more work, the counter is to affirm+continue,
+    # not "out of scope, stop".
+    body = " ".join((bot.bot_home(bot.NOSTALL_BOT) / "main.md").read_text().lower().split())
+    assert "already stopped" in body            # it never catches a bot mid-work
+    assert "continue, do not stop" in body      # the affirm-and-drive move
+
+
 def test_recent_answers_buffer_is_bounded():
     s = bot.Session("claude")
     for i in range(bot.NOSTALL_FEED_MSGS + 5):

@@ -73,8 +73,33 @@ def _children_map() -> dict:
     return m
 
 
+def sigkill_subtree(root: int | None) -> list[int]:
+    """SIGKILL a specific pid and every descendant of it. This is the per-session kill:
+    a controller passes its OWN CLI subprocess pid so it never touches a sibling session's
+    subprocess (under multiplexing, all sessions' CLI children share bot.py as parent, so a
+    process-wide 'kill every claude child' would nuke the whole fleet — see kill())."""
+    if not root:
+        return []
+    cmap = _children_map()
+    killed: list[int] = []
+    targets, stack = [root], list(cmap.get(root, []))
+    while stack:
+        p = stack.pop()
+        targets.append(p)
+        stack.extend(cmap.get(p, []))
+    for t in targets:
+        try:
+            os.kill(t, signal.SIGKILL)
+            killed.append(t)
+        except OSError:
+            pass
+    return killed
+
+
 def sigkill_claude_subtree() -> list[int]:
-    """SIGKILL the 'claude' CLI child of THIS process and all its descendants."""
+    """SIGKILL every 'claude' CLI child of THIS process and all their descendants. This is
+    the process-WIDE nuke (all sessions at once); a single controller must NOT use it — it
+    kills its siblings too. Kept for an emergency/panic path only."""
     me = os.getpid()
     cmap = _children_map()
     killed: list[int] = []
@@ -82,17 +107,7 @@ def sigkill_claude_subtree() -> list[int]:
         _, cmd = _proc_ppid_cmd(child)
         if "claude" not in cmd.lower():
             continue
-        targets, stack = [child], list(cmap.get(child, []))
-        while stack:
-            p = stack.pop()
-            targets.append(p)
-            stack.extend(cmap.get(p, []))
-        for t in targets:
-            try:
-                os.kill(t, signal.SIGKILL)
-                killed.append(t)
-            except OSError:
-                pass
+        killed.extend(sigkill_subtree(child))
     return killed
 
 _API_ENV_VARS = (
@@ -178,6 +193,7 @@ class ClaudeController:
         self.max_budget_usd = max_budget_usd
         self.model = None  # actual model, captured from the init message
         self._client: ClaudeSDKClient | None = None
+        self._child_pid: int | None = None  # this session's OWN CLI subprocess (per-session kill)
         self._lock = asyncio.Lock()  # serializes USER turns (not the reader)
         self._on_system = None  # async callback(kind:str, data:dict) for the active turn
 
@@ -379,6 +395,9 @@ class ClaudeController:
                 await self._client.connect()
             else:
                 raise
+        # Remember THIS client's own CLI subprocess so kill() can target just our subtree
+        # (not every session's). Best-effort: the SDK spawns it inside connect().
+        self._child_pid = self._live_child_pid()
         # (Re)start the always-on reader on the fresh client.
         self._start_reader()
         # Announce the (re)started session to the active turn's listener.
@@ -488,7 +507,16 @@ class ClaudeController:
         except asyncio.CancelledError:
             return
         except Exception:
-            log.exception("reader loop ended")
+            # The CLI subprocess died out from under us (crash, OOM kill, or a sibling
+            # teardown). Self-heal: drop the dead client so the NEXT ask() reconnects and
+            # resumes (session_id is persisted), and release any ask() waiting on this turn
+            # instead of letting it hang to the 900s stuck-timeout. Guard on identity so we
+            # never clobber a client a concurrent reconnect already swapped in.
+            log.exception("reader loop ended — dropping the dead client so the next turn reconnects")
+            if self._client is client:
+                self._client = None
+                self._child_pid = None
+                self._reset_live_state()  # clears shells + sets _segment_done (frees a waiting ask)
 
     def status(self) -> dict:
         """A snapshot of the Claude INSTANCE state, for the watchdog poll."""
@@ -568,15 +596,25 @@ class ClaudeController:
             except Exception:
                 pass
 
+    def _live_child_pid(self) -> int | None:
+        """This client's OWN CLI subprocess pid, dug out of the SDK transport. Best-effort:
+        internal SDK attributes, so guarded — a None just means kill() skips the SIGKILL and
+        relies on disconnect()'s own terminate/kill."""
+        try:
+            return self._client._transport._process.pid  # type: ignore[attr-defined]
+        except Exception:
+            return None
+
     async def kill(self) -> list[int]:
-        """Hard-kill (SIGKILL) the Claude CLI subprocess. The next turn reconnects,
-        resuming the session. Deliberately does NOT take the lock, so it works even
-        when a turn is stuck."""
-        killed = sigkill_claude_subtree()
+        """Hard-kill (SIGKILL) THIS session's Claude CLI subprocess (and its descendants) —
+        never a sibling session's. The next turn reconnects, resuming the session. Deliberately
+        does NOT take the lock, so it works even when a turn is stuck."""
+        killed = sigkill_subtree(self._child_pid or self._live_child_pid())
         client = self._client
         self._stop_reader()
         self._reset_live_state()
         self._client = None  # force a reconnect on the next ask()
+        self._child_pid = None
         if client is not None:
             try:
                 await asyncio.wait_for(client.disconnect(), 3)

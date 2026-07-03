@@ -42,6 +42,18 @@ the Claude instance **wakes itself and emits a new turn when the shell completes
 user message needed. The old single-`receive_response()` design dropped those; the
 continuous reader relays them.
 
+Two invariants the reader/kill path MUST keep (both were single-session relics that
+multiplexing broke — see `tests/test_driver_recovery.py`):
+- **`controller.kill()` is PER-SESSION.** It SIGKILLs only *this* controller's own CLI
+  subprocess subtree (`sigkill_subtree(self._child_pid)`, pid captured after `connect()`),
+  never a sibling's. All sessions' CLI children share `bot.py` as parent, so the old
+  process-wide "kill every `claude` child" (`sigkill_claude_subtree`, now the panic-only
+  path) nuked the whole fleet — e.g. ending the guard bot killed the main worker.
+- **The reader self-heals.** If the CLI dies out from under `_read_loop` (crash, OOM,
+  sibling teardown), the loop drops the dead client (`_client = None`, guarded on identity)
+  and `_reset_live_state()`s, so the next `ask()` reconnects+resumes and any waiting `ask()`
+  is released instead of hanging to the 900s stuck-timeout.
+
 ## Rendering (bot.py)
 - `StatusBoard` — one message edited in place for the live activity feed. **Telegram
   edits in place**, so the board must stop mutating once the answer streams below it:
