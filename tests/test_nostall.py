@@ -1,7 +1,8 @@
+import asyncio
 import types
 
 import bot
-from tests.fakes import FakeBot
+from tests.fakes import FakeBot, make_fake_session
 
 
 def test_guard_bot_is_haiku_low_internal_no_voice_with_config_icon():
@@ -136,3 +137,74 @@ def test_recent_answers_buffer_is_bounded():
         s.recent_answers.append(f"answer {i}")
     assert len(s.recent_answers) == bot.NOSTALL_FEED_MSGS
     assert s.recent_answers[-1] == f"answer {bot.NOSTALL_FEED_MSGS + 4}"
+
+
+async def test_police_runs_off_the_watchdog_critical_path():
+    # THE REGRESSION: a slow guard turn (jack took ~83s once) froze the watched bot's watchdog
+    # because _police_stall was awaited INLINE in the loop. Now it's spawned off the critical
+    # path: _spawn_police fires the consult as a task and returns immediately, and a second call
+    # while one is in flight does not stack.
+    wd = bot.Watchdog.__new__(bot.Watchdog)
+    wd._police_task = None
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    calls = []
+
+    async def _fake_police(reason):
+        calls.append(reason)
+        started.set()
+        await gate.wait()               # simulate a slow / hung guard turn
+        return True
+
+    wd._police_stall = _fake_police
+
+    wd._spawn_police("first")
+    t1 = wd._police_task
+    assert t1 is not None
+    await started.wait()                # consult began — deterministic, no sleep race
+    assert not t1.done()                # still blocked, yet _spawn_police already returned
+    assert calls == ["first"]
+
+    wd._spawn_police("second")          # one already in flight -> no stacking
+    assert wd._police_task is t1
+    assert calls == ["first"]
+
+    gate.set()
+    await t1
+    assert t1.done()
+
+    started.clear()
+    wd._spawn_police("third")           # the in-flight one finished -> a new consult is allowed
+    await wd._police_task
+    assert calls == ["first", "third"]
+
+
+async def test_police_posts_a_reviewing_one_liner_to_the_owner():
+    # When the guard actually consults, the OWNER gets a 'reviewing…' one-liner up front so the
+    # (possibly slow) reasoning window reads as activity, not a frozen watchdog. Owner only — it's
+    # a send_message, never injected into the reviewed bot.
+    fb = FakeBot()
+    sess = make_fake_session("claude")
+    sess.recent_answers.append("I'll stop here; nothing left to do.")
+    guard = make_fake_session(bot.NOSTALL_BOT)
+    wd = bot.Watchdog.__new__(bot.Watchdog)
+    wd.app = types.SimpleNamespace(bot=fb)
+    wd.session = sess
+    wd._nostall_last = 0.0
+    wd._chat = lambda: 12345
+
+    orig_ensure, orig_ask = bot.ensure_nostall_bot, bot.ask_text
+
+    async def _fake_ask(g, p):
+        return "LEGIT STOP — done and green"
+
+    bot.ensure_nostall_bot = lambda: guard
+    bot.ask_text = _fake_ask
+    try:
+        result = await wd._police_stall("it's idle with nothing running")
+    finally:
+        bot.ensure_nostall_bot, bot.ask_text = orig_ensure, orig_ask
+
+    assert result is True
+    assert any("reviewing" in s for s in fb.sent), fb.sent           # the up-front one-liner
+    assert any("genuinely done" in s for s in fb.sent), fb.sent      # the verdict lands below it

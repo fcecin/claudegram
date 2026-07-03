@@ -12,12 +12,27 @@ No pytest: import these from tests/test_*.py and assert. See tests/run.py for th
 
 import itertools
 import logging
+import pathlib
+import tempfile
 
 import bot
 from claude_agent_sdk import (
     AssistantMessage, ResultMessage, StreamEvent, SystemMessage,
     TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage,
 )
+
+# ISOLATION: the suite runs in the repo dir and clear_flags() unlinks the presence-flag files
+# between tests. Those flags live at absolute module paths (HERE/…), so without this a test run
+# would toggle the LIVE install's state — e.g. wipe a running bot's `nostall.mode`, `voice.mode`,
+# or even a live `BLOCKED`/`SLEEP` flag. Repoint every WRITABLE flag at a throwaway dir before any
+# test imports/uses them; they're read via these module globals at call time, so redirection here
+# is total. Read-only assets (bots/, configs) still resolve to the real repo.
+_TMP_STATE = pathlib.Path(tempfile.mkdtemp(prefix="cg-test-flags-"))
+bot.NOSTALL_FILE = _TMP_STATE / "nostall.mode"
+bot.BLOCK_FILE = _TMP_STATE / "BLOCKED.flag"
+bot.SLEEP_FILE = _TMP_STATE / "SLEEP.flag"
+bot.VOICE_MODE_FILE = _TMP_STATE / "voice.mode"
+bot.INTRUSION_OFF_FILE = _TMP_STATE / "INTRUSION_OFF.flag"
 
 # Quiet the bridge's INFO chatter during tests (turn logs, worker (re)start, etc.).
 logging.getLogger("claudegram").setLevel(logging.ERROR)

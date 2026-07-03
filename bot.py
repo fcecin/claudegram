@@ -2018,6 +2018,7 @@ class Watchdog:
         self.is_latest = False    # is our status message still the newest in the chat?
         self.done_declared = False  # IDLE_DONE one-shot guard (Claude said NO MORE WORK)
         self._nostall_last = 0.0    # monotonic ts of the last anti-stall intervention (cooldown)
+        self._police_task = None    # in-flight anti-stall consult (kept OFF the loop's critical path)
 
     def _chat(self):
         return sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
@@ -2094,11 +2095,12 @@ class Watchdog:
                         continue
                     self.done_declared = True
                     if policing:
-                        # Anti-stall on: don't just accept "done" — let the guard second-guess it.
-                        # If the guard agrees it's genuinely finished, fall through to the ✅ notice;
-                        # otherwise it has already kicked the bot back to work, so stay quiet.
-                        if not await self._police_stall("it declared NO MORE WORK"):
-                            continue
+                        # Anti-stall on: don't just accept "done" — let the guard second-guess it,
+                        # OFF the watchdog's critical path (a slow guard must not freeze the loop).
+                        # The guard posts its own verdict — a stand-down notice if it agrees, or a
+                        # kick if not — so the watchdog stays out of the terminal messaging here.
+                        self._spawn_police("it declared NO MORE WORK")
+                        continue
                     await self._show("✅ idle · done — you said NO MORE WORK. "
                                      "Say hi whenever there's more.")
                     continue
@@ -2110,7 +2112,7 @@ class Watchdog:
                     # too fast. With the guard OFF, Claude gets the canned nudge only at ×30.
                     await self._show("💤 idle · 🐚 no shells — nothing running.")
                     if policing and not self.session.nostall_cleared:
-                        await self._police_stall("it's idle with nothing running")
+                        self._spawn_police("it's idle with nothing running")
                     elif self.count == IDLE_NO_SHELLS_NUDGE_AT:
                         await self._nudge_idle_no_shells()
                     continue
@@ -2122,12 +2124,30 @@ class Watchdog:
             except Exception:
                 log.exception("watchdog error")
 
+    def _spawn_police(self, reason: str) -> None:
+        """Run the anti-stall consult OFF the watchdog's critical path. The guard's review can
+        take a minute (a slow model turn); awaiting it inline would freeze THIS bot's watchdog —
+        no status refresh, no silence tracking — for the whole window, which reads as a dead
+        watchdog. So fire it as a task and return immediately; the loop keeps ticking. At most one
+        consult in flight per bot (a second tick while one runs is a no-op); `_police_stall`'s own
+        cooldown throttles back-to-back consults and posts the 'reviewing…' one-liner once it
+        commits. Its return value is now advisory — the guard owns all of its own messaging."""
+        if self._police_task is not None and not self._police_task.done():
+            return
+        async def _run():
+            try:
+                await self._police_stall(reason)
+            except Exception:
+                log.exception("nostall: police task crashed")
+        self._police_task = asyncio.create_task(_run())
+
     async def _police_stall(self, reason: str) -> bool:
         """Anti-stall: hand this bot's most-recent answers to the guard bot and let it judge
         whether the stop is genuine or a stall. Returns True if the guard rules it a legitimate
-        stop (the caller should let the bot rest), False if the guard browbeat it (already posted +
-        re-queued as the bot's next turn) OR the consult was skipped. Cooldown-throttled per bot so
-        a stubborn bot can't spin the guard in a tight loop. Only ever called idle + no shells."""
+        stop, False if the guard browbeat it (already posted + re-queued as the bot's next turn)
+        OR the consult was skipped. Cooldown-throttled per bot so a stubborn bot can't spin the
+        guard in a tight loop. Only ever called idle + no shells, and always via `_spawn_police`
+        (off the watchdog's critical path)."""
         now = time.monotonic()
         if (now - self._nostall_last) < NOSTALL_COOLDOWN_SECS:
             return False
@@ -2139,6 +2159,15 @@ class Watchdog:
         if guard is None or guard is self.session:
             return False
         self._nostall_last = now
+        # Tell the OWNER (not the reviewed bot) that the guard is on it. The review can take a
+        # minute, so this one-liner shows the reasoning window as activity instead of a frozen
+        # watchdog; the verdict (stand-down or kick) lands below it when the guard finishes.
+        try:
+            await self.app.bot.send_message(
+                chat, registry.badge(self.session) + "🐕 anti-stall: reviewing whether it's really done…")
+            mark_sent()
+        except Exception:
+            log.exception("nostall: posting the reviewing notice failed")
 
         def _cap(a: str) -> str:
             return a if len(a) <= 2000 else a[:2000] + " …[truncated]"

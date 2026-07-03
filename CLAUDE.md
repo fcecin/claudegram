@@ -167,6 +167,12 @@ its `var/`:
 - The watchdog captures each bot's recent answers (`session.recent_answers`). When a bot goes idle +
   no-shells (declared done, or hit the idle threshold), `Watchdog._police_stall` hands those answers
   to the guard via `ask_text` (a quiet turn, no channel render), throttled by a per-bot cooldown.
+- **Policing runs OFF the watchdog's critical path** (`_spawn_police`, one consult in flight per bot).
+  The guard's review can take a minute; awaiting it inline (the old bug) froze that bot's watchdog —
+  no status refresh, no silence tracking — for the whole window, which read as a dead watchdog. Now
+  it's fired as a task and the loop keeps ticking. On commit the guard posts a `🐕 anti-stall:
+  reviewing…` one-liner **to the owner** (not the reviewed bot), so the reasoning window shows as
+  activity; the verdict lands below it.
 - The guard replies `NOSTALL_LEGIT_MARKER` (`LEGIT STOP` = release it, let it rest) or a browbeat.
   The browbeat is posted in the watchdog's voice and injected into the stalling bot as a bare
   `[anti-stall]` directive — the bot never converses with the guard, it just acts.
