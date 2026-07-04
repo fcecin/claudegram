@@ -194,6 +194,8 @@ class ClaudeController:
         self.model = None  # actual model, captured from the init message
         self._client: ClaudeSDKClient | None = None
         self._child_pid: int | None = None  # this session's OWN CLI subprocess (per-session kill)
+        self._interrupted = False  # set by interrupt_turn(); the in-flight dispatch consumes it
+                                   # so a user interrupt closes cleanly (not as a crash/error)
         self._lock = asyncio.Lock()  # serializes USER turns (not the reader)
         self._on_system = None  # async callback(kind:str, data:dict) for the active turn
 
@@ -540,6 +542,7 @@ class ClaudeController:
             try:
                 await self._ensure_connected()
                 self._segment_done.clear()
+                self._interrupted = False  # fresh turn — clear any stale interrupt flag
                 self._awaiting_user_segment = True
                 await self._client.query(prompt)
                 # Wait for the turn to end — but never hang forever. If the stream goes
@@ -574,6 +577,52 @@ class ClaudeController:
     async def interrupt(self) -> None:
         if self._client is not None:
             await self._client.interrupt()
+
+    async def interrupt_turn(self, settle: float = 10.0) -> bool:
+        """Bare Esc/Ctrl-C: stop the CURRENT turn but KEEP the CLI connected — background shells
+        and the session context survive. This is the LIGHTEST of the three teardowns:
+          - interrupt_turn(): stop the turn, keep everything (bg + session).            [this]
+          - stop():           interrupt + DISCONNECT (drops bg; resumes fresh next ask).
+          - kill():           SIGKILL the subtree (bg dies hard; resumes next ask).
+        Returns True if a turn was actually interrupted, False if nothing was running.
+        Deliberately does NOT take _lock (a live turn holds it), like stop()/kill()."""
+        client = self._client
+        if client is None or not self.in_segment:
+            return False
+        self._interrupted = True  # so the in-flight dispatch closes this turn cleanly, not as a crash
+        try:
+            await asyncio.wait_for(client.interrupt(), 5)
+        except Exception:
+            log.warning("interrupt_turn: interrupt() failed/timed out — forcing turn end")
+        # Prefer a clean end: interrupting makes the CLI emit this turn's ResultMessage, which the
+        # (still-running) reader routes -> _segment_done, releasing the waiting ask() and keeping
+        # segment bookkeeping consistent. Wait for that. If the CLI never closes the turn (the
+        # historical wedge), release it ourselves — WITHOUT dropping the client, so bg + context
+        # stay alive. (The timeout path implies the ORIGINAL turn is still stuck: a new turn can
+        # only start after the old ask() is released, which sets _segment_done and ends this wait.)
+        try:
+            await asyncio.wait_for(self._segment_done.wait(), settle)
+        except asyncio.TimeoutError:
+            log.warning("interrupt_turn: no turn-end %.0fs after interrupt — releasing locally", settle)
+            self._end_segment_locally()
+        return True
+
+    def consume_interrupt_flag(self) -> bool:
+        """True exactly once if the last/current turn was ended by interrupt_turn() — lets the
+        in-flight dispatch render it as a clean stop rather than a crash. Self-clearing."""
+        was = self._interrupted
+        self._interrupted = False
+        return was
+
+    def _end_segment_locally(self) -> None:
+        """Release a stuck ask() and reset SEGMENT bookkeeping WITHOUT touching the client,
+        reader, or shells — so background work and the session survive. Contrast
+        _reset_live_state(), which forgets everything (incl. shells) because the CLI itself is
+        going away."""
+        self.in_segment = False
+        self._cur_is_user = False
+        self._awaiting_user_segment = False
+        self._segment_done.set()
 
     async def stop(self) -> None:
         """Graceful stop for `bot stop`: interrupt the running turn, then reset to a CLEAN

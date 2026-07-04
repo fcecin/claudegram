@@ -1811,6 +1811,27 @@ class SegmentRenderer:
             "The session is intact — just resend to continue."
         )
 
+    async def interrupted_close(self) -> None:
+        """Close a turn the user ended with `bot interrupt`: capture whatever streamed, seal the
+        board, and free the prompt ([[END]]) — with NO crash/error notice. The interrupt's real
+        ResultMessage is `is_error=True` (subtype error_during_execution), but that's not a crash:
+        the command handler already told the user, and background shells keep running."""
+        if self.tripped:
+            return
+        answer = "".join(self.answer_buf).strip()
+        if answer and self.session is not None:
+            self.session.recent_answers.append(answer)
+            self.session.nostall_cleared = False
+        if not self.board.sealed:
+            try:
+                await self.board.finish("⏸ interrupted")
+            except Exception:
+                pass
+        try:
+            await self.streamer.finish()   # flush remainder + [[END]] (prompt free for input)
+        except Exception:
+            log.exception("interrupted_close: streamer finish failed")
+
     async def rate_limited_notice(self, attempt: int, max_retries: int, mins: int) -> None:
         """Seal the board and tell the user we hit Anthropic throttling and will retry."""
         if not self.board.sealed:
@@ -1863,6 +1884,11 @@ async def dispatch_to_claude(
             err = f"{type(e).__name__}: {e}"
         else:
             res = r.result or {}
+            if ctrl.consume_interrupt_flag():
+                # `bot interrupt`: the turn ended by request (its ResultMessage is is_error, but
+                # that's not a crash) — close cleanly; the command already told the user.
+                await r.interrupted_close()
+                return
             if res.get("is_error"):
                 err = res.get("text") or f"ended: {res.get('subtype')}"
                 log.warning("turn errored: subtype=%s rate_event=%s text=%s",
@@ -1871,6 +1897,10 @@ async def dispatch_to_claude(
                 await r.finalize()
                 return
 
+        # A user interrupt can also surface via the exception path — still a clean stop, not a crash.
+        if ctrl.consume_interrupt_flag():
+            await r.interrupted_close()
+            return
         # An error occurred. Is it throttling? (clear marker OR verbatim — not the answer.)
         throttled = r.rate_limited or is_rate_limited(err)
         if throttled and attempt <= RATE_LIMIT_MAX_RETRIES:
@@ -2304,7 +2334,9 @@ def classify_bot_command(rest: str):
     if norm in ("new", "reset", "fresh", "clear", "new conversation", "new session",
                 "start over", "start fresh"):
         return "new"
-    if norm in ("stop", "cancel", "interrupt", "abort", "halt", "stop it"):
+    if norm in ("interrupt", "int"):
+        return "interrupt"
+    if norm in ("stop", "cancel", "abort", "halt", "stop it"):
         return "stop"
     if norm in ("kill", "kill -9", "force kill", "force stop", "die", "kill claude"):
         return "kill"
@@ -2334,7 +2366,8 @@ BOT_HELP = (
     '🤖 "bot" commands — say or type, starting with the word "bot":\n'
     "• bot new / bot clear — fresh conversation (clears Claude's context)\n"
     "• bot compact — compact the conversation (summarize to free context)\n"
-    "• bot stop — interrupt the current task (Esc/Ctrl-C)\n"
+    "• bot interrupt / bot int — Esc/Ctrl-C: stop the current turn, KEEP background shells running\n"
+    "• bot stop — interrupt + reset the connection (drops background work); session resumes\n"
     "• bot drop — discard messages queued but not yet sent to Claude\n"
     "• bot kill — force-kill the Claude process (kill -9), then respawn\n"
     "• bot lock — kill Claude AND lock the bridge (unlock at the machine)\n"
@@ -2763,12 +2796,26 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
     if action == "new":
         await controller.reset()
         await reply("🆕 Fresh conversation (new session).")
+    elif action == "interrupt":
+        # Bare Esc/Ctrl-C: stop the current turn but keep the CLI connected — background shells
+        # and session context survive (unlike stop(), which disconnects and drops bg work).
+        cur = registry.current()
+        interrupted = await cur.controller.interrupt_turn()
+        ensure_worker(cur)           # mirror stop's dispatcher-revive safety
+        cur.pending_event.set()
+        badge = registry.badge(cur)
+        if interrupted:
+            await reply(badge + "⏸ Interrupted the current turn — background shells and the "
+                        "session are untouched. Send your next message.")
+        else:
+            await reply(badge + "⏸ Nothing to interrupt — Claude is idle.")
     elif action == "stop":
         cur = registry.current()
         await cur.controller.stop()  # interrupt + clean reset (no post-interrupt wedge)
         ensure_worker(cur)           # revive the dispatcher if the interrupt killed it
         cur.pending_event.set()
-        await reply("✋ Stopped — turn interrupted, session kept. Send your next message.")
+        await reply("✋ Stopped — turn interrupted + connection reset (background work dropped); "
+                    "session resumes on your next message.")
     elif action == "kill":
         killed = await controller.kill()
         if killed:

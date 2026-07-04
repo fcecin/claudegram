@@ -105,6 +105,7 @@ class FakeController:
         self.raises = raises
         self.asked: list[str] = []
         self._spontaneous = None
+        self._interrupted = False
         self._scripts = list(scripts) if scripts is not None else None
         self._script = list(script) if script is not None else []
 
@@ -134,6 +135,17 @@ class FakeController:
 
     async def interrupt(self):
         pass
+
+    async def interrupt_turn(self, settle=10.0):
+        was = self.busy
+        self.busy = False          # a bare interrupt ends the current turn (bg/session kept)
+        self._interrupted = was
+        return was
+
+    def consume_interrupt_flag(self) -> bool:
+        was = self._interrupted
+        self._interrupted = False
+        return was
 
     async def kill(self):
         return []
