@@ -8,6 +8,7 @@ effort.level
 cwd.path
 compute.type
 instance.txt
+instance.json
 work/
 voice.mode
 nostall.mode

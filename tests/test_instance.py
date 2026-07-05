@@ -29,6 +29,35 @@ def test_label_from_dir_strips_redundant_prefix():
     assert i.label_from_dir("claudegram-") == "claudegram-"     # nothing after -> unchanged
 
 
+# --- declared identity: instance.json ------------------------------------------------
+def test_parse_instance_json():
+    assert i.parse_instance_json('{"name":"research","color":"#c2410c","glyph":"2"}') \
+        == ("research", "#c2410c", "2")
+    assert i.parse_instance_json('{"name":"work"}') == ("work", None, None)
+    assert i.parse_instance_json('{"name":"  spaced  ","glyph":"🛠"}') == ("spaced", None, "🛠")
+    # malformed / wrong-shape / empty -> all None (degrade to the dir-name fallback, never crash)
+    assert i.parse_instance_json("not json") == (None, None, None)
+    assert i.parse_instance_json("") == (None, None, None)
+    assert i.parse_instance_json(None) == (None, None, None)
+    assert i.parse_instance_json('["a","b"]') == (None, None, None)         # not an object
+    assert i.parse_instance_json('{"name": 5, "color": ""}') == (None, None, None)  # non-str/blank
+
+
+def test_resolve_precedence():
+    # instance.json wins over instance.txt when both are present
+    lbl, col, gly, default = i.resolve("claudegram-x",
+                                       json_text='{"name":"jbot","glyph":"J"}',
+                                       txt_text="tbot")
+    assert (lbl, col, gly, default) == ("jbot", None, "J", False)
+    # instance.txt used when there's no json
+    assert i.resolve("cg", txt_text="Txt\n#abc")[:3] == ("Txt", "#abc", None)
+    # neither -> directory-name fallback, and 'claudegram' with no identity file is the default
+    assert i.resolve("claudegram") == ("claudegram", None, None, True)
+    assert i.resolve("claudegram-work") == ("work", None, None, False)
+    # a declared identity on the canonical dir opts it OUT of default-look
+    assert i.resolve("claudegram", json_text='{"name":"main"}') == ("main", None, None, False)
+
+
 # --- optional instance.txt overrides -------------------------------------------------
 def test_parse_instance_file():
     assert i.parse_instance_file("") == (None, None, None)
@@ -44,9 +73,9 @@ def test_parse_instance_file():
 
 # --- the canonical install stays untouched -------------------------------------------
 def test_is_default_install():
-    assert i.is_default_install("claudegram", has_instance_file=False) is True
-    assert i.is_default_install("claudegram", has_instance_file=True) is False   # opted in
-    assert i.is_default_install("claudegram-work", has_instance_file=False) is False
+    assert i.is_default_install("claudegram", False) is True
+    assert i.is_default_install("claudegram", True) is False                     # opted in
+    assert i.is_default_install("claudegram-work", False) is False
 
 
 # --- auto tray color -----------------------------------------------------------------
@@ -79,6 +108,6 @@ def test_slug():
 
 
 def test_desktop_name():
-    assert i.desktop_name("claudegram", "claudegram", has_instance_file=False) == "claudegram"
-    assert i.desktop_name("claudegram-work", "work", has_instance_file=False) == "claudegram-work"
-    assert i.desktop_name("claudegram", "Prod", has_instance_file=True) == "claudegram-prod"
+    assert i.desktop_name("claudegram", "claudegram", False) == "claudegram"
+    assert i.desktop_name("claudegram-work", "work", False) == "claudegram-work"
+    assert i.desktop_name("claudegram", "Prod", True) == "claudegram-prod"

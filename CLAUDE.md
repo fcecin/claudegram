@@ -242,17 +242,26 @@ covered by `test_instance`) is the identity behind it; `gui.py` wraps it in Qt:
   **per directory**. The old fixed key meant a 2nd copy's `QLocalSocket` probe just poked the 1st
   tray and exited; now a copy elsewhere launches its own tray, and re-launching the SAME copy
   still focuses its own (still one tray per install).
-- **Differentiation (zero-config):** `LABEL` = the directory basename with a redundant
-  `claudegram-` prefix stripped (`~/claudegram-work` → "work"); the canonical lone `~/claudegram`
-  (no `instance.txt`) is `is_default_install` → **left looking exactly as before** (title
-  "claudegram", themed mic icon). A named copy gets window title `claudegram · <label>`, a tray
-  **badge** (auto color from `accent_hsv(label)` + first-letter `badge_glyph`), badged
-  notifications, and a distinct WM class / `.desktop` name (`desktop_name`) so taskbar entries
-  don't merge.
-- **Override:** optional `instance.txt` (gitignored, per-install) — line 1 = display name, an
-  optional `#rrggbb` line = accent color, another line = an explicit badge glyph (e.g. an emoji).
-- **Sync point:** `install-autostart.sh` mirrors the label/slug logic in shell; a change to
-  `instance_id.py`'s naming must be reflected there (a test compares the two).
+- **Non-collision is automatic; identity is DECLARED.** Because the lock key is per-directory,
+  copies never collide with zero config — the "discerning string" (name) is only so a human can
+  tell trays apart. `instance_id.resolve(dir, json, txt)` folds the precedence into
+  `(label, color, glyph, is_default)`: **`instance.json` (declared) > `instance.txt` (legacy) >
+  directory basename (foolproof fallback)**. `instance.json` = `{"name","color","glyph"}` — glyph
+  is a letter OR an emoji (`"2"`, `"🛠"`); color/glyph omitted → auto from the name
+  (`accent_hsv` + `badge_glyph`). A named copy gets title `claudegram · <label>`, a colored tray
+  **badge**, badged notifications, and a distinct WM class / `.desktop` name (`desktop_name`). The
+  canonical lone `~/claudegram` (no identity file) is `is_default_install` → **left exactly as
+  before** (title "claudegram", themed mic icon).
+- **How a new instance is made:** just clone the repo anywhere (git clone / cp) and configure it —
+  there is deliberately **no self-clone script and no setup gate**; the tray just launches when
+  the clone is ready (else `bot.py` refuses and says what's missing). Config is **AI-guided** (see
+  the runbook's *Adding another instance*): an AI writes `token.txt` (the user can forward the
+  BotFather message; lift the `<digits>:<35 chars>` token, never echo it), `.env`
+  (`ALLOWED_USER_IDS`), and `instance.json`, and prunes the roster.
+- **Single source of truth:** `install-autostart.sh` / `uninstall-autostart.sh` DON'T mirror the
+  naming in bash — they call `python3 instance_id.py {label,desktop_name,title,is_default} <dir>`
+  (the module's `__main__`), so the shell can't drift from the code and gets `instance.json` for
+  free.
 
 ## DEPLOY (non-obvious)
 - `bot.py` / `claude_driver.py` / `transcribe_worker.py` change → restart **just the bot
@@ -267,7 +276,7 @@ covered by `test_instance`) is the identity behind it; `gui.py` wraps it in Qt:
 - **Launch paths differ:** manual = `./run-gui.sh` (tray, self-backgrounding) or `./run.sh`
   (headless bot, no tray); **autostart = `./install-autostart.sh`** writes a `.desktop` that
   runs `gui.py` *directly* at login (GNOME-managed) — not `run-gui.sh`. `install-autostart.sh` /
-  `uninstall-autostart.sh` name the `.desktop` per-install (mirror of `instance_id.py`), so each
+  `uninstall-autostart.sh` name the `.desktop` per-install (via `instance_id.py`), so each
   copy autostarts independently. Keep these in sync.
 - **NEVER** `pkill -f "claudegram/bot.py"` — the pattern matches the killing shell's own
   argv and it self-kills. Kill by explicit PID.

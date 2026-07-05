@@ -49,23 +49,30 @@ BLOCK_FILE = HERE / "BLOCKED.flag"   # presence = bridge is locked (firewall tri
 SLEEP_FILE = HERE / "SLEEP.flag"     # presence = sleep mode (Telegram input paused)
 INTRUSION_OFF_FILE = HERE / "INTRUSION_OFF.flag"  # presence = paranoid intrusion gate OFF (default ON)
 REGRESSIONS_FILE = HERE / "HACKING_REGRESSIONS.md"  # false-positive list to append to
-INSTANCE_FILE = HERE / "instance.txt"   # optional per-install identity (name / accent / glyph)
+INSTANCE_JSON = HERE / "instance.json"  # declared per-install identity {name, color, glyph}
+INSTANCE_FILE = HERE / "instance.txt"   # legacy identity fallback (name / #color / glyph lines)
+
+
+def _read_text(path):
+    try:
+        return path.read_text(encoding="utf-8") if path.exists() else None
+    except OSError:
+        return None
+
 
 # --- per-install identity ---------------------------------------------------------
 # Run several copies of claudegram (each its OWN directory + token = its own Telegram bot),
-# and each tray must be launchable and tell-apart-able. The single-instance key is now keyed
-# to THIS directory (not global), and a named copy gets a distinct title + tray badge. The
-# canonical lone `claudegram` install (no instance.txt) is left looking exactly as before.
+# and each tray must be launchable and tell-apart-able. The single-instance key is keyed to THIS
+# directory (not global), so copies never collide. A named copy gets a distinct title + tray
+# badge; identity is DECLARED in instance.json (name/color/glyph), with instance.txt and finally
+# the directory name as fallbacks. The canonical lone `claudegram` install is left as before.
 APP_ID = instance_id.instance_key(str(HERE))   # single-instance key, unique per directory
-try:
-    _INST_TEXT = INSTANCE_FILE.read_text(encoding="utf-8") if INSTANCE_FILE.exists() else ""
-except OSError:
-    _INST_TEXT = ""
-_INST_NAME, _INST_COLOR, _INST_GLYPH = instance_id.parse_instance_file(_INST_TEXT)
-IS_DEFAULT = instance_id.is_default_install(HERE.name, INSTANCE_FILE.exists())
-LABEL = _INST_NAME or instance_id.label_from_dir(HERE.name)
+_INST_JSON = _read_text(INSTANCE_JSON)
+_INST_TXT = _read_text(INSTANCE_FILE) if _INST_JSON is None else None
+_HAS_IDENTITY = _INST_JSON is not None or _INST_TXT is not None
+LABEL, _INST_COLOR, _INST_GLYPH, IS_DEFAULT = instance_id.resolve(HERE.name, _INST_JSON, _INST_TXT)
 TITLE = "claudegram" if IS_DEFAULT else f"claudegram · {LABEL}"
-DESKTOP_NAME = instance_id.desktop_name(HERE.name, LABEL, INSTANCE_FILE.exists())
+DESKTOP_NAME = instance_id.desktop_name(HERE.name, LABEL, _HAS_IDENTITY)
 
 # Toolbar buttons get real chrome (border, hover highlight, pressed feedback) instead of
 # flat text. Explicit colors so it looks deliberate under any system theme; blue accent

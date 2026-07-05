@@ -9,15 +9,21 @@ so install-autostart.sh can mirror it in shell:
   - instance_key(dir)      -> the single-instance lock key, unique PER DIRECTORY. THE fix: the
                               old fixed key meant a 2nd copy just poked the 1st tray and exited.
   - label_from_dir(name)   -> a friendly label from the directory basename
-  - parse_instance_file()  -> optional instance.txt overrides (name / accent color / glyph)
+  - parse_instance_json()  -> the DECLARED identity from instance.json (name / color / glyph)
+  - parse_instance_file()  -> legacy instance.txt fallback (name / accent color / glyph)
+  - resolve(dir, ...)      -> the single resolver: (label, color, glyph, is_default)
   - is_default_install()   -> the canonical lone 'claudegram' install (keeps its original look)
   - accent_hsv / badge_glyph -> the tray badge's auto color + letter for a named install
   - slug / desktop_name    -> a filesystem-safe id for the .desktop / WM class
 
-gui.py wraps the color as a QColor and the glyph into a drawn icon; nothing here imports Qt.
+Identity precedence: instance.json (declared) > instance.txt (legacy) > directory basename
+(foolproof fallback). gui.py wraps the color as a QColor and the glyph into a drawn icon; the
+`__main__` CLI at the bottom lets the shell scripts reuse this instead of mirroring it — so this
+module is the SINGLE source of truth. Nothing here imports Qt.
 """
 
 import hashlib
+import json
 
 DEFAULT_NAME = "claudegram"
 _STRIP_PREFIXES = ("claudegram-", "claudegram_", "claudegram.")
@@ -53,11 +59,29 @@ def parse_instance_file(text: str | None):
     return name, color, glyph
 
 
-def is_default_install(dir_name: str, has_instance_file: bool) -> bool:
-    """True only for the canonical single install: directory 'claudegram' with no instance.txt.
-    That case keeps the original tray look/title untouched — differentiation only kicks in once
-    you actually make a second, differently-named copy."""
-    return dir_name == DEFAULT_NAME and not has_instance_file
+def parse_instance_json(text: str | None):
+    """The DECLARED identity from instance.json -> (name, color, glyph), each None if absent or
+    the file is malformed. Shape: {"name": "research", "color": "#c2410c", "glyph": "2"}. A bad
+    file degrades to the directory-name fallback rather than crashing the tray."""
+    try:
+        data = json.loads(text or "")
+    except (ValueError, TypeError):
+        return (None, None, None)
+    if not isinstance(data, dict):
+        return (None, None, None)
+
+    def field(key):
+        v = data.get(key)
+        return v.strip() if isinstance(v, str) and v.strip() else None
+
+    return (field("name"), field("color"), field("glyph"))
+
+
+def is_default_install(dir_name: str, has_identity_file: bool) -> bool:
+    """True only for the canonical single install: directory 'claudegram' with no declared
+    identity (no instance.json / instance.txt). That case keeps the original tray look/title
+    untouched — differentiation only kicks in once you make a second, differently-named copy."""
+    return dir_name == DEFAULT_NAME and not has_identity_file
 
 
 def instance_key(dir_path: str) -> str:
@@ -95,10 +119,51 @@ def slug(name: str) -> str:
     return out or DEFAULT_NAME
 
 
-def desktop_name(dir_name: str, label: str, has_instance_file: bool) -> str:
+def desktop_name(dir_name: str, label: str, has_identity_file: bool) -> str:
     """Base name for this install's autostart .desktop file / WM class. The canonical install
     keeps 'claudegram'; every other copy gets 'claudegram-<slug>' so their entries and taskbar
     groups don't collide."""
-    if is_default_install(dir_name, has_instance_file):
+    if is_default_install(dir_name, has_identity_file):
         return DEFAULT_NAME
     return "claudegram-" + slug(label)
+
+
+def resolve(dir_name: str, json_text=None, txt_text=None):
+    """THE resolver: fold the identity precedence (instance.json > instance.txt > directory
+    basename) into (label, color, glyph, is_default). Pass the raw file contents (or None if a
+    file is absent); explicit `color`/`glyph` may be None to mean 'auto-derive from the label'."""
+    name = color = glyph = None
+    has_file = False
+    if json_text is not None:
+        name, color, glyph = parse_instance_json(json_text)
+        has_file = True
+    elif txt_text is not None:
+        name, color, glyph = parse_instance_file(txt_text)
+        has_file = True
+    label = name or label_from_dir(dir_name)
+    return label, color, glyph, is_default_install(dir_name, has_file)
+
+
+if __name__ == "__main__":
+    # Single source of truth for the shell scripts: instead of mirroring the naming logic in
+    # bash (and drifting), install-autostart.sh calls e.g. `python3 instance_id.py desktop_name .`
+    import pathlib
+    import sys
+
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "label"
+    root = pathlib.Path(sys.argv[2] if len(sys.argv) > 2 else ".").resolve()
+    jf, tf = root / "instance.json", root / "instance.txt"
+    jtext = jf.read_text(encoding="utf-8") if jf.exists() else None
+    ttext = tf.read_text(encoding="utf-8") if (jtext is None and tf.exists()) else None
+    has_file = jtext is not None or ttext is not None
+    label, _color, _glyph, default = resolve(root.name, jtext, ttext)
+    if cmd == "label":
+        print(label)
+    elif cmd == "desktop_name":
+        print(desktop_name(root.name, label, has_file))
+    elif cmd == "title":
+        print(DEFAULT_NAME if default else f"claudegram · {label}")
+    elif cmd == "is_default":
+        print("1" if default else "0")
+    else:
+        sys.exit(f"unknown command: {cmd}")

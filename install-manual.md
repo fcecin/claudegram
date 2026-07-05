@@ -162,3 +162,29 @@ Tell the user:
   working dir + session file.
 - Developing claudegram itself? Read `CLAUDE.md` (architecture, the watchdog/continuous-
   reader model, deploy and testing rules).
+
+## Adding another instance (a second/third bot, AI-guided)
+
+You can run several whole copies of claudegram side by side — each its own directory, its own
+`token.txt` (= its own Telegram bot), its own tray. There is **no self-clone script and no setup
+wizard**: the user clones the repo wherever they like (`git clone` / `cp`), and *you* configure
+that clone. Non-collision is automatic — the tray's single-instance key is a hash of the install
+directory, so copies never fight. The only human input is a **discerning name**.
+
+Per new clone (say at `~/cg/<name>/`):
+1. **New bot token** — the user makes it in **@BotFather** (`/newbot`). They can just **forward
+   you the BotFather message**; lift the token (pattern `<digits>:<≈35 chars>`) from it. **Never
+   print the token back**; write it straight to `token.txt` (`chmod 600`). Sanity-check it maps to
+   the right bot: `curl -s https://api.telegram.org/bot<token>/getMe`.
+2. **`.env`** — reuse the existing install's `ALLOWED_USER_IDS` (same person) unless told
+   otherwise. `CGHOME` can be omitted (defaults to the clone's own `work/`).
+3. **`instance.json`** — the DECLARED identity, so the tray isn't guessing:
+   `{"name":"<name>","glyph":"2","color":"#c2410c"}`. `glyph` is a letter or an emoji; omit
+   `color`/`glyph` to auto-derive from the name. (Legacy `instance.txt` also works.)
+4. **Roster** — a fresh bot usually wants a clean roster: keep `bots/claude` (+ `bots/README.md`),
+   remove the rest. Or copy them all if asked.
+5. **Launch** — build the venv and start the tray with the user's desktop env
+   (`cd ~/cg/<name> && ./run-gui.sh`). Verify the log shows `Private mode: only user ids […]`.
+6. **First contact** — a brand-new bot can't DM the user until they message it once
+   (`telegram.error.BadRequest: Chat not found` until then). Tell them to send `/start` to the new
+   bot. Optional: `./install-autostart.sh` from the clone adds its own login entry.
