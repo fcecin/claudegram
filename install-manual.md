@@ -181,8 +181,11 @@ Per new clone (say at `~/cg/<name>/`):
 3. **`instance.json`** — the DECLARED identity, so the tray isn't guessing:
    `{"name":"<name>","glyph":"2","color":"#c2410c"}`. `glyph` is a letter or an emoji; omit
    `color`/`glyph` to auto-derive from the name. (Legacy `instance.txt` also works.)
-4. **Roster** — a fresh bot usually wants a clean roster: keep `bots/claude` (+ `bots/README.md`),
-   remove the rest. Or copy them all if asked.
+4. **Roster** — **keep the full `bots/` roster as-is.** Multiplexing is meant to be multi-instance
+   AND multi-internal-bot, so a new clone inherits every personality by default. Do **NOT** prune
+   `bots/` unless the user explicitly asks for a clean roster — and even then, only remove the
+   specific bots they name. (`ensure_default_bot()` will recreate `bots/claude` if it's ever
+   missing, but that is a self-heal, not a cue to delete the others.)
 5. **Launch** — build the venv and start the tray with the user's desktop env
    (`cd ~/cg/<name> && ./run-gui.sh`). Verify the log shows `Private mode: only user ids […]`.
 6. **First contact** — a brand-new bot can't DM the user until they message it once
