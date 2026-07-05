@@ -231,19 +231,43 @@ cleared at the tray. **Keep the guard small** (no prompt bloat). False positives
 `HACKING_REGRESSIONS.md` (read on demand, not injected). Allowlist is the real access
 control; subscription is forced (`force_subscription_env` strips `ANTHROPIC_API_KEY`).
 
+## Multiple installs (N bot processes, N trays) — the OTHER scaling axis
+Orthogonal to *Multi-session multiplexing* (one bot process, N Claude sessions): you can also
+run **several whole copies** of claudegram, each in its OWN directory with its OWN `token.txt`
+(= its own Telegram bot) and its OWN tray window/`bot.py` child. `instance_id.py` (pure, Qt-free,
+covered by `test_instance`) is the identity behind it; `gui.py` wraps it in Qt:
+- **The fix that enables it:** the tray's single-instance key (`APP_ID`) is now
+  `instance_id.instance_key(str(HERE))` — a hash of the install's absolute path, so it's unique
+  **per directory**. The old fixed key meant a 2nd copy's `QLocalSocket` probe just poked the 1st
+  tray and exited; now a copy elsewhere launches its own tray, and re-launching the SAME copy
+  still focuses its own (still one tray per install).
+- **Differentiation (zero-config):** `LABEL` = the directory basename with a redundant
+  `claudegram-` prefix stripped (`~/claudegram-work` → "work"); the canonical lone `~/claudegram`
+  (no `instance.txt`) is `is_default_install` → **left looking exactly as before** (title
+  "claudegram", themed mic icon). A named copy gets window title `claudegram · <label>`, a tray
+  **badge** (auto color from `accent_hsv(label)` + first-letter `badge_glyph`), badged
+  notifications, and a distinct WM class / `.desktop` name (`desktop_name`) so taskbar entries
+  don't merge.
+- **Override:** optional `instance.txt` (gitignored, per-install) — line 1 = display name, an
+  optional `#rrggbb` line = accent color, another line = an explicit badge glyph (e.g. an emoji).
+- **Sync point:** `install-autostart.sh` mirrors the label/slug logic in shell; a change to
+  `instance_id.py`'s naming must be reflected there (a test compares the two).
+
 ## DEPLOY (non-obvious)
 - `bot.py` / `claude_driver.py` / `transcribe_worker.py` change → restart **just the bot
   child**: find its PID (`ps -eo pid,cmd | grep '[/]claudegram/bot.py'`) and `kill <pid>`; the
   tray supervisor respawns it and the session resumes (`session.id`). (`transcribe_worker.py` is
   re-read per spawn, so its changes apply on the next voice message even without a restart.)
-- `gui.py` change → **full tray restart**: kill the tray + bot child, then `./run-gui.sh`. It
-  **self-backgrounds** (re-execs via `setsid`, survives terminal close) and gui.py is
-  single-instance. From a non-graphical context, pass the desktop env (`WAYLAND_DISPLAY`,
-  `DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`). Don't do it mid Claude-turn /
-  transcription — wait for idle.
+- `gui.py` / `instance_id.py` change → **full tray restart**: kill the tray + bot child, then
+  `./run-gui.sh`. It **self-backgrounds** (re-execs via `setsid`, survives terminal close) and
+  gui.py is single-instance **per directory** (see *Multiple installs*). From a non-graphical
+  context, pass the desktop env (`WAYLAND_DISPLAY`, `DISPLAY`, `XDG_RUNTIME_DIR`,
+  `DBUS_SESSION_BUS_ADDRESS`). Don't do it mid Claude-turn / transcription — wait for idle.
 - **Launch paths differ:** manual = `./run-gui.sh` (tray, self-backgrounding) or `./run.sh`
   (headless bot, no tray); **autostart = `./install-autostart.sh`** writes a `.desktop` that
-  runs `gui.py` *directly* at login (GNOME-managed) — not `run-gui.sh`. Keep these in sync.
+  runs `gui.py` *directly* at login (GNOME-managed) — not `run-gui.sh`. `install-autostart.sh` /
+  `uninstall-autostart.sh` name the `.desktop` per-install (mirror of `instance_id.py`), so each
+  copy autostarts independently. Keep these in sync.
 - **NEVER** `pkill -f "claudegram/bot.py"` — the pattern matches the killing shell's own
   argv and it self-kills. Kill by explicit PID.
 
@@ -260,7 +284,8 @@ because the bridge has exactly **two external edges** and `tests/fakes.py` fakes
 Coverage: `test_multiplex` (registry/routing/badges + the scanned roster), `test_render` (badge on
 every message), `test_regressions` (the 2026-07-01 voiceback bugs, pinned), `test_turn` (firewall /
 spontaneous relay / crash via mock-Claude), `test_nostall` (anti-stall guard: discovery, flag,
-config-driven icon, refuse-without-its-bot), `test_park` (`bot park` + un-park). The runner resets
+config-driven icon, refuse-without-its-bot), `test_park` (`bot park` + un-park), `test_instance`
+(per-install identity: per-dir single-instance key, label/color/glyph, `.desktop` slug). The runner resets
 the registry + clears flags between tests.
 - **Add a test** whenever you touch bridge logic — it's cheap now. Keep the few *real*-Claude
   checks (isolated `ClaudeController(temp_cwd, temp_session_file, effort='low')`) as a thin

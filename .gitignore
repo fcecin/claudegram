@@ -7,6 +7,7 @@ session.id
 effort.level
 cwd.path
 compute.type
+instance.txt
 voice.mode
 nostall.mode
 BLOCKED.flag

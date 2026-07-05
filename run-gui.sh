@@ -4,8 +4,9 @@
 # SELF-BACKGROUNDING: run `./run-gui.sh` and walk away — it re-execs itself in a new
 # session (setsid) with stdio redirected to gui-stderr.log, so closing the terminal can't
 # SIGHUP it. The graphical env (WAYLAND_DISPLAY/DISPLAY/XDG_RUNTIME_DIR/DBUS_…) is inherited
-# from your desktop session. Re-running is safe: gui.py is single-instance (QLocalServer),
-# so a second launch just pokes the running tray and exits.
+# from your desktop session. Re-running is safe: gui.py is single-instance PER DIRECTORY
+# (QLocalServer keyed to this install's path), so a second launch of THIS copy just pokes its
+# running tray and exits — while a copy in another directory runs its own independent tray.
 #
 # Creates the virtualenv + installs deps on first run.
 set -euo pipefail

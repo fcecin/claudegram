@@ -10,13 +10,18 @@ itself is unchanged — this is a supervisor + log viewer.
   - Tray menu: Show console / Restart bot / Quit.
   - Closing the window hides it to the tray (the bot keeps running).
   - If the bot crashes, it is restarted automatically (with backoff).
-  - Single-instance: a second launch just focuses the first.
+  - Single-instance PER DIRECTORY: a second launch of the SAME install just focuses the
+    first, but a copy in ANOTHER directory runs its own independent tray (its own token =
+    its own Telegram bot). Named copies get a distinct title + colored tray badge so the
+    windows are tell-apart-able; see instance_id.py and the optional `instance.txt`.
 
-Launched at login via ~/.config/autostart/claudegram.desktop (see install-autostart.sh).
+Launched at login via ~/.config/autostart/<install>.desktop (see install-autostart.sh).
 """
 
 import sys
 from pathlib import Path
+
+import instance_id
 
 from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QTimer, QElapsedTimer
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap, QTextCursor
@@ -39,12 +44,28 @@ from PySide6.QtWidgets import (
 HERE = Path(__file__).resolve().parent
 PYTHON = str(HERE / ".venv" / "bin" / "python")
 BOT = str(HERE / "bot.py")
-APP_ID = "claudegram-gui"  # single-instance key (one instance per user session)
 LOG_FILE = HERE / "claudegram.log"   # persistent copy of the bot's output
 BLOCK_FILE = HERE / "BLOCKED.flag"   # presence = bridge is locked (firewall trip)
 SLEEP_FILE = HERE / "SLEEP.flag"     # presence = sleep mode (Telegram input paused)
 INTRUSION_OFF_FILE = HERE / "INTRUSION_OFF.flag"  # presence = paranoid intrusion gate OFF (default ON)
 REGRESSIONS_FILE = HERE / "HACKING_REGRESSIONS.md"  # false-positive list to append to
+INSTANCE_FILE = HERE / "instance.txt"   # optional per-install identity (name / accent / glyph)
+
+# --- per-install identity ---------------------------------------------------------
+# Run several copies of claudegram (each its OWN directory + token = its own Telegram bot),
+# and each tray must be launchable and tell-apart-able. The single-instance key is now keyed
+# to THIS directory (not global), and a named copy gets a distinct title + tray badge. The
+# canonical lone `claudegram` install (no instance.txt) is left looking exactly as before.
+APP_ID = instance_id.instance_key(str(HERE))   # single-instance key, unique per directory
+try:
+    _INST_TEXT = INSTANCE_FILE.read_text(encoding="utf-8") if INSTANCE_FILE.exists() else ""
+except OSError:
+    _INST_TEXT = ""
+_INST_NAME, _INST_COLOR, _INST_GLYPH = instance_id.parse_instance_file(_INST_TEXT)
+IS_DEFAULT = instance_id.is_default_install(HERE.name, INSTANCE_FILE.exists())
+LABEL = _INST_NAME or instance_id.label_from_dir(HERE.name)
+TITLE = "claudegram" if IS_DEFAULT else f"claudegram · {LABEL}"
+DESKTOP_NAME = instance_id.desktop_name(HERE.name, LABEL, INSTANCE_FILE.exists())
 
 # Toolbar buttons get real chrome (border, hover highlight, pressed feedback) instead of
 # flat text. Explicit colors so it looks deliberate under any system theme; blue accent
@@ -86,27 +107,42 @@ def make_icon() -> QIcon:
     themed = QIcon.fromTheme("audio-input-microphone")
     if not themed.isNull():
         return themed
+    return make_badge_icon(QColor("#2b6cb0"), "C")
+
+
+def make_badge_icon(color: QColor, glyph: str) -> QIcon:
+    """A filled circle in `color` with `glyph` (a letter or emoji) centered — the tray badge
+    that tells one running install apart from another at a glance."""
     pm = QPixmap(64, 64)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
-    p.setBrush(QColor("#2b6cb0"))
+    p.setBrush(color)
     p.setPen(Qt.NoPen)
     p.drawEllipse(4, 4, 56, 56)
     p.setPen(QColor("white"))
     f = QFont()
-    f.setPointSize(28)
+    f.setPointSize(30 if len(glyph) <= 1 else 22)
     f.setBold(True)
     p.setFont(f)
-    p.drawText(pm.rect(), Qt.AlignCenter, "C")
+    p.drawText(pm.rect(), Qt.AlignCenter, glyph[:2])
     p.end()
     return QIcon(pm)
+
+
+def instance_icon() -> QIcon:
+    """The default microphone for the canonical install, or a per-install colored badge for a
+    named copy (explicit color/glyph from instance.txt, else auto-derived from the label)."""
+    if IS_DEFAULT:
+        return make_icon()
+    color = QColor(_INST_COLOR) if _INST_COLOR else QColor.fromHsv(*instance_id.accent_hsv(LABEL))
+    return make_badge_icon(color, instance_id.badge_glyph(LABEL, _INST_GLYPH))
 
 
 class Supervisor(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.icon = make_icon()
+        self.icon = instance_icon()
         self._quitting = False
         self._fast_fails = 0
         self._uptime = QElapsedTimer()
@@ -114,7 +150,7 @@ class Supervisor(QMainWindow):
         self._log_fh = self._open_log()
 
         # --- console window ---------------------------------------------------
-        self.setWindowTitle("claudegram")
+        self.setWindowTitle(TITLE)
         self.setWindowIcon(self.icon)
         self.resize(860, 500)
 
@@ -172,7 +208,7 @@ class Supervisor(QMainWindow):
 
         # --- tray icon --------------------------------------------------------
         self.tray = QSystemTrayIcon(self.icon, self)
-        self.tray.setToolTip("claudegram")
+        self.tray.setToolTip(TITLE)
         menu = QMenu()
         menu.addAction("Show console", self.show_console)
         menu.addAction("Restart bot", self.restart_bot)
@@ -221,7 +257,7 @@ class Supervisor(QMainWindow):
                 "record this as a false positive so it never blocks again.\n"
             )
             self.tray.showMessage(
-                "claudegram LOCKED 🔒",
+                f"{TITLE} LOCKED 🔒",
                 "A request was flagged as a hacking attempt. Open the console and "
                 "Unblock (or Unlock & add regression) when you're at the machine.",
                 QSystemTrayIcon.Critical,
@@ -247,7 +283,7 @@ class Supervisor(QMainWindow):
         self.append("\n[supervisor] 🔓 Unblocked at the machine — bridge will resume.\n")
         self._check_block()
         self.tray.showMessage(
-            "claudegram", "Unblocked — the bridge will resume.", self.icon, 4000
+            TITLE, "Unblocked — the bridge will resume.", self.icon, 4000
         )
 
     def unblock_and_regress(self) -> None:
@@ -267,7 +303,7 @@ class Supervisor(QMainWindow):
         )
         self._check_block()
         self.tray.showMessage(
-            "claudegram",
+            TITLE,
             "Unblocked and added to the regressions list — it won't block this again.",
             self.icon,
             5000,
@@ -288,7 +324,7 @@ class Supervisor(QMainWindow):
         self.append(f"\n[supervisor] 🛡 Intrusion lock {'ON' if now_on else 'OFF'} "
                     "(set at the machine).\n")
         self.tray.showMessage(
-            "claudegram", f"Intrusion lock {'ON' if now_on else 'OFF'}.", self.icon, 4000)
+            TITLE, f"Intrusion lock {'ON' if now_on else 'OFF'}.", self.icon, 4000)
 
     def _refresh_intrusion(self) -> None:
         on = not INTRUSION_OFF_FILE.exists()
@@ -313,7 +349,7 @@ class Supervisor(QMainWindow):
                 "running). Click 'WAKE UP' to resume accepting input.\n"
             )
             self.tray.showMessage(
-                "claudegram — sleeping 😴",
+                f"{TITLE} — sleeping 😴",
                 "Telegram input is paused. Click the tray icon → 'Wake up' to resume.",
                 self.icon,
                 6000,
@@ -329,7 +365,7 @@ class Supervisor(QMainWindow):
         self.append("\n[supervisor] ☀️ Woken at the machine — Telegram input resumes.\n")
         self._check_sleep()
         self.tray.showMessage(
-            "claudegram", "Awake — Telegram input resumes.", self.icon, 4000
+            TITLE, "Awake — Telegram input resumes.", self.icon, 4000
         )
 
     # --- bot process management ----------------------------------------------
@@ -438,7 +474,7 @@ class Supervisor(QMainWindow):
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
-        self.tray.setToolTip(f"claudegram — {text}")
+        self.tray.setToolTip(f"{TITLE} — {text}")
 
     def show_console(self) -> None:
         self.showNormal()
@@ -460,7 +496,7 @@ class Supervisor(QMainWindow):
         event.ignore()
         self.hide()
         self.tray.showMessage(
-            "claudegram",
+            TITLE,
             "Still running in the tray. Right-click the icon to quit.",
             self.icon,
             3000,
@@ -480,7 +516,9 @@ class Supervisor(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("claudegram")
+    app.setApplicationName(DESKTOP_NAME)          # distinct WM class -> separate taskbar entry
+    app.setApplicationDisplayName(TITLE)
+    app.setDesktopFileName(DESKTOP_NAME)          # matches this install's autostart .desktop
     app.setQuitOnLastWindowClosed(False)  # live in the tray
 
     # Single instance: if one is already running, just ask it to show, then exit.
@@ -510,7 +548,7 @@ def main() -> None:
         win.show_console()
         QMessageBox.information(
             win,
-            "claudegram",
+            TITLE,
             "No system tray detected; showing the console window directly.",
         )
 
