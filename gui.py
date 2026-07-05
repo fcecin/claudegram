@@ -139,10 +139,12 @@ def make_badge_icon(color: QColor, glyph: str) -> QIcon:
 
 def instance_icon() -> QIcon:
     """The default microphone for the canonical install, or a per-install colored badge for a
-    named copy (explicit color/glyph from instance.txt, else auto-derived from the label)."""
+    named copy (declared color/glyph from the identity file, else auto-derived from the label)."""
     if IS_DEFAULT:
         return make_icon()
-    color = QColor(_INST_COLOR) if _INST_COLOR else QColor.fromHsv(*instance_id.accent_hsv(LABEL))
+    color = QColor(_INST_COLOR) if _INST_COLOR else QColor()
+    if not color.isValid():                     # unset OR a bad hex in instance.json -> auto
+        color = QColor.fromHsv(*instance_id.accent_hsv(LABEL))
     return make_badge_icon(color, instance_id.badge_glyph(LABEL, _INST_GLYPH))
 
 

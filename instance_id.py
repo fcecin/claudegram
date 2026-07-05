@@ -4,7 +4,7 @@ You can run several copies of the whole install — each in its OWN directory, e
 own token.txt (so its own Telegram bot) and its own tray window. For that to work the tray
 must be (a) launchable more than once and (b) visually distinguishable. This module holds the
 tiny bit of logic behind both, kept PURE and dependency-free (no Qt) so it's unit-testable and
-so install-autostart.sh can mirror it in shell:
+so the shell scripts can reuse it via the `__main__` CLI (rather than re-implementing it):
 
   - instance_key(dir)      -> the single-instance lock key, unique PER DIRECTORY. THE fix: the
                               old fixed key meant a 2nd copy just poked the 1st tray and exited.
