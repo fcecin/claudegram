@@ -4,8 +4,8 @@
 >
 > claudegram drives a **Claude Code instance with `bypassPermissions` (full
 > autonomy)**: it can run **any shell command** and read/edit/delete **any file**
-> as your user, triggered remotely from your phone. `~/cghome` is only where it
-> *starts* — Bash is **not** a sandbox.
+> as your user, triggered remotely from your phone. The install-local `work/` is only
+> where it *starts* — Bash is **not** a sandbox.
 >
 > **Run claudegram only on a dedicated, isolated machine that holds NO sensitive
 > credentials or data** — no SSH keys, cloud/CLI logins (AWS/GCP/gh/etc.), password
@@ -18,11 +18,11 @@
 
 A private Telegram bridge that lets you **drive a Claude Code instance by voice or
 text from your phone**. You talk to your bot; it transcribes locally, echoes back
-what it heard, dispatches the request to a Claude Code instance running in
-`~/cghome`, and streams back what Claude does plus its answer.
+what it heard, dispatches the request to a Claude Code instance running in the
+install's `work/` directory, and streams back what Claude does plus its answer.
 
 ```
-phone ──voice/text──▶  your bot  ──▶  transcribe (local) ──▶  Claude Code (~/cghome)
+phone ──voice/text──▶  your bot  ──▶  transcribe (local) ──▶  Claude Code (work/)
                                                                    │ streams activity
         your bot  ◀── 🗣 echo · 🔧 live board · streamed answer · [[END]] ◀──┘
 ```
@@ -183,7 +183,7 @@ itself and is **never sent to Claude**. Unknown ones reply
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | required (or `token.txt`) |
 | `ALLOWED_USER_IDS` | — | **required**; comma-separated Telegram ids |
-| `CGHOME` | `~/cghome` | Claude's working directory (auto-created) |
+| `CGHOME` | `<install>/work` | Claude's working directory (install-local, gitignored, auto-created) |
 | `WHISPER_MODEL` | `large-v3` | transcription model |
 | `WHISPER_COMPUTE_TYPE` | `float32` | seeds the default; flip live with `bot transcribe` (good=`int8_float32` ~2×, fast=`int8` ~3-4×) |
 | `WHISPER_LANGUAGE` | auto | force e.g. `en` / `pt` |

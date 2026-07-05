@@ -170,7 +170,9 @@ TRANSCRIBE_NODUR_BUDGET = 900.0     # hard cap when the clip's duration is unkno
 
 # --- Claude Code control ------------------------------------------------------
 
-CGHOME = Path(os.environ.get("CGHOME", str(Path.home() / "cghome"))).expanduser()
+# Default working dir for the driven Claude: an install-local, gitignored `work/` (so each
+# copy is self-contained and nothing leaks into git). Override with the CGHOME env var.
+CGHOME = Path(os.environ.get("CGHOME", str(HERE / "work"))).expanduser()
 SESSION_FILE = HERE / "session.id"   # persisted Claude session id (for resume)
 EFFORT_FILE = HERE / "effort.level"  # persisted reasoning effort
 CWD_FILE = HERE / "cwd.path"         # persisted working directory

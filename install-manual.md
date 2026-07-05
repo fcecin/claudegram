@@ -59,7 +59,8 @@ Ask for, and help them obtain:
    *Only the user can do this (it needs their account). You cannot.*
 2. **Their numeric Telegram user id** — guide them to message **@userinfobot**, which
    replies `Id: 123456789`. (A username is NOT usable for the allowlist.)
-3. **Working directory** — default `~/cghome` (auto-created). Ask if they want another.
+3. **Working directory** — default `work/` inside the install (install-local, gitignored,
+   auto-created). Ask if they want another (set `CGHOME` in `.env`).
 4. **Transcription** — default `large-v3` / `float32` (max accuracy, CPU-heavy); quality is
    also a live toggle, `bot transcribe best|good|fast` (float32 / int8_float32 ~2× / int8
    ~3-4×), no restart. Offer a forced `WHISPER_LANGUAGE` if they speak one language. Decoding

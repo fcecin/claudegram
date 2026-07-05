@@ -8,6 +8,7 @@ effort.level
 cwd.path
 compute.type
 instance.txt
+work/
 voice.mode
 nostall.mode
 BLOCKED.flag

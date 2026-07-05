@@ -1,7 +1,8 @@
 # CLAUDE.md — working on claudegram
 
 Guidance for an AI (Claude Code) **developing this repo**. (Not the runtime prompt —
-the bridge drives a *separate* Claude Code instance whose cwd is `~/cghome`.)
+the bridge drives a *separate* Claude Code instance whose cwd defaults to the
+install-local, gitignored `work/`.)
 
 > ## 🤝 If you're a Claude that just opened this repo
 > claudegram is a Telegram⇄Claude bridge. It is **self-sufficient**: the tray supervises and
