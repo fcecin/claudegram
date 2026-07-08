@@ -8,7 +8,7 @@ def test_config_resolution():
     sno = bot.bot_config("sno")
     assert sno["model"] == "haiku" and sno["transcribe"] == "fast" and sno["effort"] == "medium"
     assert bot.bot_config("ily")["effort"] == "high"
-    assert bot.bot_config("ava")["effort"] == "xhigh"
+    assert bot.bot_config("ava")["effort"] == "max"
     nyx = bot.bot_config("nyx")
     assert nyx["model"] == "opus" and nyx["effort"] == "max" and nyx["voiceback"] is False
     assert bot.bot_config("blu")["effort"] == "xhigh"
@@ -29,7 +29,7 @@ def test_forced_model_is_per_session():
 
 
 def test_forced_effort_from_config():
-    for name, effort in (("ava", "xhigh"), ("ily", "high"), ("sno", "medium"), ("blu", "xhigh")):
+    for name, effort in (("ava", "max"), ("ily", "high"), ("sno", "medium"), ("blu", "xhigh")):
         p = bot.HERE / f"effort.{name}.level"
         if p.exists():
             p.unlink()
@@ -38,9 +38,30 @@ def test_forced_effort_from_config():
 
 
 def test_model_bots_are_naked_without_main_md():
-    for name in ("sno", "ily", "ava"):
+    for name in ("sno", "ily"):
         assert bot.bot_home(name) is None
         assert "main.md" not in bot.build_prompt("hi", "text", bot_name=name)
+    # ava now carries a main.md (the writer/operator persona), so it is NOT naked.
+    assert bot.bot_home("ava") is not None
+
+
+def test_canonical_bot_from_default_bot_env():
+    import os
+    old = os.environ.get("DEFAULT_BOT")
+    try:
+        os.environ.pop("DEFAULT_BOT", None)
+        assert bot.canonical_bot() == "claude"            # unset -> fallback
+        os.environ["DEFAULT_BOT"] = "ava"
+        assert bot.canonical_bot() == "ava"               # a real bot -> canonical
+        os.environ["DEFAULT_BOT"] = "nope_not_a_bot"
+        assert bot.canonical_bot() == "claude"            # dangling name -> fallback
+        os.environ["DEFAULT_BOT"] = "claude"
+        assert bot.canonical_bot() == "claude"            # explicit default -> claude
+    finally:
+        if old is None:
+            os.environ.pop("DEFAULT_BOT", None)
+        else:
+            os.environ["DEFAULT_BOT"] = old
 
 
 def test_max_bot():

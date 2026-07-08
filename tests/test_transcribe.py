@@ -4,8 +4,9 @@ import bot
 def test_config_bot_pins_its_codec_at_spawn():
     for name in ("sno", "ily", "gol"):
         assert bot.session_compute(bot.Session(name)) == "int8", name          # config: fast
-    for name in ("ava", "blu", "gil"):
+    for name in ("blu", "gil"):
         assert bot.session_compute(bot.Session(name)) == "int8_float32", name  # config: good
+    assert bot.session_compute(bot.Session("ava")) == "float32"                # config: best
 
 
 def test_default_bot_inherits_the_code_default_best():

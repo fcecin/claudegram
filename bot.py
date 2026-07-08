@@ -1930,6 +1930,14 @@ def discover_bots() -> dict:
     return found
 
 
+def canonical_bot() -> str:
+    """The session loaded on startup and in single-bot mode: DEFAULT_BOT (from .env) if it
+    names a real bot on disk, else the always-regenerated 'claude' default — so an unset,
+    blank, or dangling DEFAULT_BOT safely falls back to 'claude'."""
+    name = os.environ.get("DEFAULT_BOT", "").strip()
+    return name if (name and name != DEFAULT_SESSION and name in discover_bots()) else DEFAULT_SESSION
+
+
 def bot_icon(name: str) -> str:
     """A bot's badge emoji — from its own config; the default gear if it declares none."""
     return bot_config(name).get("icon") or DEFAULT_ICON
@@ -3180,6 +3188,20 @@ async def media_outbox_loop(application) -> None:
 async def on_startup(application) -> None:
     """Runs once the bot is initialized — log it and ping the owner(s) on Telegram
     that the bridge just came online (handy to see power-cycles from your phone)."""
+    global _app
+    _app = application
+    # Load the canonical session BEFORE announcing, so the online banner and status text report
+    # the configured bot (DEFAULT_BOT), not the vestigial 'claude' default that was current at
+    # import. select_session wires the dispatcher (batches a burst into one turn), the spontaneous
+    # relay (turns Claude starts on its own), and the silence-breaker watchdog. A dangling/unset
+    # DEFAULT_BOT leaves the regenerated 'claude' default current. Extra sessions activate on
+    # `bot select`. This must stay first: reorder it below the announce and the phone shows claude.
+    canon = canonical_bot()
+    if canon != DEFAULT_SESSION:
+        select_session(canon)   # creates + sets current + controller + activates
+    else:
+        _activate_session(registry.current())
+    log.info("bots discovered on disk: %s", ", ".join(discover_bots()) or "(none)")
     sid = controller.session_id
     log.info("🟢 claudegram online — session=%s cwd=%s", sid or "new", controller.get_cwd())
     text = "🟢 claudegram online\n" + await _status_text()
@@ -3189,13 +3211,6 @@ async def on_startup(application) -> None:
         except Exception:
             log.exception("Could not send startup ping to %s", uid)
     mark_sent()  # the online ping counts — don't let the watchdog fire immediately
-    global _app
-    _app = application
-    # Activate the default session: its dispatcher (batches a burst into one turn), its
-    # spontaneous relay (turns Claude starts on its own), and its silence-breaker watchdog.
-    # Extra sessions are activated on `bot select`. One guard covers all sessions.
-    _activate_session(registry.current())
-    log.info("bots discovered on disk: %s", ", ".join(discover_bots()) or "(none)")
     if nostall_on():
         ensure_nostall_bot()  # anti-stall guard was left on — bring its bot up at startup
     _spawn(worker_guard(), name="worker_guard")

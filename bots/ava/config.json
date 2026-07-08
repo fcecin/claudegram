@@ -2,8 +2,8 @@
   "icon": "🟣",
   "aliases": ["avah", "arva", "ahva", "aava"],
   "model": "opus",
-  "effort": "xhigh",
-  "transcribe": "good",
+  "effort": "max",
+  "transcribe": "best",
   "voice": {
     "name": "af_bella"
   }
