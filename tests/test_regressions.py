@@ -65,3 +65,10 @@ async def test_normal_reply_does_not_declare_done():
     sess, r = _renderer(False, "Here is the answer you asked for.")
     await r.finalize()
     assert sess.no_more_work is False
+
+
+async def test_no_more_work_detected_mid_reply():
+    # Detected ANYWHERE now, not just at the start — bots routinely bury it mid-paragraph.
+    sess, r = _renderer(False, "Deployed and verified on cg2/cg3. NO MORE WORK — standing down.")
+    await r.finalize()
+    assert sess.no_more_work is True

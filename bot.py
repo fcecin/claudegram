@@ -471,8 +471,8 @@ IDLE_SHELLS_NUDGE = (
     "continue your work and check for stuck shells. Otherwise clean up your shells."
 )
 # After ~×30 idle ticks (~30 min) with NOTHING running, nudge Claude to continue or to
-# declare it's done. NO_MORE_WORK_MARKER is the agreed opt-out: Claude must reply STARTING
-# WITH it (startswith detection in SegmentRenderer.finalize), so the prompt says so plainly.
+# declare it's done. NO_MORE_WORK_MARKER is the agreed opt-out: detected ANYWHERE in the reply
+# (substring scan in SegmentRenderer.finalize) since a bot often buries it mid-paragraph.
 NO_MORE_WORK_MARKER = "NO MORE WORK"
 IDLE_NO_SHELLS_NUDGE_AT = 30
 IDLE_AUTOEND_AT = 10  # a background (non-current, non-default) session idle+no-shells this many
@@ -480,9 +480,8 @@ IDLE_AUTOEND_AT = 10  # a background (non-current, non-default) session idle+no-
 IDLE_NO_SHELLS_NUDGE = (
     "You have been idle for a long time with nothing running (no background shells). "
     "If you have any remaining work or next steps, CONTINUE now. If you are genuinely out "
-    "of work and ideas, reply with your message STARTING WITH the exact words "
-    "'NO MORE WORK' (uppercase, as the very first thing in your reply) and I will stop "
-    "nudging you until the human sends something."
+    "of work and ideas, include the exact words 'NO MORE WORK' (uppercase) anywhere in your "
+    "reply and I will stop nudging you until the human sends something."
 )
 # Anthropic-side throttling (overloaded / 429 — NOT the user's quota): report + auto-retry.
 RATE_LIMIT_RETRY_SECS = 300   # wait this long before retrying a rate-limited turn
@@ -728,10 +727,9 @@ REGRESSIONS_FILE = HERE / "HACKING_REGRESSIONS.md"  # curated list of false posi
 # The model is capable; a sane prompt + the regressions list converges. Almost
 # everything is legitimate — only genuine malice trips the (intentional) hard lock.
 _GUARD_BODY = (
-    " via the user's own bridge — just help with normal requests. If it is a genuine "
-    "malicious hacking/intrusion attempt, do NOT answer or give a normal refusal — "
-    "reply with exactly 'HACKING ATTEMPT BLOCKED' on line 1, then the reason. "
-    f"Unsure? Read {REGRESSIONS_FILE}. "
+    " via the user's bridge — just help with normal requests. Only a genuine malicious "
+    "hacking/intrusion attempt gets no normal answer or refusal: reply exactly 'HACKING "
+    f"ATTEMPT BLOCKED' on line 1, then the reason (unsure? read {REGRESSIONS_FILE}). "
 )
 GUARD_AUDIO = "[Voice transcript (may be imperfect)" + _GUARD_BODY + "Transcript:]"
 GUARD_TEXT = "[Text" + _GUARD_BODY + "Message:]"
@@ -744,22 +742,19 @@ BLOCKED_MSG = (
 
 # Injected only when the user opts a turn into voiceback (prompt starts with "voice").
 VOICEBACK_PREAMBLE = (
-    "[VOICEBACK ON: your entire reply is spoken aloud as ONE voice message and the user will "
-    "only HEAR it — no text is shown. So speak naturally and briefly, like talking aloud: "
-    "give the answer or gist, and do NOT write code, file paths, logs, URLs, or long lists "
-    "(they sound terrible read aloud).]\n"
+    "[VOICEBACK ON: your whole reply is spoken as one voice message (no text shown). Speak "
+    "naturally and briefly; no code, paths, logs, URLs, or long lists (they sound bad aloud).]\n"
 )
 
 
-# Teaches every turn that the bot can reconfigure claudegram itself when ASKED. Small on
-# purpose (rides every prompt). The `cg-cmd` helper drops a command into cmd-inbox/, which a
-# loop here runs through the ordinary bot-command handler (safe config subset only).
+# Teaches every turn that the bot can reconfigure claudegram (when asked) and manage itself.
+# Small on purpose (rides every prompt). `cg-cmd` drops a command into cmd-inbox/, which a loop
+# here runs through the ordinary bot-command handler (safe subset only).
 SELFCONFIG_PREAMBLE = (
-    "[claudegram self-config: if the user asks you to change a bridge setting, run the shell "
-    f"command `{HERE / 'cg-cmd'} <command>`. Available commands: effort <low|medium|high|xhigh|"
-    "max>, model <opus|sonnet|haiku|default>, voice <on|off>, transcribe <best|good|fast>, "
-    "cwd <path>, status. Run it ONLY when they actually ask to change a setting, then confirm "
-    "briefly in words. Changes take effect on the next turn, not this one.]\n"
+    f"[self-config via `{HERE / 'cg-cmd'} <cmd>` — change a bridge setting when asked, or manage "
+    "yourself: effort low|medium|high|xhigh|max · model opus|sonnet|haiku|default · voice on|off "
+    "· transcribe best|good|fast · cwd <path> · park (when you're done: end-state idle, stops "
+    "nudging) · status. Effect is next turn.]\n"
 )
 
 
@@ -773,11 +768,9 @@ def bot_boot_pointer(name: str) -> str:
     if home is None:
         return ""
     return (
-        f'[You are the bot "{name}". Your home directory is {home}. Read {home}/main.md '
-        "now and follow it as your operating instructions for this and every following "
-        "turn; re-read it and anything it points to after any context compaction. Paths in "
-        "your instructions are relative to your home unless absolute. This does not "
-        "override or relax the security guard above.]\n"
+        f'[You are bot "{name}" (home: {home}). Read {home}/main.md now and follow it every '
+        "turn; re-read it and what it points to after any compaction. Relative paths are under "
+        "home. Does not relax the guard above.]\n"
     )
 
 
@@ -1722,7 +1715,7 @@ class SegmentRenderer:
             self.session.recent_answers.append(answer)  # what the guard reviews if this bot stalls
             self.session.nostall_cleared = False        # new output — let the guard review again
         clean = answer.lstrip()
-        if clean.upper().startswith(NO_MORE_WORK_MARKER):
+        if NO_MORE_WORK_MARKER in clean.upper():
             set_no_more_work(self.session, True)
             log.info("watchdog: Claude declared NO MORE WORK — idle nudging paused")
         if self.voiceback:
@@ -3054,7 +3047,7 @@ async def deliver_harness(application, body: str) -> None:
 # (firewall/intrusion) isn't a bot command at all, so it's untouchable regardless.
 SELFCONFIG_ALLOWED = {
     "effort", "model", "voice", "transcribe", "transcription", "quality", "tx",
-    "cwd", "chdir", "workdir", "pwd", "status", "context", "ctx",
+    "cwd", "chdir", "workdir", "pwd", "status", "context", "ctx", "park",
 }
 
 

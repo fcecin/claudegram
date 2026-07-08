@@ -35,3 +35,13 @@ async def test_user_input_unparks():
 
 def test_parked_flag_defaults_off():
     assert bot.Session("claude").parked is False
+
+
+async def test_bot_can_park_itself_via_selfconfig():
+    # A bot parks itself through the self-config channel (./cg-cmd park), not only the user.
+    fb = FakeBot()
+    cur = bot.registry.current()
+    cur.parked = False
+    await bot._run_selfconfig(fb, 1, "park")
+    assert cur.parked is True
+    assert not any("refused" in s for s in fb.sent), fb.sent
