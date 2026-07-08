@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# cg-wake — inject a wake TURN into THIS install's current bot (the external -> bot-turn path).
+# Any scheduler or program on this machine calls it; the running bot then takes a turn. The
+# wake cron uses it (see install-cron.sh). With no args it sends a terse timestamped heartbeat;
+# with args, that text becomes the injected turn.
+#   ./cg-wake                         # heartbeat: "anything to do? else stand down"
+#   ./cg-wake "peer ava: <message>"   # arbitrary injected turn
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+INBOX="$HERE/wake-inbox"
+mkdir -p "$INBOX"
+
+if [ "$#" -gt 0 ]; then
+  msg="$*"
+else
+  msg="tick $(date '+%Y-%m-%d %H:%M %Z') (automated, not the user). Anything to do on your standing tasks? If not, end the turn without replying."
+fi
+
+stamp="$(date +%s%N)"
+tmp="$INBOX/.$stamp.tmp"
+printf '%s' "$msg" > "$tmp"
+mv "$tmp" "$INBOX/$stamp.msg"   # atomic: the bridge never reads a partial file
+echo "queued wake: $msg"

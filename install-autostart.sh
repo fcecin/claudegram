@@ -30,4 +30,9 @@ Categories=Utility;
 EOF
 
 echo "Installed autostart entry: $FILE   (Name: $NAME)"
+
+# Also (re)install this install's wake cron: every 3h it injects a heartbeat turn into the
+# current bot. Per-install + idempotent (see install-cron.sh); never touches other installs.
+"$DIR/install-cron.sh" "$DIR" || echo "wake cron step skipped (crontab unavailable?)" >&2
+
 echo "It will launch on your next login. To start it now: ./run-gui.sh"

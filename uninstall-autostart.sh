@@ -14,3 +14,6 @@ if [ -f "$FILE" ]; then
 else
     echo "No autostart entry found at $FILE"
 fi
+
+# Also remove this install's wake cron (leaves other installs' entries untouched).
+"$DIR/install-cron.sh" "$DIR" --remove || true

@@ -37,3 +37,4 @@ media-outbox/
 models
 /var/
 cmd-inbox/
+wake-inbox/

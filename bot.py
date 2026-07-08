@@ -186,6 +186,9 @@ HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by 
 MEDIA_OUTBOX = HERE / "media-outbox"
 CMD_INBOX = HERE / "cmd-inbox"       # drop dir: the DRIVEN Claude drops a config command
                                      # (via ./cg-cmd) -> run through the bot-command handler
+WAKE_INBOX = HERE / "wake-inbox"     # drop dir: a scheduler (cron via ./cg-wake) or a peer
+                                     # program drops a msg -> injected as a turn into the
+                                     # current bot session (the external -> bot-turn path)
 # --- multi-session multiplexing (ONE Telegram bot, N concurrent Claude sessions) -----
 # Names + color bubbles. "claude" (orange) is the DEFAULT/hidden session: until a SECOND
 # session is created, registry.multiplexing() is False and every badge is "" — so the whole
@@ -3139,6 +3142,53 @@ async def harness_outbox_loop(application) -> None:
         await asyncio.sleep(1.0)
 
 
+def _drain_wake_inbox(chat) -> int:
+    """Process finished drops in WAKE_INBOX once: inject each as a turn into the CURRENT
+    session (source 'wake'), consume-once (delete before enqueue). Returns the count
+    injected. Split from the loop so it is unit-testable without the infinite loop."""
+    injected = 0
+    try:
+        entries = sorted(WAKE_INBOX.iterdir())
+    except OSError:
+        return 0
+    for f in entries:
+        if (not f.is_file()) or f.name.startswith(".") or f.suffix != ".msg":
+            continue  # not a finished drop
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        try:
+            f.unlink()  # consume-once: delete before enqueue, never double-inject
+        except OSError:
+            pass
+        if text:
+            enqueue_for_claude(registry.current(), chat, None, text, "wake", False)
+            log.info("wake -> %s: %s", registry.current().name, _oneline(text, 120))
+            injected += 1
+    return injected
+
+
+async def wake_inbox_loop(application) -> None:
+    """External -> bot-turn injection. A scheduler (cron via ./cg-wake) or a peer program
+    drops a message in wake-inbox/; we inject it as a turn into the current bot session.
+    cron is the first client (a 3h heartbeat: "anything to do?"); the same drop shape will
+    serve bot-to-bot messaging later. Atomic drop then rename; consume-once."""
+    try:
+        WAKE_INBOX.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        log.exception("Could not create wake inbox dir %s", WAKE_INBOX)
+        return
+    while True:
+        try:
+            chat = sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
+            if chat is not None:
+                _drain_wake_inbox(chat)
+        except Exception:
+            log.exception("wake inbox loop error")
+        await asyncio.sleep(1.0)
+
+
 async def media_outbox_loop(application) -> None:
     try:
         MEDIA_OUTBOX.mkdir(parents=True, exist_ok=True)
@@ -3223,6 +3273,8 @@ async def on_startup(application) -> None:
     log.info("media outbox watcher started at %s", MEDIA_OUTBOX)
     _spawn(cmd_inbox_loop(application), name="cmd_inbox")
     log.info("self-config command inbox started at %s", CMD_INBOX)
+    _spawn(wake_inbox_loop(application), name="wake_inbox")
+    log.info("wake inbox watcher started at %s", WAKE_INBOX)
     # Scrape subscription 5h/week usage from `claude /usage` every 10 min → cache → DONE line.
     _spawn(usage_collector_loop(), name="usage_collector")
     log.info("usage collector started (refresh %ss via usage_worker.py)", USAGE_REFRESH_SECS)
