@@ -19,6 +19,7 @@ Launched at login via ~/.config/autostart/<install>.desktop (see install-autosta
 """
 
 import sys
+import time
 from pathlib import Path
 
 import instance_id
@@ -28,6 +29,7 @@ from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap, QTex
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMenu,
@@ -38,6 +40,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QSystemTrayIcon,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -148,6 +151,20 @@ def instance_icon() -> QIcon:
     return make_badge_icon(color, instance_id.badge_glyph(LABEL, _INST_GLYPH))
 
 
+class _InputBox(QPlainTextEdit):
+    """Multi-line paste box for the console; Ctrl+Enter submits (the Send button also does)."""
+
+    def __init__(self, on_submit):
+        super().__init__()
+        self._on_submit = on_submit
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter) and (e.modifiers() & Qt.ControlModifier):
+            self._on_submit()
+            return
+        super().keyPressEvent(e)
+
+
 class Supervisor(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -170,7 +187,28 @@ class Supervisor(QMainWindow):
         mono.setStyleHint(QFont.Monospace)
         mono.setPointSize(10)
         self.view.setFont(mono)
-        self.setCentralWidget(self.view)
+
+        # Bottom pane: paste a message and Send it into the running bot. It is dropped into
+        # wake-inbox/ (the same path cg-wake/cron use), so the bot injects it as a turn and
+        # echoes it into the chat. Ctrl+Enter sends too.
+        self.input = _InputBox(self.send_to_bot)
+        self.input.setPlaceholderText("Message to the bot — paste, then Send (or Ctrl+Enter)")
+        self.input.setFont(mono)
+        self.input.setFixedHeight(self.input.fontMetrics().lineSpacing() * 5 + 14)  # ~5 lines
+        send_btn = QPushButton("Send")
+        send_btn.setFixedWidth(80)
+        send_btn.clicked.connect(self.send_to_bot)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.input, 1)
+        row.addWidget(send_btn, 0, Qt.AlignBottom)
+        central = QWidget()
+        col = QVBoxLayout(central)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(2)
+        col.addWidget(self.view, 1)   # log pane takes the slack
+        col.addLayout(row)            # input pane stays ~fixed height
+        self.setCentralWidget(central)
 
         tb = QToolBar()
         tb.setMovable(False)
@@ -471,6 +509,24 @@ class Supervisor(QMainWindow):
             self.set_status("failed to start")
 
     # --- window / tray behaviour ---------------------------------------------
+    def send_to_bot(self) -> None:
+        """Inject the input-box text into the running bot as a turn by dropping it into
+        wake-inbox/ (atomic: temp then rename). The bot's wake watcher picks it up on its
+        next poll and echoes it into the chat; nothing else to do here."""
+        text = self.input.toPlainText().strip()
+        if not text:
+            return
+        inbox = HERE / "wake-inbox"
+        try:
+            inbox.mkdir(parents=True, exist_ok=True)
+            stamp = str(time.time_ns())
+            tmp = inbox / f".{stamp}.tmp"
+            tmp.write_text(text, encoding="utf-8")
+            tmp.rename(inbox / f"{stamp}.msg")  # atomic: the bot never reads a partial drop
+            self.input.clear()
+        except OSError:
+            self.append("\n[gui] could not queue message (wake-inbox write failed)\n")
+
     def append(self, text: str) -> None:
         sb = self.view.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 4
