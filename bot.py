@@ -3135,15 +3135,25 @@ async def harness_outbox_loop(application) -> None:
         await asyncio.sleep(1.0)
 
 
-def _drain_wake_inbox(chat) -> int:
+def _wake_echo_line(text: str) -> str:
+    """One-line chat render of an incoming wake: a clock for the cron heartbeat, an inbox
+    glyph for anything else (another bot, a program, a manual cg-wake). cg-wake is a plain
+    program — the host can't know who called it, only what they wrote — so any sender
+    identity lives inside `text`, shown verbatim."""
+    icon = "⏰" if text.startswith("tick ") else "\U0001f4e8"  # cron clock / other
+    return f"{icon} {text}"
+
+
+def _drain_wake_inbox(chat) -> list[str]:
     """Process finished drops in WAKE_INBOX once: inject each as a turn into the CURRENT
-    session (source 'wake'), consume-once (delete before enqueue). Returns the count
-    injected. Split from the loop so it is unit-testable without the infinite loop."""
-    injected = 0
+    session (source 'wake'), consume-once (delete before enqueue). Returns the injected
+    texts so the loop can echo each into the chat (so the owner sees WHAT woke the bot, not
+    only its reply). Split from the loop so it is unit-testable without the infinite loop."""
+    injected: list[str] = []
     try:
         entries = sorted(WAKE_INBOX.iterdir())
     except OSError:
-        return 0
+        return injected
     for f in entries:
         if (not f.is_file()) or f.name.startswith(".") or f.suffix != ".msg":
             continue  # not a finished drop
@@ -3158,7 +3168,7 @@ def _drain_wake_inbox(chat) -> int:
         if text:
             enqueue_for_claude(registry.current(), chat, None, text, "wake", False)
             log.info("wake -> %s: %s", registry.current().name, _oneline(text, 120))
-            injected += 1
+            injected.append(text)
     return injected
 
 
@@ -3176,7 +3186,15 @@ async def wake_inbox_loop(application) -> None:
         try:
             chat = sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
             if chat is not None:
-                _drain_wake_inbox(chat)
+                echoed = False
+                for text in _drain_wake_inbox(chat):
+                    try:  # echo the incoming wake so the owner sees what woke the bot
+                        await reply_chunked_bot(application.bot, chat, None, _wake_echo_line(text))
+                        echoed = True
+                    except Exception:
+                        log.exception("wake echo failed")
+                if echoed:
+                    mark_sent()  # we posted to the chat; keep the watchdog quiet
         except Exception:
             log.exception("wake inbox loop error")
         await asyncio.sleep(1.0)
