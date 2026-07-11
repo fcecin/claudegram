@@ -2,12 +2,25 @@
 any document) to the owner's phone by dropping it into media-outbox/, which
 media_outbox_loop relays over Telegram (photo, else document)."""
 
+import contextlib
 import pathlib
 import shutil
 import subprocess
 import tempfile
 
 import bot
+from tests.fakes import FakeBot
+
+
+@contextlib.contextmanager
+def _outbox(td):
+    """Repoint bot.MEDIA_OUTBOX at a temp dir for one test."""
+    old = bot.MEDIA_OUTBOX
+    bot.MEDIA_OUTBOX = pathlib.Path(td)
+    try:
+        yield bot.MEDIA_OUTBOX
+    finally:
+        bot.MEDIA_OUTBOX = old
 
 
 def _run_cg_send(root: pathlib.Path, *args: str):
@@ -66,3 +79,44 @@ def test_cg_send_missing_file_fails_loudly():
         r = _run_cg_send(root, str(root / "nope.pdf"))
         assert r.returncode != 0
         assert "no such file" in r.stderr
+
+
+async def test_outbox_routes_by_type_up_front():
+    """A PDF must go out as a DOCUMENT (sendPhoto would rasterize page 1, not fail);
+    an image goes as a photo. Captions pair; the outbox is consumed."""
+    with tempfile.TemporaryDirectory() as td, _outbox(td) as outbox:
+        (outbox / "1-report.pdf").write_bytes(b"%PDF")
+        (outbox / "1-report.caption").write_text("the report")
+        (outbox / "2-pic.png").write_bytes(b"\x89PNG")
+        fb = FakeBot()
+        assert await bot._drain_media_outbox(fb, 1) == 2
+        assert fb.documents == ["the report"]  # pdf → document, caption attached
+        assert fb.photos == [None]             # png → photo, no caption
+        assert list(outbox.iterdir()) == []    # media + caption consumed
+
+
+async def test_failed_document_send_is_never_retried_as_photo():
+    """The mangler: a transient document failure retried via sendPhoto would deliver
+    a rasterized page 1 pretending to be the file. Fail loudly instead."""
+    class DocumentsFail(FakeBot):
+        async def send_document(self, chat_id, document=None, caption=None, **kw):
+            raise RuntimeError("boom")
+
+    with tempfile.TemporaryDirectory() as td, _outbox(td) as outbox:
+        (outbox / "1-report.pdf").write_bytes(b"%PDF")
+        fb = DocumentsFail()
+        assert await bot._drain_media_outbox(fb, 1) == 0
+        assert fb.photos == []
+
+
+async def test_failed_photo_send_falls_back_to_document():
+    """An image Telegram rejects as a photo (huge/odd) still arrives — as a file."""
+    class PhotosFail(FakeBot):
+        async def send_photo(self, chat_id, photo=None, caption=None, **kw):
+            raise RuntimeError("PHOTO_INVALID_DIMENSIONS")
+
+    with tempfile.TemporaryDirectory() as td, _outbox(td) as outbox:
+        (outbox / "1-huge.png").write_bytes(b"\x89PNG")
+        fb = PhotosFail()
+        assert await bot._drain_media_outbox(fb, 1) == 1
+        assert fb.documents == [None]

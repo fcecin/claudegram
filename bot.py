@@ -3208,6 +3208,55 @@ async def wake_inbox_loop(application) -> None:
         await asyncio.sleep(1.0)
 
 
+async def _drain_media_outbox(tgbot, chat) -> int:
+    """One scan of media-outbox/: send every staged file to `chat`; returns how many
+    were sent. Route by type UP FRONT — Telegram's sendPhoto silently accepts a PDF
+    and rasterizes page 1, so a "try photo first" scheme mangles documents. A failed
+    photo still falls back to document (the universal container: oversized/odd images
+    arrive as files), but a failed document send is NEVER retried as a photo — a
+    rasterized first page masquerading as the file is worse than a loud failure."""
+    n = 0
+    for f in sorted(MEDIA_OUTBOX.iterdir()):
+        if (not f.is_file()) or f.name.startswith(".") or f.suffix in (".tmp", ".caption"):
+            continue
+        cap_file = f.with_suffix(".caption")
+        caption = None
+        if cap_file.exists():
+            try:
+                caption = cap_file.read_text(encoding="utf-8", errors="replace").strip() or None
+            except OSError:
+                caption = None
+        sent = False
+        is_image = f.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+        try:
+            with open(f, "rb") as fh:
+                if is_image:
+                    await tgbot.send_photo(chat, photo=fh, caption=caption)
+                else:
+                    await tgbot.send_document(chat, document=fh, caption=caption)
+            sent = True
+        except Exception:
+            if is_image:
+                log.warning("send_photo failed for %s — trying document", f.name, exc_info=True)
+                try:
+                    with open(f, "rb") as fh:
+                        await tgbot.send_document(chat, document=fh, caption=caption)
+                    sent = True
+                except Exception:
+                    log.exception("send_document also failed for %s", f.name)
+            else:
+                log.exception("send_document failed for %s", f.name)
+        if sent:
+            n += 1
+            log.info("media sent: %s", f.name)
+        for g in (f, cap_file):
+            try:
+                g.unlink()
+            except OSError:
+                pass
+    return n
+
+
 async def media_outbox_loop(application) -> None:
     try:
         MEDIA_OUTBOX.mkdir(parents=True, exist_ok=True)
@@ -3217,38 +3266,8 @@ async def media_outbox_loop(application) -> None:
     while True:
         try:
             chat = sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
-            if chat is not None:
-                for f in sorted(MEDIA_OUTBOX.iterdir()):
-                    if (not f.is_file()) or f.name.startswith(".") or f.suffix in (".tmp", ".caption"):
-                        continue
-                    cap_file = f.with_suffix(".caption")
-                    caption = None
-                    if cap_file.exists():
-                        try:
-                            caption = cap_file.read_text(encoding="utf-8", errors="replace").strip() or None
-                        except OSError:
-                            caption = None
-                    sent = False
-                    try:
-                        with open(f, "rb") as fh:
-                            await application.bot.send_photo(chat, photo=fh, caption=caption)
-                        sent = True
-                    except Exception:
-                        log.warning("send_photo failed for %s — trying document", f.name, exc_info=True)
-                        try:
-                            with open(f, "rb") as fh:
-                                await application.bot.send_document(chat, document=fh, caption=caption)
-                            sent = True
-                        except Exception:
-                            log.exception("send_document also failed for %s", f.name)
-                    if sent:
-                        mark_sent()
-                        log.info("media sent: %s", f.name)
-                    for g in (f, cap_file):
-                        try:
-                            g.unlink()
-                        except OSError:
-                            pass
+            if chat is not None and await _drain_media_outbox(application.bot, chat):
+                mark_sent()
         except Exception:
             log.exception("media outbox loop error")
         await asyncio.sleep(1.0)
