@@ -58,6 +58,8 @@ from claude_agent_sdk import (
 from claude_driver import (
     ClaudeController,
     VALID_EFFORTS,
+    ambient_default_model,
+    default_model_guard,
     force_subscription_env,
     summarize_tool,
 )
@@ -2424,15 +2426,10 @@ MODEL_RESET = {"default", "none", "reset", "auto"}      # config-only (never a l
 
 
 def default_model():
-    v = os.environ.get("ANTHROPIC_MODEL")
-    if v:
-        return v
-    try:
-        return json.loads(
-            (Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8")
-        ).get("model")
-    except Exception:
-        return None
+    """EFFECTIVE default for sessions with no forced model — the driver's fable
+    guard applied over the ambient env/settings default, so the label matches
+    what actually runs."""
+    return default_model_guard() or ambient_default_model()
 
 
 def _model_label(ctrl) -> str:

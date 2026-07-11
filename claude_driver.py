@@ -15,6 +15,7 @@ Guarantees:
 """
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -44,6 +45,33 @@ VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # The SDK doesn't expose Claude Code's unset/default effort as a value, so we pin an
 # explicit default — "effort" is then always a concrete, known level (override: bot effort).
 DEFAULT_EFFORT = "high"
+
+# fable is never an AMBIENT default: it runs only when explicitly chosen (a bot's
+# config.json "model" or `bot model fable`). If the machine's env/settings default
+# would resolve to fable, sessions without a forced model run this instead.
+FABLE_GUARD_FALLBACK = "opus"
+
+
+def ambient_default_model() -> str | None:
+    """The model the CLI would pick with no --model: ANTHROPIC_MODEL env, then
+    ~/.claude/settings.json — the CLI's own precedence, mirrored."""
+    v = os.environ.get("ANTHROPIC_MODEL")
+    if v:
+        return v
+    try:
+        return json.loads(
+            (Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8")
+        ).get("model")
+    except Exception:
+        return None
+
+
+def default_model_guard() -> str | None:
+    """The explicit --model to force when a session has NO forced model: normally
+    None (let the CLI pick), but never let the ambient default land on fable."""
+    if "fable" in (ambient_default_model() or "").lower():
+        return FABLE_GUARD_FALLBACK
+    return None
 
 
 def _proc_ppid_cmd(pid: int):
@@ -362,7 +390,7 @@ class ClaudeController:
             permission_mode="bypassPermissions",
             resume=self.session_id,  # None => fresh session
             effort=self.effort,  # None => model/CLI default
-            model=self.forced_model,  # None => whatever the user's env/CLI default is
+            model=self.forced_model or default_model_guard(),  # guard: default never fable
             max_budget_usd=self.max_budget_usd,  # None => no cap; 0 => never spend money
             include_partial_messages=True,  # stream text deltas for live output
             hooks={"PreCompact": [HookMatcher(hooks=[self._pre_compact_hook])]},
