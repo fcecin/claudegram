@@ -272,6 +272,14 @@ def ensure_default_bot() -> None:
         log.info("bootstrap: regenerated %s", cfg)
 
 
+# Shorthands resolved to an exact model ID before reaching the CLI (which may not
+# know the bare alias). Defined here because Session() runs at import time.
+# fable is safe to expose (incl. self-config): it draws usage credits, and with
+# credits disabled it just stops — it can no longer bill overage (old 4daac98
+# exclusion is obsolete).
+MODEL_ALIASES = {"fable": "claude-fable-5"}
+
+
 class Session:
     """One named Claude instance behind the single Telegram bot."""
 
@@ -287,8 +295,9 @@ class Session:
         # `bot transcribe` overrides this in-memory (process-lived); never persisted.
         self.compute = TRANSCRIBE_PRESETS.get((self.config.get("transcribe") or "").lower())
         sf, ef, cf = _session_files(name)
+        model = self.config.get("model")
         self.controller = ClaudeController(str(CGHOME), sf, ef, cf,
-                                           model=self.config.get("model"),
+                                           model=MODEL_ALIASES.get(model, model),
                                            max_budget_usd=self.config.get("max_budget_usd"),
                                            effort=self.config.get("effort"))
         # per-session batching queue (mirrors the old module-level _pending* globals)
@@ -752,7 +761,7 @@ VOICEBACK_PREAMBLE = (
 # here runs through the ordinary bot-command handler (safe subset only).
 SELFCONFIG_PREAMBLE = (
     f"[self-config via `{HERE / 'cg-cmd'} <cmd>` — change a bridge setting when asked, or manage "
-    "yourself: effort low|medium|high|xhigh|max · model opus|sonnet|haiku|default · voice on|off "
+    "yourself: effort low|medium|high|xhigh|max · model opus|sonnet|haiku|fable|default · voice on|off "
     "· transcribe best|good|fast · cwd <path> · park (when you're done: end-state idle, stops "
     "nudging) · status. Effect is next turn.]\n"
 )
@@ -2410,7 +2419,7 @@ EFFORT_SYNONYMS = {
 }
 
 
-VALID_MODELS = {"opus", "sonnet", "haiku", "opusplan"}  # NOT fable — it can bill; keep it
+VALID_MODELS = {"opus", "sonnet", "haiku", "opusplan", "fable"}
 MODEL_RESET = {"default", "none", "reset", "auto"}      # config-only (never a live command)
 
 
@@ -2590,17 +2599,18 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         log.info("bot command: model %r", raw)
         if not raw:
             await reply(f"🧠 Model: {_model_label(controller)}\n"
-                        "Set with: bot model <opus|sonnet|haiku|default>")
+                        "Set with: bot model <opus|sonnet|haiku|fable|default>")
         else:
             name = raw.lower()
             if name in MODEL_RESET:
                 await controller.set_model(None)
                 await reply("🧠 Model → default (applies going forward).")
             elif name in VALID_MODELS or name.startswith("claude-"):
+                name = MODEL_ALIASES.get(name, name)
                 await controller.set_model(name)
                 await reply(f"🧠 Model set to: {name} (applies going forward).")
             else:
-                await reply(f'🧠 Unknown model "{raw}". Try: opus, sonnet, haiku, or default.')
+                await reply(f'🧠 Unknown model "{raw}". Try: opus, sonnet, haiku, fable, or default.')
         return True
 
     # "bot cwd [path]" / "bot pwd" — show or set Claude's working directory.
