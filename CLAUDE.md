@@ -203,6 +203,11 @@ via the USR1 dump + the "dispatch_worker got CancelledError" log.
 ## `[HARNESS]` channels (IPC, both directions)
 - **machine → phone**: drop a file in `outbox/` (atomic rename) → `harness_outbox_loop`
   relays it as `🤖 [HARNESS] …`. Helper: `./cg-notify "msg"`.
+- **machine → phone (files)**: drop any file in `media-outbox/` → `media_outbox_loop` sends
+  it to the owner chat (photo if Telegram accepts it, else document; optional
+  `<name>.caption` sidecar, paired via `with_suffix(".caption")`). Helper:
+  `./cg-send <file> [caption]` — taught to every bot via `SELFCONFIG_PREAMBLE`, so
+  "make a PDF and send it to me" works on any bot (nyx keeps its own `tools/send`).
 - **phone → machine/AI**: `bot harness <msg>` / `bot h <msg>` writes to `inbox/`. Helper:
   `./cg-inbox` (drain), `--peek`, or `--wait` (block until one; loop primitive).
 

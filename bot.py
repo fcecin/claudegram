@@ -765,7 +765,8 @@ SELFCONFIG_PREAMBLE = (
     f"[self-config via `{HERE / 'cg-cmd'} <cmd>` — change a bridge setting when asked, or manage "
     "yourself: effort low|medium|high|xhigh|max · model opus|sonnet|haiku|fable|default · voice on|off "
     "· transcribe best|good|fast · cwd <path> · park (when you're done: end-state idle, stops "
-    "nudging) · status. Effect is next turn.]\n"
+    "nudging) · status. Effect is next turn. To deliver a file (image/PDF/any document) to the "
+    f"user's phone: `{HERE / 'cg-send'} <file> [caption]`.]\n"
 )
 
 

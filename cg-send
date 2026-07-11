@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Deliver a file to the owner's phone: drop it into media-outbox/, where the
+# bridge's media_outbox_loop relays it over Telegram — photos arrive as photos,
+# anything else (PDF, docx, zip, …) as a document. Optional caption.
+# The stamp prefix keeps names unique; the original basename is kept so the
+# Telegram document has a readable filename.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+OUTBOX="$ROOT/media-outbox"
+mkdir -p "$OUTBOX"
+
+src="${1:?usage: cg-send <file> [caption]}"
+shift || true
+caption="$*"
+
+[ -f "$src" ] || { echo "cg-send: no such file: $src" >&2; exit 1; }
+
+base="$(basename "$src")"
+stamp="$(date +%s)-$$-$RANDOM"
+final="$OUTBOX/${stamp}-${base}"
+
+# Caption sidecar must exist BEFORE the media file lands (the loop reads it when
+# it sees the media), named exactly like the media's with_suffix(".caption"):
+# strip the extension from the BASENAME only (a dot in the dir path must not clip).
+capbase="${base%.*}"
+[ -n "$caption" ] && printf '%s' "$caption" > "$OUTBOX/${stamp}-${capbase}.caption"
+
+tmp="$OUTBOX/.${stamp}.tmp"
+cp "$src" "$tmp"
+mv "$tmp" "$final"
+echo "sent: $final"
