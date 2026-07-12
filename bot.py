@@ -130,13 +130,20 @@ def session_compute(session) -> str:
     return getattr(session, "compute", None) or DEFAULT_COMPUTE
 
 
-def _parse_ids(raw: str) -> set[int]:
-    ids: set[int] = set()
+def _parse_ids(raw: str) -> list[int]:
+    # FILE ORDER matters: the FIRST id is the MASTER — the human who opens a chat with
+    # the bot and receives every proactive notification (status/watchdog/startup/harness/
+    # intrusion). The rest are GUESTS: allowed to use the bot (their replies go to their
+    # own chat) but they get NO notifications. Deduplicated, order preserved.
+    ids: list[int] = []
     for tok in raw.replace(",", " ").split():
         try:
-            ids.add(int(tok))
+            v = int(tok)
         except ValueError:
             log.warning("Ignoring non-numeric ALLOWED_USER_IDS entry: %r", tok)
+            continue
+        if v not in ids:
+            ids.append(v)
     return ids
 
 
@@ -150,6 +157,15 @@ def is_authorized(update: Update) -> bool:
         return True
     user = update.effective_user
     return user is not None and user.id in ALLOWED_USER_IDS
+
+
+def _master():
+    """The MASTER user = ALLOWED_USER_IDS[0] (FIRST as listed in .env). Every proactive
+    notification (status/watchdog/startup/harness/intrusion) goes here, and this user
+    must open a chat with the bot. Everyone else in the allowlist is a GUEST: they may
+    use the bot (their replies land in their own chat) but receive no notifications.
+    None if the allowlist is empty."""
+    return ALLOWED_USER_IDS[0] if ALLOWED_USER_IDS else None
 
 
 # --- Transcription (runs in a killable subprocess; see transcribe_worker.py) ----
@@ -1015,10 +1031,11 @@ async def handle_intrusion(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:
             log.exception("intrusion: kill failed for %s", s.name)
     engage_block(reason)
-    for owner in ALLOWED_USER_IDS:  # alert the owner — the bot can still send while locked
+    master = _master()  # alert only the MASTER — the bot can still send while locked
+    if master is not None:
         try:
             await context.bot.send_message(
-                owner,
+                master,
                 "🚨 LOCKED — someone who isn't you tried to use the bot.\n"
                 f"From: id {uid} {name}{uname}\n"
                 f"Sent: “{_oneline(content, 200)}”\n\n"
@@ -1027,7 +1044,7 @@ async def handle_intrusion(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             mark_sent()
         except Exception:
-            log.exception("intrusion: owner alert failed")
+            log.exception("intrusion: master alert failed")
 
 
 # --- sleep mode: pause Telegram input while keeping Claude running ------------
@@ -2019,7 +2036,7 @@ class SpontaneousRelay:
         self.cur: SegmentRenderer | None = None
 
     def _owner_chat(self):
-        return sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
+        return _master()
 
     async def on_message(self, message) -> None:
         kind = type(message).__name__
@@ -2069,7 +2086,7 @@ class Watchdog:
         self._police_task = None    # in-flight anti-stall consult (kept OFF the loop's critical path)
 
     def _chat(self):
-        return sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
+        return _master()
 
     def _compose(self, body, count):
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -2321,8 +2338,11 @@ class Watchdog:
             m = await self.app.bot.send_message(chat, self._compose(body, 1))
             self.msg_id = m.message_id
             self._touch()
-        except Exception:
-            log.exception("watchdog send failed")
+        except Exception as e:
+            if "chat not found" in str(e).lower():
+                log.info("watchdog: master %s hasn't opened a chat with this bot yet; skipping status", chat)
+            else:
+                log.exception("watchdog send failed")
 
     def _touch(self):
         # This session keeps editing its OWN balloon in place (×N). A watchdog balloon does
@@ -3040,13 +3060,14 @@ def _log_exit(signum: int | None = None) -> None:
 async def deliver_harness(application, body: str) -> None:
     """Send a [HARNESS] message to the owner(s) on Telegram."""
     text = "🤖 [HARNESS] " + body.strip()
-    for uid in sorted(ALLOWED_USER_IDS):
+    master = _master()  # HARNESS goes to the MASTER only (guests get no notifications)
+    if master is not None:
         try:
-            await reply_chunked_bot(application.bot, uid, None, text)
+            await reply_chunked_bot(application.bot, master, None, text)
         except Exception:
-            log.exception("Failed to deliver HARNESS message to %s", uid)
+            log.exception("Failed to deliver HARNESS message to %s", master)
     mark_sent()
-    log.info("HARNESS -> %s: %s", sorted(ALLOWED_USER_IDS), _oneline(body, 200))
+    log.info("HARNESS -> %s: %s", master, _oneline(body, 200))
 
 
 # The DRIVEN Claude may only reconfigure itself through these (the safe subset — the first
@@ -3088,7 +3109,7 @@ async def cmd_inbox_loop(application) -> None:
         return
     while True:
         try:
-            chat = sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
+            chat = _master()
             if chat is not None:
                 for f in sorted(CMD_INBOX.iterdir()):
                     if (not f.is_file()) or f.suffix != ".cmd":
@@ -3192,7 +3213,7 @@ async def wake_inbox_loop(application) -> None:
         return
     while True:
         try:
-            chat = sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
+            chat = _master()
             if chat is not None:
                 echoed = False
                 for text in _drain_wake_inbox(chat):
@@ -3265,7 +3286,7 @@ async def media_outbox_loop(application) -> None:
         return
     while True:
         try:
-            chat = sorted(ALLOWED_USER_IDS)[0] if ALLOWED_USER_IDS else None
+            chat = _master()
             if chat is not None and await _drain_media_outbox(application.bot, chat):
                 mark_sent()
         except Exception:
@@ -3293,11 +3314,15 @@ async def on_startup(application) -> None:
     sid = controller.session_id
     log.info("🟢 claudegram online — session=%s cwd=%s", sid or "new", controller.get_cwd())
     text = "🟢 claudegram online\n" + await _status_text()
-    for uid in sorted(ALLOWED_USER_IDS):
+    master = _master()  # startup ping to the MASTER only (guests get no notifications)
+    if master is not None:
         try:
-            await application.bot.send_message(uid, text)
-        except Exception:
-            log.exception("Could not send startup ping to %s", uid)
+            await application.bot.send_message(master, text)
+        except Exception as e:
+            if "chat not found" in str(e).lower():
+                log.info("startup ping: master %s hasn't opened a chat with this bot yet", master)
+            else:
+                log.exception("Could not send startup ping to %s", master)
     mark_sent()  # the online ping counts — don't let the watchdog fire immediately
     if nostall_on():
         ensure_nostall_bot()  # anti-stall guard was left on — bring its bot up at startup
@@ -3335,7 +3360,7 @@ def main() -> None:
         log.warning("Stripped API-routing env vars (forcing subscription use): %s", removed)
     ensure_cghome()
     sweep_audio_tmp()
-    log.info("Private mode: only user ids %s are served.", sorted(ALLOWED_USER_IDS))
+    log.info("Private mode: only user ids %s are served (first = master, rest = guests).", ALLOWED_USER_IDS)
     log.info("Claude working dir: %s", CGHOME)
     if is_blocked():
         log.warning("Starting in BLOCKED state — Unblock from the tray app to resume.")

@@ -176,8 +176,13 @@ Per new clone (say at `~/cg/<name>/`):
    you the BotFather message**; lift the token (pattern `<digits>:<≈35 chars>`) from it. **Never
    print the token back**; write it straight to `token.txt` (`chmod 600`). Sanity-check it maps to
    the right bot: `curl -s https://api.telegram.org/bot<token>/getMe`.
-2. **`.env`** — reuse the existing install's `ALLOWED_USER_IDS` (same person) unless told
-   otherwise. `CGHOME` can be omitted (defaults to the clone's own `work/`).
+2. **`.env`** — set `ALLOWED_USER_IDS`. **Order matters:** the FIRST id is the MASTER
+   (drives the bot, receives every notification, must `/start` it); the rest are GUESTS
+   (may use the bot, replies land in their own chat, get no notifications, need not own
+   the machine). To hand a bot to someone else while keeping your own backup access, list
+   THEM first and yourself second: `ALLOWED_USER_IDS=<their-id>,<your-id>`. Reuse the
+   existing install's value if it's the same person. `CGHOME` can be omitted (defaults to
+   the clone's own `work/`).
 3. **`instance.json`** — the DECLARED identity, so the tray isn't guessing:
    `{"name":"<name>","glyph":"2","color":"#c2410c"}`. `glyph` is a letter or an emoji; omit
    `color`/`glyph` to auto-derive from the name. (Legacy `instance.txt` also works.)
