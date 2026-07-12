@@ -48,6 +48,8 @@ HERE = Path(__file__).resolve().parent
 PYTHON = str(HERE / ".venv" / "bin" / "python")
 BOT = str(HERE / "bot.py")
 LOG_FILE = HERE / "claudegram.log"   # persistent copy of the bot's output
+LOG_MAX_BYTES = 25_000_000           # rotate claudegram.log past ~25 MB (keeps one .1 backup)
+LOG_CHECK_INTERVAL = 86_400          # seconds between rotation checks that touch disk (once a day)
 import re as _re
 # Matches the bot's periodic line, e.g.:
 #   usage refreshed: session=35% (1:39pm) week=79% (Jul 14, 6:59pm)
@@ -178,6 +180,7 @@ class Supervisor(QMainWindow):
         self._uptime = QElapsedTimer()
         self.proc: QProcess | None = None
         self._log_fh = self._open_log()
+        self._last_log_check = time.time()  # gates the once-a-day log rotation (see _maybe_rotate_log)
 
         # --- console window ---------------------------------------------------
         self.setWindowTitle(TITLE)
@@ -293,6 +296,7 @@ class Supervisor(QMainWindow):
         self._block_timer.timeout.connect(self._check_block)
         self._block_timer.timeout.connect(self._check_sleep)
         self._block_timer.timeout.connect(self._refresh_intrusion)
+        self._block_timer.timeout.connect(self._maybe_rotate_log)
         self._block_timer.start(2000)
         self._check_block()
         self._check_sleep()
@@ -458,11 +462,30 @@ class Supervisor(QMainWindow):
         else:
             self.start_bot()
 
+    def _maybe_rotate_log(self) -> None:
+        """Bound the on-disk log without thrashing the disk. Wired to the 2s block timer but
+        only compares a timestamp on each tick (cheap); at most once per LOG_CHECK_INTERVAL it
+        actually stats the file and, if it grew past LOG_MAX_BYTES, rotates it (keeps one .1
+        backup). Trims, never clears: recent history stays in the new file, older in .log.1."""
+        now = time.time()
+        if now - self._last_log_check < LOG_CHECK_INTERVAL:
+            return
+        self._last_log_check = now
+        try:
+            if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+                if self._log_fh:
+                    self._log_fh.close()
+                LOG_FILE.replace(LOG_FILE.with_name(LOG_FILE.name + ".1"))
+                self._log_fh = self._open_log()
+                self.append("[supervisor] log rotated (previous kept as claudegram.log.1)\n")
+        except OSError:
+            pass
+
     @staticmethod
     def _open_log():
         try:
-            # Big backstop only — the user clears manually via "Clear logs".
-            if LOG_FILE.exists() and LOG_FILE.stat().st_size > 500_000_000:
+            # Boot-time backstop; ongoing rotation is _maybe_rotate_log on the timer.
+            if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
                 LOG_FILE.replace(LOG_FILE.with_name(LOG_FILE.name + ".1"))
             return open(LOG_FILE, "a", encoding="utf-8", buffering=1)
         except OSError:

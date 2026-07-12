@@ -3027,7 +3027,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Unhandled error", exc_info=context.error)
+    err = context.error
+    # Transient long-poll reconnect Conflicts ("terminated by other getUpdates") self-heal on
+    # retry; collapse the traceback burst to one throttled line instead of spamming the log.
+    if err is not None and type(err).__name__ == "Conflict":
+        now = time.monotonic()
+        if now - getattr(on_error, "_last_conflict_warn", 0.0) > 60:
+            on_error._last_conflict_warn = now
+            log.warning("transient getUpdates conflict (long-poll reconnect, retrying)")
+        return
+    log.exception("Unhandled error", exc_info=err)
 
 
 # --- lifecycle: startup ping + shutdown diagnostics --------------------------
