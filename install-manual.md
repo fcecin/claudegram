@@ -167,32 +167,77 @@ Tell the user:
 
 You can run several whole copies of claudegram side by side — each its own directory, its own
 `token.txt` (= its own Telegram bot), its own tray. There is **no self-clone script and no setup
-wizard**: the user clones the repo wherever they like (`git clone` / `cp`), and *you* configure
-that clone. Non-collision is automatic — the tray's single-instance key is a hash of the install
-directory, so copies never fight. The only human input is a **discerning name**.
+wizard**: you clone the repo and configure it. Non-collision is automatic — the tray's
+single-instance key is a hash of the install directory, so copies never fight.
+
+> **A COMPLETE copy = a copy with ALL abilities: text, transcription (Whisper), spoken replies
+> (Kokoro voiceback), the full bot roster, and autostart. Skip a step below and the clone is
+> crippled — e.g. forget the Kokoro model and every voiceback says "voiceback was on, but nothing
+> could be spoken". Do ALL of it, then run the final check.**
 
 Per new clone (say at `~/cg/<name>/`):
-1. **New bot token** — the user makes it in **@BotFather** (`/newbot`). They can just **forward
-   you the BotFather message**; lift the token (pattern `<digits>:<≈35 chars>`) from it. **Never
-   print the token back**; write it straight to `token.txt` (`chmod 600`). Sanity-check it maps to
-   the right bot: `curl -s https://api.telegram.org/bot<token>/getMe`.
-2. **`.env`** — set `ALLOWED_USER_IDS`. **Order matters:** the FIRST id is the MASTER
-   (drives the bot, receives every notification, must `/start` it); the rest are GUESTS
-   (may use the bot, replies land in their own chat, get no notifications, need not own
-   the machine). To hand a bot to someone else while keeping your own backup access, list
-   THEM first and yourself second: `ALLOWED_USER_IDS=<their-id>,<your-id>`. Reuse the
-   existing install's value if it's the same person. `CGHOME` can be omitted (defaults to
-   the clone's own `work/`).
-3. **`instance.json`** — the DECLARED identity, so the tray isn't guessing:
-   `{"name":"<name>","glyph":"2","color":"#c2410c"}`. `glyph` is a letter or an emoji; omit
-   `color`/`glyph` to auto-derive from the name. (Legacy `instance.txt` also works.)
-4. **Roster** — **keep the full `bots/` roster as-is.** Multiplexing is meant to be multi-instance
-   AND multi-internal-bot, so a new clone inherits every personality by default. Do **NOT** prune
-   `bots/` unless the user explicitly asks for a clean roster — and even then, only remove the
-   specific bots they name. (`ensure_default_bot()` will recreate `bots/claude` if it's ever
-   missing, but that is a self-heal, not a cue to delete the others.)
-5. **Launch** — build the venv and start the tray with the user's desktop env
-   (`cd ~/cg/<name> && ./run-gui.sh`). Verify the log shows `Private mode: only user ids […]`.
-6. **First contact** — a brand-new bot can't DM the user until they message it once
-   (`telegram.error.BadRequest: Chat not found` until then). Tell them to send `/start` to the new
-   bot. Optional: `./install-autostart.sh` from the clone adds its own login entry.
+
+0. **Clone the code — but EXCLUDE per-instance identity, secrets, venv and runtime state** (so you
+   don't inherit another bot's soul). From an existing install or the dev repo:
+   ```
+   rsync -a --exclude='.venv/' --exclude='.env' --exclude='token.txt' --exclude='instance.json' \
+     --exclude='session*.id' --exclude='*.flag' --exclude='*.level' --exclude='cwd.path' \
+     --exclude='compute.type' --exclude='voice.mode' --exclude='work/' --exclude='outbox/' \
+     --exclude='media-outbox/' --exclude='cmd-inbox/' --exclude='*.log' --exclude='__pycache__/' \
+     <source>/ ~/cg/<name>/
+   ```
+   KEEP `bots/` (the roster). `models/` you'll handle in step 6. `git clone` also works, but the
+   deployed code may be ahead of the committed HEAD — copying a live install is the safe default.
+
+1. **New bot token** — the user makes it in **@BotFather** (`/newbot`) and **forwards you the
+   message**; lift the token (`<digits>:<≈35 chars>`), write it straight to `token.txt` (`chmod
+   600`), **never print it back**. Verify it maps to the right bot:
+   `curl -s https://api.telegram.org/bot<token>/getMe`.
+
+2. **`.env`** — set `ALLOWED_USER_IDS`. **Order matters:** the FIRST id is the MASTER (drives the
+   bot, receives every notification, must `/start` it); the rest are GUESTS (may use the bot,
+   replies land in their own chat, no notifications, need not own the machine). To hand a bot to
+   someone else while keeping backup access, list THEM first, you second:
+   `ALLOWED_USER_IDS=<their-id>,<your-id>`. `CGHOME` optional (defaults to the clone's `work/`).
+
+3. **`instance.json`** — the DECLARED identity: `{"name":"<name>","glyph":"<char>","color":"#RRGGBB"}`.
+   **Pick a glyph AND a color that NO other instance uses** (check them all:
+   `for f in ~/cg/*/instance.json; do cat "$f"; echo; done`) so they stay visually distinct in the tray.
+
+4. **Roster** — **keep the full `bots/` roster as-is** (every personality). Do NOT prune unless the
+   user names specific bots to drop. Per-bot config is `bots/<name>/config.json`
+   (`model`/`effort`/`transcribe`/`voice`/`icon`/`aliases`); per-bot memory is `bots/<name>/var/main.md`
+   (each bot's `main.md` just says `Read var/main.md if available.`).
+
+5. **venv** — the first `./run-gui.sh` builds it (`python3 -m venv .venv` + `pip install -r
+   requirements.txt`; Python 3.10+). Afterwards VERIFY it's complete:
+   `./.venv/bin/python -c "import telegram, faster_whisper, kokoro_onnx, soundfile, claude_agent_sdk"`
+   — all must import with no error.
+
+6. **Models — the two abilities that need big model files. DO BOTH:**
+   - **Transcription (Whisper):** `large-v3` (~3 GB) downloads once on first use and is **cached in
+     `~/.cache/huggingface`, shared across ALL instances** — a new clone reuses it, no re-download.
+   - **Voiceback (Kokoro TTS):** the `models/` dir (`kokoro-v1.0.onnx` + `voices-v1.0.bin`, ~338 MB)
+     is **per-install and does NOT auto-download**. Without it the bot literally cannot speak. Install:
+     - `./fetch-kokoro.sh` (downloads ~336 MB), **or** — faster if a sibling already has it —
+     - `mkdir -p models && cp <sibling>/models/kokoro-v1.0.onnx <sibling>/models/voices-v1.0.bin models/`
+     (`fetch-kokoro.sh` ONLY downloads those two files, so copying them is identical.) The
+     `kokoro-onnx` package ships in `requirements.txt`, installed with the venv in step 5.
+
+7. **Launch** — `cd ~/cg/<name> && ./run-gui.sh`, inheriting the user's desktop env
+   (`DISPLAY`/`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`), detached. Watch the log
+   for `Private mode: only user ids [...]` and `claudegram bridge is up.`.
+
+8. **Autostart + wake cron** — run **`./install-autostart.sh` FROM the clone**. It writes this
+   install's own `~/.config/autostart/claudegram-<slug>.desktop` (launch at login) AND its 3-hourly
+   wake cron — the SAME scheme every other instance uses. This is what makes it a first-class citizen,
+   not a one-off.
+
+9. **First contact** — a brand-new bot can't DM anyone until they message it once
+   (`telegram.error.BadRequest: Chat not found` until then). Tell the MASTER (and any guests) to
+   send `/start` to the new bot.
+
+**Final check — a COMPLETE copy has ALL of:** venv imports OK (step 5) · `models/kokoro-*.onnx` present
+(voiceback) · Whisper cache reachable (transcription) · `token.txt` `getMe` maps to the right bot ·
+`Private mode: only user ids [...]` in the log · unique glyph/color · `.desktop` autostart + wake cron
+installed. If any is missing, the bot is crippled — finish it.
