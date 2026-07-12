@@ -48,6 +48,10 @@ HERE = Path(__file__).resolve().parent
 PYTHON = str(HERE / ".venv" / "bin" / "python")
 BOT = str(HERE / "bot.py")
 LOG_FILE = HERE / "claudegram.log"   # persistent copy of the bot's output
+import re as _re
+# Matches the bot's periodic line, e.g.:
+#   usage refreshed: session=35% (1:39pm) week=79% (Jul 14, 6:59pm)
+_USAGE_RE = _re.compile(r"usage refreshed: session=(\d+)% \(([^)]+)\) week=(\d+)% \(([^)]+)\)")
 BLOCK_FILE = HERE / "BLOCKED.flag"   # presence = bridge is locked (firewall trip)
 SLEEP_FILE = HERE / "SLEEP.flag"     # presence = sleep mode (Telegram input paused)
 INTRUSION_OFF_FILE = HERE / "INTRUSION_OFF.flag"  # presence = paranoid intrusion gate OFF (default ON)
@@ -206,9 +210,18 @@ class Supervisor(QMainWindow):
         col = QVBoxLayout(central)
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(2)
+        # Readings bar: below the toolbar buttons, above the log. Live subscription budget,
+        # parsed from the bot's periodic "usage refreshed" log line (_update_usage below).
+        self.usage_label = QLabel("📊  session —   ·   week —")
+        self.usage_label.setStyleSheet(
+            "QLabel { background:#10263b; color:#8fd0ff; padding:5px 10px;"
+            " font-family:monospace; font-size:11px; border-bottom:1px solid #24425f; }")
+        self.usage_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        col.addWidget(self.usage_label, 0)
         col.addWidget(self.view, 1)   # log pane takes the slack
         col.addLayout(row)            # input pane stays ~fixed height
         self.setCentralWidget(central)
+        self._seed_usage_from_log()
 
         tb = QToolBar()
         tb.setMovable(False)
@@ -470,12 +483,35 @@ class Supervisor(QMainWindow):
     def _on_output(self) -> None:
         data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
         self.append(data)
+        self._update_usage(data)
         if self._log_fh is not None:
             try:
                 self._log_fh.write(data)
                 self._log_fh.flush()
             except OSError:
                 pass
+
+    def _update_usage(self, text: str) -> None:
+        """Show the bot's latest 'usage refreshed' reading in the bar (subscription budget)."""
+        m = None
+        for m in _USAGE_RE.finditer(text):
+            pass  # keep the last match in this chunk
+        if m is not None:
+            s, sr, w, wr = m.groups()
+            self.usage_label.setText(
+                f"📊  session {s}%  (resets {sr})       ·       week {w}%  (resets {wr})")
+
+    def _seed_usage_from_log(self) -> None:
+        """On startup, fill the bar from the last usage line already in the log (tail only)."""
+        try:
+            with open(LOG_FILE, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 65536))
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            return
+        self._update_usage(tail)
 
     def _on_finished(self, code: int, _status) -> None:
         self.set_status(f"stopped (exit {code})")
