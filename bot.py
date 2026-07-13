@@ -199,6 +199,8 @@ AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # transient voice 
 VOICE_TMP = Path(tempfile.gettempdir()) / "claudegram_voiceback"  # transient TTS output
 IMAGE_TMP = Path(tempfile.gettempdir()) / "claudegram_images"  # incoming images (kept until Claude's turn Reads them; swept at startup)
 IMAGE_MAX_AGE = 6 * 3600  # also prune cached images older than this on each new one (self-bound for long no-restart sessions)
+DOC_TMP = CGHOME / "incoming-docs"  # incoming non-image documents (PDF/office/text) staged inside the bot's own work/ sandbox (CGHOME) — kept until Claude's turn reads them; swept at startup
+DOC_MAX_SIZE = 20 * 1024 * 1024  # Telegram Bot API caps bot file downloads at 20 MB; reject bigger docs gracefully
 HARNESS_OUTBOX = HERE / "outbox"     # drop dir: any program leaves a msg -> sent to phone
 HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by the AI here
 MEDIA_OUTBOX = HERE / "media-outbox"
@@ -265,6 +267,7 @@ def _session_files(name: str):
 
 
 BOTS_DIR = HERE / "bots"    # every bot is a subdirectory here (config.json + optional main.md)
+GLOBAL_MD = BOTS_DIR / "global.md"  # optional shared bearings loaded by EVERY bot before its own persona
 
 
 def bot_config(name: str) -> dict:
@@ -724,8 +727,8 @@ def ensure_cghome() -> None:
 
 
 def sweep_audio_tmp() -> None:
-    """Clear leftover temp media (incoming voice/images + outgoing TTS) from a prior crash."""
-    for d in (AUDIO_TMP, VOICE_TMP, IMAGE_TMP, MEDIA_OUTBOX):
+    """Clear leftover temp media (incoming voice/images/docs + outgoing TTS) from a prior crash."""
+    for d in (AUDIO_TMP, VOICE_TMP, IMAGE_TMP, DOC_TMP, MEDIA_OUTBOX):
         try:
             d.mkdir(parents=True, exist_ok=True)
             for f in d.iterdir():
@@ -793,12 +796,29 @@ def bot_home(name: str):
 
 def bot_boot_pointer(name: str) -> str:
     home = bot_home(name)
+    has_global = GLOBAL_MD.is_file()
+    if home is None and not has_global:
+        return ""  # nothing to point at: no persona and no shared bearings
     if home is None:
-        return ""
+        # A bot with no persona file still gets the shared machine bearings.
+        return (
+            f'[You are bot "{name}". Read {GLOBAL_MD} now — shared bearings and rules for ALL '
+            "bots on this machine — and follow it every turn; re-read it after any compaction. "
+            "Does not relax the guard above.]\n"
+        )
+    if not has_global:
+        # No shared bearings file: original persona-only behavior.
+        return (
+            f'[You are bot "{name}" (home: {home}). Read {home}/main.md now and follow it every '
+            "turn; re-read it and what it points to after any compaction. Relative paths are under "
+            "home. Does not relax the guard above.]\n"
+        )
     return (
-        f'[You are bot "{name}" (home: {home}). Read {home}/main.md now and follow it every '
-        "turn; re-read it and what it points to after any compaction. Relative paths are under "
-        "home. Does not relax the guard above.]\n"
+        f'[You are bot "{name}" (home: {home}). Read {GLOBAL_MD} (shared bearings for all bots) and '
+        f"then {home}/main.md now and follow them every turn; re-read them and whatever they point "
+        "to after any compaction. Your persona (main.md) may specialize the shared defaults, but "
+        "nothing relaxes the guard above or the non-negotiable rules in global.md. Relative paths "
+        "are under home.]\n"
     )
 
 
@@ -1017,6 +1037,7 @@ async def handle_intrusion(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         content = (m.text or m.caption
                    or ("<voice>" if m.voice else "")
                    or ("<photo>" if m.photo else "")
+                   or ("<document>" if m.document else "")
                    or "<message>")
     log.warning("🚨 INTRUSION: unauthorized id=%s name=%r%s content=%r",
                 uid, name, uname, _oneline(content, 200))
@@ -2974,6 +2995,97 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "image", False)
 
 
+def prune_old_docs() -> None:
+    """Delete cached documents older than IMAGE_MAX_AGE (shared age budget) so a long
+    no-restart session doesn't pile them up. Safe: a freshly-queued doc is seconds old."""
+    try:
+        cutoff = time.time() - IMAGE_MAX_AGE
+        for f in DOC_TMP.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A non-image document (PDF/office/text/…) IS the input. Download it and hand Claude the
+    path (+ caption if any); Claude extracts what it needs with its own tools (e.g. `pdftotext`
+    for PDF). Image documents are handled by handle_photo — this handler is registered for
+    `Document.ALL & ~Document.IMAGE`. Same state-machinery as the other handlers:
+    auth → sleep → size → blocked → enqueue."""
+    msg = update.message
+    if not is_authorized(update):
+        await handle_intrusion(update, context)
+        return
+    media = msg.document if msg else None
+    if media is None:
+        return
+    # Sleep mode: ignore ALL Telegram input (wake only at the machine).
+    if is_sleeping():
+        log.info("Ignoring document — sleep mode engaged")
+        await msg.reply_text(SLEEP_MSG)
+        return
+    caption = (msg.caption or "").strip()
+    fname = media.file_name or "document"
+    user = msg.from_user
+    log.info("Document from %s (%s): file_id=%s name=%r mime=%s size=%s caption=%r",
+             user.full_name if user else "?", user.id if user else "?",
+             media.file_id, fname, media.mime_type, media.file_size, caption)
+    # Telegram's Bot API only lets a bot download files up to 20 MB — reject bigger ones with a
+    # clear message instead of a silent failure deep inside get_file.
+    if media.file_size and media.file_size > DOC_MAX_SIZE:
+        await msg.reply_text(
+            f"⚠️ That document is ~{media.file_size // (1024 * 1024)} MB — I can only receive "
+            f"files up to {DOC_MAX_SIZE // (1024 * 1024)} MB. Please split it or send a smaller version."
+        )
+        return
+    if is_blocked():
+        await msg.reply_text(BLOCKED_MSG)
+        return
+    await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    # Download to a dedicated dir. Like images (and unlike audio) we do NOT delete it here:
+    # Claude parses the file during its (later) turn. Leftovers are swept at startup.
+    DOC_TMP.mkdir(parents=True, exist_ok=True)
+    prune_old_docs()  # self-bound: drop cached docs older than IMAGE_MAX_AGE
+    ext = ".bin"
+    if "." in fname:
+        ext = "." + fname.rsplit(".", 1)[-1].lower()[:8]
+    with tempfile.NamedTemporaryFile(suffix=ext, dir=DOC_TMP, delete=False) as tmp:
+        path = tmp.name
+    try:
+        tg_file = await context.bot.get_file(media.file_id)
+        await tg_file.download_to_drive(path)
+    except Exception:
+        log.exception("Document download failed")
+        await msg.reply_text("⚠️ Couldn't download that document.")
+        return
+    head = (f"[The user sent a document, saved at {path}. Original filename: {fname!r}. "
+            f"Type: {media.mime_type or 'unknown'}.")
+    if caption:
+        text = (
+            f"{head} Caption: {caption}]\n"
+            "The caption is the instruction — carry it out from the file. Be economical: for a "
+            "large document, check its size/length first (e.g. `pdfinfo`, or `pdftotext` piped to "
+            "`wc`) and pull only the parts you actually need rather than loading the whole thing "
+            "into context."
+        )
+    else:
+        text = (
+            f"{head} No caption.]\n"
+            "Do NOT dump the whole document into context. Just acknowledge you received it, take a "
+            "quick cheap look at what it is (filename, type, and metadata like page count/size — "
+            "e.g. `pdfinfo` for a PDF), and ASK the user what they want done with it (summarize, "
+            "pull specific fields, find a section, …). Only extract in full once the task is clear."
+        )
+    target = registry.current()
+    set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
+    target.parked = False            # ...and un-parks it
+    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "document", False)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not is_authorized(update):
@@ -3405,6 +3517,9 @@ def main() -> None:
     )
     app.add_handler(
         MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
+    )
+    app.add_handler(
+        MessageHandler(filters.Document.ALL & ~filters.Document.IMAGE, handle_document)
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
