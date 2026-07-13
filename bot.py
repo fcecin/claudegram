@@ -3253,7 +3253,7 @@ def _wake_echo_line(text: str) -> str:
     glyph for anything else (another bot, a program, a manual cg-wake). cg-wake is a plain
     program — the host can't know who called it, only what they wrote — so any sender
     identity lives inside `text`, shown verbatim."""
-    icon = "⏰" if text.startswith("tick ") else "\U0001f4e8"  # cron clock / other
+    icon = "⏰" if text.startswith("CRON ") else "\U0001f4e8"  # cron clock / other
     return f"{icon} {text}"
 
 

@@ -9,15 +9,15 @@ def test_wake_drop_injects_turn_into_current_bot():
     old = bot.WAKE_INBOX
     bot.WAKE_INBOX = tmp
     try:
-        (tmp / "1.msg").write_text("tick 2026-07-08 16:00: anything to do?", encoding="utf-8")
+        (tmp / "1.msg").write_text("CRON 2026-07-08 16:00: anything to do?", encoding="utf-8")
         (tmp / ".partial.tmp").write_text("half-written drop", encoding="utf-8")  # ignored
         (tmp / "note.txt").write_text("not a .msg", encoding="utf-8")             # ignored
         injected = bot._drain_wake_inbox(chat=123)
-        assert injected == ["tick 2026-07-08 16:00: anything to do?"]
+        assert injected == ["CRON 2026-07-08 16:00: anything to do?"]
         cur = bot.registry.current()
         assert len(cur.pending) == 1
         m = cur.pending[0]
-        assert m["text"].startswith("tick 2026-07-08")
+        assert m["text"].startswith("CRON 2026-07-08")
         assert m["source"] == "wake"
         assert m["chat_id"] == 123
         assert m["reply_to"] is None
@@ -54,7 +54,7 @@ def test_wake_multiple_drops_injected_in_name_order():
 
 
 def test_wake_echo_line_marks_source_and_shows_text():
-    cron = bot._wake_echo_line("tick 2026-07-09 00:00 (automated). anything to do?")
+    cron = bot._wake_echo_line("CRON 2026-07-09 00:00 (automated). anything to do?")
     assert cron.startswith("⏰")                       # cron heartbeat -> clock
     other = bot._wake_echo_line("ava: ping — you around?")
     assert other.startswith("\U0001f4e8")                  # anything else -> inbox glyph
