@@ -16,7 +16,7 @@ def _clear_outbox():
 
 async def test_media_outbox_sends_image_and_cleans_up():
     saved = bot.ALLOWED_USER_IDS
-    bot.ALLOWED_USER_IDS = {123}
+    bot.ALLOWED_USER_IDS = [123]
     _clear_outbox()
     img = bot.MEDIA_OUTBOX / "t-1.png"
     img.write_bytes(b"\x89PNG\r\n\x1a\n fake-image-bytes")

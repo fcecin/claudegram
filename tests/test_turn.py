@@ -40,7 +40,7 @@ async def test_firewall_trips_on_sentinel_and_locks():
 async def test_spontaneous_relay_renders_self_started_turn():
     # A background shell landed -> Claude wakes itself -> must reach the phone unprompted.
     saved = bot.ALLOWED_USER_IDS
-    bot.ALLOWED_USER_IDS = {123}
+    bot.ALLOWED_USER_IDS = [123]
     try:
         app = FakeApp()
         sess = make_fake_session("claude")
