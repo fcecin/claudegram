@@ -189,17 +189,16 @@ TRANSCRIBE_NODUR_BUDGET = 900.0     # hard cap when the clip's duration is unkno
 # --- Claude Code control ------------------------------------------------------
 
 # Default working dir for the driven Claude: an install-local, gitignored `work/` (so each
-# copy is self-contained and nothing leaks into git). Override with the CGHOME env var.
-CGHOME = Path(os.environ.get("CGHOME", str(HERE / "work"))).expanduser()
+# copy is self-contained and nothing leaks into git).
+WORK = HERE / "work"
 SESSION_FILE = HERE / "session.id"   # persisted Claude session id (for resume)
 EFFORT_FILE = HERE / "effort.level"  # persisted reasoning effort
 CWD_FILE = HERE / "cwd.path"         # persisted working directory
 LOG_PATH = HERE / "claudegram.log"   # bridge log (written by the tray supervisor)
-AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # transient voice files
-VOICE_TMP = Path(tempfile.gettempdir()) / "claudegram_voiceback"  # transient TTS output
-IMAGE_TMP = Path(tempfile.gettempdir()) / "claudegram_images"  # incoming images (kept until Claude's turn Reads them; swept at startup)
-IMAGE_MAX_AGE = 6 * 3600  # also prune cached images older than this on each new one (self-bound for long no-restart sessions)
-DOC_TMP = CGHOME / "incoming-docs"  # incoming non-image documents (PDF/office/text) staged inside the bot's own work/ sandbox (CGHOME) — kept until Claude's turn reads them; swept at startup
+AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # transient voice files (decoded, then deleted)
+VOICE_TMP = Path(tempfile.gettempdir()) / "claudegram_voiceback"  # transient TTS output (sent, then deleted)
+IMAGE_DIR = WORK / "incoming-images"  # incoming images: work pieces kept in the bot's work/ (persist, never auto-deleted)
+DOC_DIR = WORK / "incoming-docs"  # incoming documents (PDF/office/text): work pieces kept in work/ (persist, never auto-deleted)
 DOC_MAX_SIZE = 20 * 1024 * 1024  # Telegram Bot API caps bot file downloads at 20 MB; reject bigger docs gracefully
 HARNESS_OUTBOX = HERE / "outbox"     # drop dir: any program leaves a msg -> sent to phone
 HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by the AI here
@@ -317,7 +316,7 @@ class Session:
         self.compute = TRANSCRIBE_PRESETS.get((self.config.get("transcribe") or "").lower())
         sf, ef, cf = _session_files(name)
         model = self.config.get("model")
-        self.controller = ClaudeController(str(CGHOME), sf, ef, cf,
+        self.controller = ClaudeController(str(WORK), sf, ef, cf,
                                            model=MODEL_ALIASES.get(model, model),
                                            max_budget_usd=self.config.get("max_budget_usd"),
                                            effort=self.config.get("effort"))
@@ -722,13 +721,14 @@ async def worker_guard() -> None:
             log.exception("worker guard error")
 
 
-def ensure_cghome() -> None:
-    CGHOME.mkdir(parents=True, exist_ok=True)
+def ensure_work() -> None:
+    WORK.mkdir(parents=True, exist_ok=True)
 
 
 def sweep_audio_tmp() -> None:
-    """Clear leftover temp media (incoming voice/images/docs + outgoing TTS) from a prior crash."""
-    for d in (AUDIO_TMP, VOICE_TMP, IMAGE_TMP, DOC_TMP, MEDIA_OUTBOX):
+    """Clear leftover transient media (incoming voice + outgoing TTS) from a prior crash.
+    Incoming images/documents are NOT swept: they are work pieces kept under work/."""
+    for d in (AUDIO_TMP, VOICE_TMP, MEDIA_OUTBOX):
         try:
             d.mkdir(parents=True, exist_ok=True)
             for f in d.iterdir():
@@ -1104,7 +1104,7 @@ def sentinel_tripped(text: str) -> bool:
 
 WELCOME = (
     "🤖 I bridge your voice/text to a Claude Code instance running in "
-    f"{CGHOME} on this machine. The conversation persists across restarts.\n\n"
+    f"{WORK} on this machine. The conversation persists across restarts.\n\n"
     "• Voice → transcribed locally, echoed back so you see what I heard, then "
     "sent to Claude.\n"
     "• I stream what Claude does (commands, file edits, compaction) and its "
@@ -2918,21 +2918,6 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
     return True
 
 
-def prune_old_images() -> None:
-    """Delete cached images older than IMAGE_MAX_AGE so a long no-restart session doesn't pile
-    them up. Safe: a freshly-queued image is seconds old, never near the threshold."""
-    try:
-        cutoff = time.time() - IMAGE_MAX_AGE
-        for f in IMAGE_TMP.iterdir():
-            try:
-                if f.is_file() and f.stat().st_mtime < cutoff:
-                    f.unlink()
-            except OSError:
-                pass
-    except OSError:
-        pass
-
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """An image IS the input — no transcription (unlike audio). Download it and hand Claude
     the path (+ caption if any); Claude views it with the Read tool. Same state-machinery as
@@ -2966,15 +2951,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text(BLOCKED_MSG)
         return
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
-    # Download to a dedicated dir. UNLIKE audio we do NOT delete it here: Claude reads the
-    # file during its (later) turn. Leftovers are swept at startup.
-    IMAGE_TMP.mkdir(parents=True, exist_ok=True)
-    prune_old_images()  # self-bound: drop cached images older than IMAGE_MAX_AGE
+    # Download into the bot's work/ as a kept work piece — never deleted: Claude reads the
+    # file during its (later) turn and it stays under work/incoming-images for reuse.
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     ext = ".jpg"
     fname = getattr(media, "file_name", None)
     if fname and "." in fname:
         ext = "." + fname.rsplit(".", 1)[-1].lower()[:8]
-    with tempfile.NamedTemporaryFile(suffix=ext, dir=IMAGE_TMP, delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=ext, dir=IMAGE_DIR, delete=False) as tmp:
         path = tmp.name
     try:
         tg_file = await context.bot.get_file(media.file_id)
@@ -2993,21 +2977,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
     target.parked = False            # ...and un-parks it
     enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "image", False)
-
-
-def prune_old_docs() -> None:
-    """Delete cached documents older than IMAGE_MAX_AGE (shared age budget) so a long
-    no-restart session doesn't pile them up. Safe: a freshly-queued doc is seconds old."""
-    try:
-        cutoff = time.time() - IMAGE_MAX_AGE
-        for f in DOC_TMP.iterdir():
-            try:
-                if f.is_file() and f.stat().st_mtime < cutoff:
-                    f.unlink()
-            except OSError:
-                pass
-    except OSError:
-        pass
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3046,14 +3015,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text(BLOCKED_MSG)
         return
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
-    # Download to a dedicated dir. Like images (and unlike audio) we do NOT delete it here:
-    # Claude parses the file during its (later) turn. Leftovers are swept at startup.
-    DOC_TMP.mkdir(parents=True, exist_ok=True)
-    prune_old_docs()  # self-bound: drop cached docs older than IMAGE_MAX_AGE
+    # Download into the bot's work/ as a kept work piece — never deleted: Claude parses the
+    # file during its (later) turn and it stays under work/incoming-docs for reuse.
+    DOC_DIR.mkdir(parents=True, exist_ok=True)
     ext = ".bin"
     if "." in fname:
         ext = "." + fname.rsplit(".", 1)[-1].lower()[:8]
-    with tempfile.NamedTemporaryFile(suffix=ext, dir=DOC_TMP, delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=ext, dir=DOC_DIR, delete=False) as tmp:
         path = tmp.name
     try:
         tg_file = await context.bot.get_file(media.file_id)
@@ -3479,10 +3447,10 @@ def main() -> None:
     removed = force_subscription_env()
     if removed:
         log.warning("Stripped API-routing env vars (forcing subscription use): %s", removed)
-    ensure_cghome()
+    ensure_work()
     sweep_audio_tmp()
     log.info("Private mode: only user ids %s are served (first = master, rest = guests).", ALLOWED_USER_IDS)
-    log.info("Claude working dir: %s", CGHOME)
+    log.info("Claude working dir: %s", WORK)
     if is_blocked():
         log.warning("Starting in BLOCKED state — Unblock from the tray app to resume.")
 

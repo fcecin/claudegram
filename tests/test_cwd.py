@@ -7,7 +7,7 @@ def test_new_bot_uses_its_own_default_cwd():
         p.unlink()
     bot.registry.current().controller.cwd = "/tmp/somewhere-else"
     gil = bot.Session("gil")
-    assert gil.controller.get_cwd() == str(bot.CGHOME)
+    assert gil.controller.get_cwd() == str(bot.WORK)
 
 
 def test_default_session_has_a_concrete_cwd():
@@ -15,12 +15,9 @@ def test_default_session_has_a_concrete_cwd():
 
 
 def test_default_cwd_is_install_local_work():
-    # ~/cghome is gone: with no CGHOME override, the default cwd is a gitignored `work/`
-    # inside the install, so each copy is self-contained.
-    import os
-    if os.environ.get("CGHOME"):
-        return  # an explicit override is in play; the default isn't exercised
-    assert bot.CGHOME == bot.HERE / "work"
+    # The default cwd is a gitignored `work/` inside the install, so each copy is
+    # self-contained (no external override).
+    assert bot.WORK == bot.HERE / "work"
 
 
 async def test_cwd_relative_paths_resolve_absolute():

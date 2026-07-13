@@ -183,7 +183,6 @@ itself and is **never sent to Claude**. Unknown ones reply
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | required (or `token.txt`) |
 | `ALLOWED_USER_IDS` | — | **required**; comma-separated Telegram ids. **Order matters: the first id is the MASTER** (gets all notifications, must `/start` the bot); the rest are GUESTS (may use the bot, no notifications) |
-| `CGHOME` | `<install>/work` | Claude's working directory (install-local, gitignored, auto-created) |
 | `WHISPER_MODEL` | `large-v3` | transcription model |
 | `WHISPER_COMPUTE_TYPE` | `float32` | seeds the default; flip live with `bot transcribe` (good=`int8_float32` ~2×, fast=`int8` ~3-4×) |
 | `WHISPER_LANGUAGE` | auto | force e.g. `en` / `pt` |

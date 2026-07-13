@@ -112,10 +112,13 @@ audio + images are swept at startup.
 froze a live transcription. Diagnose with the bot's logging + `kill -USR1 <pid>` instead.
 
 ## Photo / image input
-`handle_photo` (`filters.PHOTO | filters.Document.IMAGE`) downloads to `IMAGE_TMP`, prunes
-images >6h old, and `enqueue_for_claude`s a prompt pointing Claude at the path (+ caption if any)
-— Claude reads it with the `Read` tool (multimodal in; no transcription). Files persist until the
-later turn reads them; swept at startup. `source="image"` collapses to the text guard.
+`handle_photo` (`filters.PHOTO | filters.Document.IMAGE`) downloads to `IMAGE_DIR`
+(`work/incoming-images`) and `enqueue_for_claude`s a prompt pointing Claude at the path
+(+ caption if any) — Claude reads it with the `Read` tool (multimodal in; no transcription).
+Incoming images are **work pieces** kept under `work/`: never auto-deleted, pruned, or swept.
+Documents (`handle_document`) mirror this into `DOC_DIR` (`work/incoming-docs`). Only truly
+transient media (voice decode `AUDIO_TMP`, TTS `VOICE_TMP`) stays in `/tmp` and is swept.
+`source="image"` collapses to the text guard.
 
 ## Intrusion lock (paranoid tripwire — default ON, GUI-only)
 Any message from a non-allowlisted id → `handle_intrusion`: log it, and (if `intrusion_gate_on()`)

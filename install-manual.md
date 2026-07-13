@@ -59,8 +59,8 @@ Ask for, and help them obtain:
    *Only the user can do this (it needs their account). You cannot.*
 2. **Their numeric Telegram user id** — guide them to message **@userinfobot**, which
    replies `Id: 123456789`. (A username is NOT usable for the allowlist.)
-3. **Working directory** — default `work/` inside the install (install-local, gitignored,
-   auto-created). Ask if they want another (set `CGHOME` in `.env`).
+3. **Working directory** — fixed at `work/` inside the install (install-local, gitignored,
+   auto-created). Each copy is self-contained; incoming images/documents are kept here too.
 4. **Transcription** — default `large-v3` / `float32` (max accuracy, CPU-heavy); quality is
    also a live toggle, `bot transcribe best|good|fast` (float32 / int8_float32 ~2× / int8
    ~3-4×), no restart. Offer a forced `WHISPER_LANGUAGE` if they speak one language. Decoding
@@ -75,7 +75,7 @@ Ask for, and help them obtain:
 echo 'PASTE-BOT-TOKEN' > token.txt          # or put TELEGRAM_BOT_TOKEN in .env
 cp .env.example .env
 # edit .env: set ALLOWED_USER_IDS=<their numeric id>  (REQUIRED — bridge refuses
-# to start without it). Add CGHOME / WHISPER_* overrides if requested.
+# to start without it). Add WHISPER_* overrides if requested.
 ```
 Confirm `.gitignore` already excludes `token.txt`, `.env`, `session.id`, `effort.level`,
 `cwd.path`, `compute.type`, `voice.mode`, `BLOCKED.flag`, `SLEEP.flag`, `INTRUSION_OFF.flag`,
@@ -198,7 +198,7 @@ Per new clone (say at `~/cg/<name>/`):
    bot, receives every notification, must `/start` it); the rest are GUESTS (may use the bot,
    replies land in their own chat, no notifications, need not own the machine). To hand a bot to
    someone else while keeping backup access, list THEM first, you second:
-   `ALLOWED_USER_IDS=<their-id>,<your-id>`. `CGHOME` optional (defaults to the clone's `work/`).
+   `ALLOWED_USER_IDS=<their-id>,<your-id>`. The working dir is the clone's own `work/`.
 
 3. **`instance.json`** — the DECLARED identity: `{"name":"<name>","glyph":"<char>","color":"#RRGGBB"}`.
    **Pick a glyph AND a color that NO other instance uses** (check them all:
