@@ -72,12 +72,12 @@ Ask for, and help them obtain:
 ## STEP 3 — Write secrets (gitignored — never commit, never print back in full)
 
 ```bash
-echo 'PASTE-BOT-TOKEN' > token.txt          # or put TELEGRAM_BOT_TOKEN in .env
-cp .env.example .env
-# edit .env: set ALLOWED_USER_IDS=<their numeric id>  (REQUIRED — bridge refuses
-# to start without it). Add WHISPER_* overrides if requested.
+echo 'PASTE-BOT-TOKEN' > token.txt && chmod 600 token.txt   # the token: its own secret file
+# All other config is in instance.json (a FILE, never env). Put the allowlist there:
+#   {"allowed_user_ids": [<their numeric id>], "name":"...", "glyph":"...", "color":"#..."}
+# First id = MASTER. Absent/empty = the bot answers anyone. (whisper/default_bot optional.)
 ```
-Confirm `.gitignore` already excludes `token.txt`, `.env`, `session.id`, `effort.level`,
+Confirm `.gitignore` already excludes `token.txt`, `instance.json`, `session.id`, `effort.level`,
 `cwd.path`, `compute.type`, `voice.mode`, `BLOCKED.flag`, `SLEEP.flag`, `INTRUSION_OFF.flag`,
 logs, and `.venv/`.
 
@@ -108,8 +108,8 @@ If the user wants it on every login:
 
 ## STEP 5 — Verify the lockdown (do all of these)
 
-1. **Allowlist**: the log must say `Private mode: only user ids [<their id>]`. If it
-   says "Refusing to start: ALLOWED_USER_IDS is empty", fix `.env`.
+1. **Allowlist**: the log must say `Private mode: only user ids [<their id>]` (loaded from
+   `instance.json` `allowed_user_ids`). If it's empty or wrong, fix `instance.json`.
 2. **Subscription, not API**: confirm no `ANTHROPIC_API_KEY` in the environment
    (`env | grep -i anthropic` → empty). The bridge also strips it at boot.
 3. **Private**: from a *different* Telegram account (or ask the user), message the bot —
@@ -194,11 +194,11 @@ Per new clone (say at `~/cg/<name>/`):
    600`), **never print it back**. Verify it maps to the right bot:
    `curl -s https://api.telegram.org/bot<token>/getMe`.
 
-2. **`.env`** — set `ALLOWED_USER_IDS`. **Order matters:** the FIRST id is the MASTER (drives the
-   bot, receives every notification, must `/start` it); the rest are GUESTS (may use the bot,
-   replies land in their own chat, no notifications, need not own the machine). To hand a bot to
-   someone else while keeping backup access, list THEM first, you second:
-   `ALLOWED_USER_IDS=<their-id>,<your-id>`. The working dir is the clone's own `work/`.
+2. **`instance.json` `allowed_user_ids`** — a list of Telegram ids. **Order matters:** the FIRST
+   id is the MASTER (drives the bot, receives every notification, must `/start` it); the rest are
+   GUESTS (may use the bot, replies land in their own chat, no notifications, need not own the
+   machine). To hand a bot to someone else while keeping backup access, list THEM first, you
+   second: `"allowed_user_ids": [<their-id>, <your-id>]`. The working dir is the clone's own `work/`.
 
 3. **`instance.json`** — the DECLARED identity: `{"name":"<name>","glyph":"<char>","color":"#RRGGBB"}`.
    **Pick a glyph AND a color that NO other instance uses** (check them all:

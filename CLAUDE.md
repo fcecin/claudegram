@@ -264,8 +264,8 @@ covered by `test_instance`) is the identity behind it; `gui.py` wraps it in Qt:
   there is deliberately **no self-clone script and no setup gate**; the tray just launches when
   the clone is ready (else `bot.py` refuses and says what's missing). Config is **AI-guided** (see
   the runbook's *Adding another instance*): an AI writes `token.txt` (the user can forward the
-  BotFather message; lift the `<digits>:<35 chars>` token, never echo it), `.env`
-  (`ALLOWED_USER_IDS`), and `instance.json`. It does NOT touch `bots/` — a clone inherits the
+  BotFather message; lift the `<digits>:<35 chars>` token, never echo it) and `instance.json`
+  (`allowed_user_ids` + identity — all config in one file, never env). It does NOT touch `bots/` — a clone inherits the
   FULL roster (multi-instance AND multi-internal-bot); prune only specific bots the user names.
 - **Single source of truth:** `install-autostart.sh` / `uninstall-autostart.sh` DON'T mirror the
   naming in bash — they call `python3 instance_id.py {label,desktop_name,title,is_default} <dir>`

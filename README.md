@@ -165,10 +165,11 @@ itself and is **never sent to Claude**. Unknown ones reply
 
 1. **Create the bot**: in Telegram, message **@BotFather** → `/newbot` → pick a
    name and a username ending in `bot` → it gives you a **token**.
-2. **Token**: `echo 'YOUR-TOKEN' > token.txt` (gitignored). Or put it in `.env`.
-3. **Lock it to you**: find your numeric Telegram id via **@userinfobot**, then set
-   `ALLOWED_USER_IDS=<id>` in `.env` (copy `.env.example`). The bridge refuses to
-   start without this.
+2. **Token**: `echo 'YOUR-TOKEN' > token.txt` (gitignored; `chmod 600` it).
+3. **Lock it to you**: find your numeric Telegram id via **@userinfobot**, then put it in
+   `instance.json` (gitignored): `{"allowed_user_ids": [<id>]}`. **Order matters: the first id
+   is the MASTER** (gets notifications, must `/start` the bot); the rest are guests. Empty or
+   absent = the bot answers anyone.
 4. **Run the tray app**: `./run-gui.sh` — it **self-backgrounds** (detaches into its own
    session via `setsid`, so closing the terminal won't kill it) and hands the prompt back.
    First run creates the virtualenv, installs deps, and downloads the `large-v3` model
@@ -177,15 +178,21 @@ itself and is **never sent to Claude**. Unknown ones reply
    is a **separate path** from the manual launch — at login GNOME runs `gui.py` directly in
    your desktop session; the self-backgrounding `run-gui.sh` is for manual terminal starts.
 
-## Configuration (`.env`)
+## Configuration (`instance.json`)
 
-| Variable | Default | Notes |
+All per-install config lives in `instance.json` (gitignored, read from the FILE — **never the
+environment**, which leaks between installs). The token is the one exception: it lives alone in
+`token.txt` (a dedicated secret file, `chmod 600`).
+
+| `instance.json` field | Default | Notes |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | — | required (or `token.txt`) |
-| `ALLOWED_USER_IDS` | — | **required**; comma-separated Telegram ids. **Order matters: the first id is the MASTER** (gets all notifications, must `/start` the bot); the rest are GUESTS (may use the bot, no notifications) |
-| `WHISPER_MODEL` | `large-v3` | transcription model |
-| `WHISPER_COMPUTE_TYPE` | `float32` | seeds the default; flip live with `bot transcribe` (good=`int8_float32` ~2×, fast=`int8` ~3-4×) |
-| `WHISPER_LANGUAGE` | auto | force e.g. `en` / `pt` |
+| `allowed_user_ids` | `[]` | list of Telegram ids. **First = MASTER** (gets all notifications, must `/start` the bot); the rest are GUESTS. `[]` = answers anyone |
+| `name` / `glyph` / `color` | dir-derived | tray identity for a named copy |
+| `default_bot` | `claude` | which persona loads on startup |
+| `whisper` | `{}` | optional `{"model":"large-v3","compute_type":"float32","language":null,"device":"cpu"}` |
+
+Per-bot model/effort/transcribe live in `bots/<name>/config.json`. Transcription quality also
+flips live with `bot transcribe good|fast` (no restart).
 
 ## Files
 
@@ -204,8 +211,8 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `install-manual.md` | step-by-step secure install guide (for an AI assistant) | yes |
 | `CLAUDE.md` | dev notes for an AI working on this codebase | yes |
 | `HACKING_REGRESSIONS.md` | curated false positives the firewall must never block | yes |
-| `.env.example` | template for `.env` | yes |
-| `.env`, `token.txt` | **secrets** — never commit | no |
+| `token.txt` | **the bot token** — a dedicated secret file (`chmod 600`) | no |
+| `instance.json` | per-install config (allowlist, identity, default_bot, whisper) | no |
 | `session.id`, `effort.level`, `cwd.path`, `compute.type`, `voice.mode`, `BLOCKED.flag`, `SLEEP.flag`, `INTRUSION_OFF.flag` | runtime state | no |
 | `outbox/`, `inbox/` | `[HARNESS]` message drop dirs (transient) | no |
 | `claudegram.log` | full per-turn transcript (Clear-logs button truncates) | no |
