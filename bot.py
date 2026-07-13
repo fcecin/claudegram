@@ -35,7 +35,6 @@ import uuid
 from pathlib import Path
 
 import instance_id
-from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -75,24 +74,31 @@ log = logging.getLogger("claudegram")
 
 HERE = Path(__file__).resolve().parent
 
-# Load .env now, before any config below is read (env vars are parsed at import
-# time). Without this, ALLOWED_USER_IDS / WHISPER_* from .env would be ignored.
-load_dotenv(HERE / ".env")
+# Per-install config lives in instance.json (gitignored), read from the FILE — never the
+# environment, which leaks between installs (env once handed a bot another's allowlist).
+# INSTANCE is the whole config dict; the getters below pull fields from it. Our config never
+# comes from the environment: env is the mother of all footguns.
+try:
+    _INSTANCE_TEXT = (HERE / "instance.json").read_text(encoding="utf-8")
+except OSError:
+    _INSTANCE_TEXT = ""
+try:
+    INSTANCE = json.loads(_INSTANCE_TEXT or "{}")
+    INSTANCE = INSTANCE if isinstance(INSTANCE, dict) else {}
+except ValueError:
+    INSTANCE = {}
 
 
 def load_token() -> str:
-    """Find the bot token from the environment, a .env file, or token.txt."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        token_file = HERE / "token.txt"
-        if token_file.exists():
-            token = token_file.read_text(encoding="utf-8").strip()
+    """The bot token, from token.txt (a dedicated secret file; keep it chmod 600). Not from the
+    environment — our config never comes from env."""
+    token_file = HERE / "token.txt"
+    token = token_file.read_text(encoding="utf-8").strip() if token_file.exists() else ""
     if not token:
         raise SystemExit(
             "No bot token found.\n"
-            "  Set TELEGRAM_BOT_TOKEN, or create a .env file, or drop the token\n"
-            "  into a file named token.txt in this directory.\n"
-            "  Get a token by messaging @BotFather on Telegram (/newbot)."
+            "  Put the token from @BotFather (/newbot) into a file named token.txt in this\n"
+            "  directory (chmod 600 it).\n"
         )
     return token
 
@@ -103,8 +109,10 @@ def load_token() -> str:
 # decode can be killed — a thread cannot. These WHISPER_* values seed the defaults; the
 # worker is told its compute type per-spawn (see get_compute_type), so `bot transcribe`
 # can switch quality at runtime with no restart. WHISPER_LANGUAGE is inherited by the worker.
-MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3").strip()
-DEVICE = os.environ.get("WHISPER_DEVICE", "cpu").strip()
+_WHISPER = INSTANCE.get("whisper") or {}
+MODEL_SIZE = str(_WHISPER.get("model") or "large-v3").strip()
+DEVICE = str(_WHISPER.get("device") or "cpu").strip()
+WHISPER_LANGUAGE = str(_WHISPER.get("language") or "").strip() or None
 # Friendly transcription-quality presets, toggled live per-bot via `bot transcribe <name>`.
 # The change takes effect on the NEXT voice message — the worker reads its compute type fresh
 # on every spawn, so nothing needs restarting.
@@ -131,39 +139,11 @@ def session_compute(session) -> str:
     return getattr(session, "compute", None) or DEFAULT_COMPUTE
 
 
-def _parse_ids(raw: str) -> list[int]:
-    # FILE ORDER matters: the FIRST id is the MASTER — the human who opens a chat with
-    # the bot and receives every proactive notification (status/watchdog/startup/harness/
-    # intrusion). The rest are GUESTS: allowed to use the bot (their replies go to their
-    # own chat) but they get NO notifications. Deduplicated, order preserved.
-    ids: list[int] = []
-    for tok in raw.replace(",", " ").split():
-        try:
-            v = int(tok)
-        except ValueError:
-            log.warning("Ignoring non-numeric ALLOWED_USER_IDS entry: %r", tok)
-            continue
-        if v not in ids:
-            ids.append(v)
-    return ids
-
-
-# Allowlist: if set, only these Telegram user ids get served; everyone else is
-# politely refused. If empty, the bot responds to anyone who messages it.
-def _load_allowed_ids() -> list[int]:
-    """Authorized ids from instance.json (the per-install config FILE), read from the file and
-    never the environment: a parent process's ALLOWED_USER_IDS leaks between installs (that bug
-    once handed one bot another's allowlist). Falls back to the legacy env/.env value only if
-    instance.json declares none (transitional)."""
-    jf = HERE / "instance.json"
-    if jf.exists():
-        ids = instance_id.parse_allowed_ids(jf.read_text(encoding="utf-8"))
-        if ids:
-            return ids
-    return _parse_ids(os.environ.get("ALLOWED_USER_IDS", ""))
-
-
-ALLOWED_USER_IDS = _load_allowed_ids()
+# Allowlist: only these Telegram user ids are served; everyone else is politely refused. If
+# empty, the bot answers anyone. FILE ORDER matters: the first id is the MASTER (opens a chat,
+# gets every proactive notification); the rest are GUESTS (may use the bot, no notifications).
+# Read from instance.json (the per-install config file), never the environment.
+ALLOWED_USER_IDS = instance_id.parse_allowed_ids(_INSTANCE_TEXT)
 
 
 def is_authorized(update: Update) -> bool:
@@ -897,7 +877,7 @@ def _voice_filters(voice: dict) -> str:
     return s if s == "aresample=48000" else s + ",alimiter=limit=0.97"  # clip guard (bass/pitch)
 
 
-KOKORO_DIR = Path(os.environ.get("KOKORO_MODEL_DIR") or (HERE / "models"))
+KOKORO_DIR = Path(INSTANCE.get("kokoro_model_dir") or (HERE / "models"))
 KOKORO_ONNX = KOKORO_DIR / "kokoro-v1.0.onnx"
 KOKORO_VOICES_FILE = KOKORO_DIR / "voices-v1.0.bin"
 DEFAULT_VOICE = "af_heart"
@@ -950,7 +930,7 @@ def synthesize_voice(text: str, voice: dict | None = None) -> str | None:
         VOICE_TMP.mkdir(parents=True, exist_ok=True)
         stem = VOICE_TMP / uuid.uuid4().hex
         wav, ogg = f"{stem}.wav", f"{stem}.ogg"
-        lang_iso = detect_tts_lang(text[:4000], default=os.environ.get("WHISPER_LANGUAGE") or "en")
+        lang_iso = detect_tts_lang(text[:4000], default=WHISPER_LANGUAGE or "en")
         name, klang = _resolve_voice(voice.get("name", DEFAULT_VOICE), lang_iso)
         speed = float(voice.get("speed", 1.0))
         log.info("voiceback: kokoro voice=%s lang=%s speed=%s robot=%s (%d chars)",
@@ -1255,7 +1235,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 sys.executable, str(HERE / "transcribe_worker.py"), tmp_path,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 limit=8 * 1024 * 1024,  # transcripts can exceed the 64K default line limit
-                env={**os.environ, "WHISPER_COMPUTE_TYPE": compute},  # live quality toggle
+                env={**os.environ, "WHISPER_MODEL": MODEL_SIZE, "WHISPER_DEVICE": DEVICE,
+                     "WHISPER_LANGUAGE": WHISPER_LANGUAGE or "", "WHISPER_COMPUTE_TYPE": compute},  # config -> worker
             )
             log.info("Transcribe: worker pid=%s started (%s/%s)", proc.pid,
                      _PRESET_BY_COMPUTE.get(compute, "?"), compute)
@@ -1991,10 +1972,10 @@ def discover_bots() -> dict:
 
 
 def canonical_bot() -> str:
-    """The session loaded on startup and in single-bot mode: DEFAULT_BOT (from .env) if it
+    """The session loaded on startup and in single-bot mode: instance.json "default_bot" if it
     names a real bot on disk, else the always-regenerated 'claude' default — so an unset,
-    blank, or dangling DEFAULT_BOT safely falls back to 'claude'."""
-    name = os.environ.get("DEFAULT_BOT", "").strip()
+    blank, or dangling default_bot safely falls back to 'claude'."""
+    name = str(INSTANCE.get("default_bot") or "").strip()
     return name if (name and name != DEFAULT_SESSION and name in discover_bots()) else DEFAULT_SESSION
 
 

@@ -45,23 +45,20 @@ def test_model_bots_are_naked_without_main_md():
     assert bot.bot_home("ava") is not None
 
 
-def test_canonical_bot_from_default_bot_env():
-    import os
-    old = os.environ.get("DEFAULT_BOT")
+def test_canonical_bot_from_default_bot_config():
+    # default_bot now comes from instance.json (bot.INSTANCE), never the environment.
+    saved = bot.INSTANCE
     try:
-        os.environ.pop("DEFAULT_BOT", None)
+        bot.INSTANCE = {}
         assert bot.canonical_bot() == "claude"            # unset -> fallback
-        os.environ["DEFAULT_BOT"] = "ava"
+        bot.INSTANCE = {"default_bot": "ava"}
         assert bot.canonical_bot() == "ava"               # a real bot -> canonical
-        os.environ["DEFAULT_BOT"] = "nope_not_a_bot"
+        bot.INSTANCE = {"default_bot": "nope_not_a_bot"}
         assert bot.canonical_bot() == "claude"            # dangling name -> fallback
-        os.environ["DEFAULT_BOT"] = "claude"
+        bot.INSTANCE = {"default_bot": "claude"}
         assert bot.canonical_bot() == "claude"            # explicit default -> claude
     finally:
-        if old is None:
-            os.environ.pop("DEFAULT_BOT", None)
-        else:
-            os.environ["DEFAULT_BOT"] = old
+        bot.INSTANCE = saved
 
 
 def test_max_bot():
