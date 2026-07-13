@@ -43,6 +43,20 @@ def test_parse_instance_json():
     assert i.parse_instance_json('{"name": 5, "color": ""}') == (None, None, None)  # non-str/blank
 
 
+def test_parse_allowed_ids():
+    assert i.parse_allowed_ids('{"allowed_user_ids":[123,456]}') == [123, 456]
+    assert i.parse_allowed_ids('{"allowed_user_ids":["123","123",456]}') == [123, 456]  # coerce+dedup
+    assert i.parse_allowed_ids('{"allowed_user_ids":[999,111]}')[0] == 999  # FILE ORDER: first = master
+    assert i.parse_allowed_ids('{"allowed_user_ids":[123,"nope",789]}') == [123, 789]  # skip non-int
+    assert i.parse_allowed_ids('{"name":"x"}') == []     # field absent
+    assert i.parse_allowed_ids('{"allowed_user_ids":[]}') == []
+    # malformed / wrong-shape / empty -> [] (never crash; caller falls back)
+    assert i.parse_allowed_ids("not json") == []
+    assert i.parse_allowed_ids("") == []
+    assert i.parse_allowed_ids(None) == []
+    assert i.parse_allowed_ids('["a","b"]') == []        # not an object
+
+
 def test_resolve_precedence():
     # instance.json wins over instance.txt when both are present
     lbl, col, gly, default = i.resolve("claudegram-x",

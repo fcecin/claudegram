@@ -77,6 +77,28 @@ def parse_instance_json(text: str | None):
     return (field("name"), field("color"), field("glyph"))
 
 
+def parse_allowed_ids(text: str | None) -> list[int]:
+    """Authorized Telegram user ids from instance.json's "allowed_user_ids" (a list). FILE ORDER
+    matters: the first id is the MASTER (gets the proactive notifications); the rest are guests.
+    Deduplicated, order preserved; non-int entries skipped. Missing/malformed -> []. This is
+    per-install config read from the FILE, never the environment (which leaks between installs)."""
+    try:
+        data = json.loads(text or "")
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    ids: list[int] = []
+    for v in data.get("allowed_user_ids") or []:
+        try:
+            iv = int(v)
+        except (ValueError, TypeError):
+            continue
+        if iv not in ids:
+            ids.append(iv)
+    return ids
+
+
 def is_default_install(dir_name: str, has_identity_file: bool) -> bool:
     """True only for the canonical single install: directory 'claudegram' with no declared
     identity (no instance.json / instance.txt). That case keeps the original tray look/title

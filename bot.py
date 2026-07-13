@@ -34,6 +34,7 @@ import types
 import uuid
 from pathlib import Path
 
+import instance_id
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
@@ -149,7 +150,20 @@ def _parse_ids(raw: str) -> list[int]:
 
 # Allowlist: if set, only these Telegram user ids get served; everyone else is
 # politely refused. If empty, the bot responds to anyone who messages it.
-ALLOWED_USER_IDS = _parse_ids(os.environ.get("ALLOWED_USER_IDS", ""))
+def _load_allowed_ids() -> list[int]:
+    """Authorized ids from instance.json (the per-install config FILE), read from the file and
+    never the environment: a parent process's ALLOWED_USER_IDS leaks between installs (that bug
+    once handed one bot another's allowlist). Falls back to the legacy env/.env value only if
+    instance.json declares none (transitional)."""
+    jf = HERE / "instance.json"
+    if jf.exists():
+        ids = instance_id.parse_allowed_ids(jf.read_text(encoding="utf-8"))
+        if ids:
+            return ids
+    return _parse_ids(os.environ.get("ALLOWED_USER_IDS", ""))
+
+
+ALLOWED_USER_IDS = _load_allowed_ids()
 
 
 def is_authorized(update: Update) -> bool:
