@@ -193,7 +193,7 @@ AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # transient voice 
 VOICE_TMP = Path(tempfile.gettempdir()) / "claudegram_voiceback"  # transient TTS output (sent, then deleted)
 IMAGE_DIR = WORK / "incoming-images"  # incoming images: work pieces kept in the bot's work/ (persist, never auto-deleted)
 DOC_DIR = WORK / "incoming-docs"  # incoming documents (PDF/office/text): work pieces kept in work/ (persist, never auto-deleted)
-DOC_MAX_SIZE = 20 * 1024 * 1024  # Telegram Bot API caps bot file downloads at 20 MB; reject bigger docs gracefully
+TG_BOT_DL_LIMIT = 20 * 1024 * 1024  # Telegram Bot API hard-caps bot file DOWNLOADS at 20 MB (getFile); larger files can't be pulled by a bot and need out-of-band handling
 HARNESS_OUTBOX = HERE / "outbox"     # drop dir: any program leaves a msg -> sent to phone
 HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by the AI here
 MEDIA_OUTBOX = HERE / "media-outbox"
@@ -1147,6 +1147,23 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         media.file_id,
     )
 
+    # Telegram's Bot API can't DOWNLOAD files over 20 MB (getFile → "File is too big"). Catch it up
+    # front so a big recording doesn't leave a dead "Transcribing…" bubble; tell the user how to get
+    # it in. (V2 will drive Telegram Desktop to fetch it hands-free.)
+    size = int(getattr(media, "file_size", 0) or 0)
+    if size > TG_BOT_DL_LIMIT:
+        mins = int((getattr(media, "duration", 0) or 0) // 60)
+        await msg.reply_text(
+            f"⚠️ That audio is ~{size // (1024 * 1024)} MB"
+            + (f" (~{mins} min)" if mins else "")
+            + f" — over Telegram's {TG_BOT_DL_LIMIT // (1024 * 1024)} MB limit for bot downloads, so "
+            "I can't pull it in automatically.\n\n"
+            "To get it transcribed now:\n"
+            "• split the recording into parts under ~15 min each and resend, or\n"
+            "• save it via Telegram Desktop (right-click → Save As) so it can be transcribed from disk.\n\n"
+            "(Auto-fetching big files from Telegram Desktop is coming.)")
+        return
+
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
 
     # Which session receives this? The CURRENT one AT SEND TIME (captured now, so a `bot select`
@@ -1179,8 +1196,24 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     badge + "🎙 Transcribing…", chat_id=msg.chat_id, message_id=prog.message_id)
             except Exception:
                 pass
-        tg_file = await context.bot.get_file(media.file_id)
-        await tg_file.download_to_drive(tmp_path)
+        try:
+            tg_file = await context.bot.get_file(media.file_id)
+            await tg_file.download_to_drive(tmp_path)
+        except Exception as e:
+            # Belt-and-suspenders for when Telegram didn't report file_size up front: a >20 MB file
+            # fails here with BadRequest "File is too big". Replace the bubble with guidance instead
+            # of leaking an unhandled error and stranding the "Transcribing…" message.
+            log.warning("audio download failed (file_id=%s): %r", media.file_id, e)
+            note = (f"⚠️ That audio is over Telegram's {TG_BOT_DL_LIMIT // (1024 * 1024)} MB "
+                    "bot-download limit, so I couldn't fetch it. Split it into shorter parts and "
+                    "resend, or save it via Telegram Desktop." if "too big" in str(e).lower()
+                    else "⚠️ I couldn't download that audio from Telegram — please try resending it.")
+            try:
+                await context.bot.edit_message_text(
+                    badge + note, chat_id=msg.chat_id, message_id=prog.message_id)
+            except Exception:
+                pass
+            return  # the outer `finally` releases the lock and removes tmp_path
 
         audio_dur = float(getattr(media, "duration", 0) or 0)
         budget = (max(TRANSCRIBE_MIN_BUDGET, audio_dur * TRANSCRIBE_BUDGET_FACTOR)
@@ -3000,10 +3033,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
              media.file_id, fname, media.mime_type, media.file_size, caption)
     # Telegram's Bot API only lets a bot download files up to 20 MB — reject bigger ones with a
     # clear message instead of a silent failure deep inside get_file.
-    if media.file_size and media.file_size > DOC_MAX_SIZE:
+    if media.file_size and media.file_size > TG_BOT_DL_LIMIT:
         await msg.reply_text(
             f"⚠️ That document is ~{media.file_size // (1024 * 1024)} MB — I can only receive "
-            f"files up to {DOC_MAX_SIZE // (1024 * 1024)} MB. Please split it or send a smaller version."
+            f"files up to {TG_BOT_DL_LIMIT // (1024 * 1024)} MB. Please split it or send a smaller version."
         )
         return
     if is_blocked():
