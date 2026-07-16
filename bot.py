@@ -2763,7 +2763,15 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         elif arg in ("off", "no", "stop"):
             state = False
         else:
-            state = not nostall_on()  # no/unknown arg → toggle
+            # Bare/unknown arg = QUERY ONLY. A bare `bot nostall` must NOT toggle — repeated sends
+            # were flipping it on/off/on/off. Report the state; require an explicit on/off to change.
+            cur = nostall_on()
+            miss = "" if nostall_bot_available() else f" (unavailable — bots/{NOSTALL_BOT}/ not installed)"
+            await reply(
+                f"🐕 Anti-stall guard is currently {'ON' if cur else 'OFF'}{miss}.\n"
+                "This is a query — to change it: bot nostall on  |  bot nostall off"
+            )
+            return True
         if state and not nostall_bot_available():
             await reply(f"⚠️ Can't turn on anti-stall — the '{NOSTALL_BOT}' bot isn't installed "
                         f"(bots/{NOSTALL_BOT}/ is missing).")
