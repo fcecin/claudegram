@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# cg-mail — send an email via Resend, IF this install has email enabled.
+#
+# Email is an OPTIONAL feature: it's enabled only when a `resend.key` file exists
+# next to this script (containing a Resend API key). No key file -> feature off.
+#
+# Usage:
+#   cg-mail <to> <subject> [body...]        # body from the remaining args, or
+#   echo "body text" | cg-mail <to> <subj>  # ...from stdin
+#
+# Sender address: the first line of an optional `resend.from` file, else the
+# Resend test sender onboarding@resend.dev (which can only deliver to the Resend
+# account's own address — fine for testing; real use needs a verified domain).
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+KEY_FILE="$HERE/resend.key"
+FROM_FILE="$HERE/resend.from"
+
+if [ ! -s "$KEY_FILE" ]; then
+  echo "cg-mail: email is disabled (no $KEY_FILE). Add your Resend API key there to enable." >&2
+  exit 3
+fi
+
+to="${1:-}"; subject="${2:-}"
+if [ -z "$to" ] || [ -z "$subject" ]; then
+  echo "usage: cg-mail <to> <subject> [body...]   (body via args or stdin)" >&2
+  exit 1
+fi
+shift 2
+if [ "$#" -gt 0 ]; then body="$*"; else body="$(cat || true)"; fi
+
+key="$(tr -d ' \t\r\n' < "$KEY_FILE")"
+from="$(head -n1 "$FROM_FILE" 2>/dev/null | tr -d ' \t\r\n' || true)"
+from="${from:-onboarding@resend.dev}"
+
+# Build the JSON body with proper escaping (python handles quotes/newlines safely).
+payload="$(python3 -c 'import json,sys; frm,to,subj,body=sys.argv[1:5]; print(json.dumps({"from":frm,"to":[to],"subject":subj,"text":body}))' "$from" "$to" "$subject" "$body")"
+
+# Pass the API key via a curl config on stdin so it never appears in `ps`/argv.
+resp="$(printf 'header = "Authorization: Bearer %s"\n' "$key" | \
+  curl -sS -w $'\n%{http_code}' -X POST https://api.resend.com/emails \
+    -H "Content-Type: application/json" \
+    --data "$payload" \
+    -K -)"
+
+code="$(printf '%s' "$resp" | tail -n1)"
+out="$(printf '%s' "$resp" | sed '$d')"
+if [ "$code" = "200" ] || [ "$code" = "201" ]; then
+  id="$(printf '%s' "$out" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("id",""))
+except Exception: pass' 2>/dev/null || true)"
+  echo "sent to $to (id=${id:-?})"
+else
+  echo "cg-mail: send failed (HTTP $code): $out" >&2
+  exit 1
+fi
