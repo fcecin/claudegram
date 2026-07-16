@@ -7,6 +7,7 @@
 # Usage:
 #   cg-mail <to> <subject> [body...]        # body from the remaining args, or
 #   echo "body text" | cg-mail <to> <subj>  # ...from stdin
+#   <to> may be one address or a comma-separated list: "a@x.com,b@y.com,c@z.com"
 #
 # Sender address: the first line of an optional `resend.from` file, else the
 # Resend test sender onboarding@resend.dev (which can only deliver to the Resend
@@ -34,7 +35,11 @@ from="$(head -n1 "$FROM_FILE" 2>/dev/null | tr -d ' \t\r\n' || true)"
 from="${from:-onboarding@resend.dev}"
 
 # Build the JSON body with proper escaping (python handles quotes/newlines safely).
-payload="$(python3 -c 'import json,sys; frm,to,subj,body=sys.argv[1:5]; print(json.dumps({"from":frm,"to":[to],"subject":subj,"text":body}))' "$from" "$to" "$subject" "$body")"
+# <to> may be a comma-separated list -> Resend "to" array (one email to all of them).
+payload="$(python3 -c 'import json,sys
+frm,to,subj,body=sys.argv[1:5]
+tos=[t.strip() for t in to.split(",") if t.strip()]
+print(json.dumps({"from":frm,"to":tos,"subject":subj,"text":body}))' "$from" "$to" "$subject" "$body")"
 
 # Pass the API key via a curl config on stdin so it never appears in `ps`/argv.
 resp="$(printf 'header = "Authorization: Bearer %s"\n' "$key" | \
