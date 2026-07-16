@@ -50,7 +50,8 @@ firewall, and the `[HARNESS]` channels work. `CLAUDE.md`'s deploy gotchas are au
   allowlist, or the hard-lock to make them weaker — those are the user's to change by hand.
   The hard-lock is **physical-unlock only**; never add a remote unlock.
 - **Stay on this machine.** Don't reach for external credentials/services beyond what the
-  task plainly needs and the user authorized. Never commit/send secrets (`token.txt`).
+  task plainly needs and the user authorized. Never commit/send secrets (`token.txt`,
+  `resend.key`).
 - **One harness at a time** — two would race on `cg-inbox`. If a human dev session is already
   serving the inbox, don't double up.
 

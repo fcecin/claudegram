@@ -211,6 +211,12 @@ via the USR1 dump + the "dispatch_worker got CancelledError" log.
   `<name>.caption` sidecar, paired via `with_suffix(".caption")`). Helper:
   `./cg-send <file> [caption]` — taught to every bot via `SELFCONFIG_PREAMBLE`, so
   "make a PDF and send it to me" works on any bot (nyx keeps its own `tools/send`).
+- **machine → world (email, optional)**: `./cg-mail [-a FILE]... <to> <subject> [body]` sends via
+  Resend **iff** a `resend.key` file exists (sender = `instance.json` `resend_from`; `<to>` may be
+  comma-separated; `-a` attaches a base64'd file). Taught to the bot via `EMAIL_PREAMBLE`, which
+  `build_prompt` adds to the prompt **only when the key exists**, so "email this to X" works on any
+  bot (recipient used exactly as typed). Absent the key, email is off. Direct API send — not
+  routed through Telegram.
 - **phone → machine/AI**: `bot harness <msg>` / `bot h <msg>` writes to `inbox/`. Helper:
   `./cg-inbox` (drain), `--peek`, or `--wait` (block until one; loop primitive).
 

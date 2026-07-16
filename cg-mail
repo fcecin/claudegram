@@ -1,51 +1,81 @@
 #!/usr/bin/env bash
 # cg-mail — send an email via Resend, IF this install has email enabled.
 #
-# Email is an OPTIONAL feature: it's enabled only when a `resend.key` file exists
-# next to this script (containing a Resend API key). No key file -> feature off.
+# Email is an OPTIONAL feature: enabled only when a `resend.key` file exists next to
+# this script (containing a Resend API key). No key file -> feature off.
 #
 # Usage:
-#   cg-mail <to> <subject> [body...]        # body from the remaining args, or
-#   echo "body text" | cg-mail <to> <subj>  # ...from stdin
-#   <to> may be one address or a comma-separated list: "a@x.com,b@y.com,c@z.com"
+#   cg-mail [-a FILE]... <to> <subject> [body...]   # body from remaining args, or
+#   echo "body text" | cg-mail <to> <subject>       # ...from stdin
+#     -a FILE   attach a file (repeatable); it's read + base64-encoded into the email
+#     <to>      one address or a comma-separated list: "a@x.com,b@y.com,c@z.com"
 #
-# Sender address: the first line of an optional `resend.from` file, else the
-# Resend test sender onboarding@resend.dev (which can only deliver to the Resend
-# account's own address — fine for testing; real use needs a verified domain).
+# Sender: instance.json's "resend_from" — a verified address on YOUR Resend domain, which
+# is what lets you email anyone (not just yourself). Unset -> Resend's test sender
+# onboarding@resend.dev, which only delivers to the email your Resend account is under.
 set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 KEY_FILE="$HERE/resend.key"
-FROM_FILE="$HERE/resend.from"
+INSTANCE_JSON="$HERE/instance.json"
 
 if [ ! -s "$KEY_FILE" ]; then
   echo "cg-mail: email is disabled (no $KEY_FILE). Add your Resend API key there to enable." >&2
   exit 3
 fi
 
+# Leading options: -a/--attach FILE (repeatable).
+attachments=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -a|--attach)
+      [ -n "${2:-}" ] || { echo "cg-mail: -a needs a file path" >&2; exit 1; }
+      [ -r "$2" ]     || { echo "cg-mail: cannot read attachment: $2" >&2; exit 1; }
+      attachments+=("$2"); shift 2 ;;
+    --) shift; break ;;
+    -*) echo "cg-mail: unknown option: $1" >&2; exit 1 ;;
+    *)  break ;;
+  esac
+done
+
 to="${1:-}"; subject="${2:-}"
 if [ -z "$to" ] || [ -z "$subject" ]; then
-  echo "usage: cg-mail <to> <subject> [body...]   (body via args or stdin)" >&2
+  echo "usage: cg-mail [-a FILE]... <to> <subject> [body...]   (body via args or stdin)" >&2
   exit 1
 fi
 shift 2
 if [ "$#" -gt 0 ]; then body="$*"; else body="$(cat || true)"; fi
 
 key="$(tr -d ' \t\r\n' < "$KEY_FILE")"
-from="$(head -n1 "$FROM_FILE" 2>/dev/null | tr -d ' \t\r\n' || true)"
+from="$(python3 -c 'import json,sys
+try: print((json.load(open(sys.argv[1])).get("resend_from") or "").strip())
+except Exception: pass' "$INSTANCE_JSON" 2>/dev/null || true)"
 from="${from:-onboarding@resend.dev}"
 
-# Build the JSON body with proper escaping (python handles quotes/newlines safely).
-# <to> may be a comma-separated list -> Resend "to" array (one email to all of them).
-payload="$(python3 -c 'import json,sys
-frm,to,subj,body=sys.argv[1:5]
-tos=[t.strip() for t in to.split(",") if t.strip()]
-print(json.dumps({"from":frm,"to":tos,"subject":subj,"text":body}))' "$from" "$to" "$subject" "$body")"
+# Build the JSON payload (python: safe escaping + base64 attachments). Write it to a temp
+# file so a large attachment doesn't hit argv limits and the body isn't visible in `ps`.
+payload_file="$(mktemp)"; chmod 600 "$payload_file"
+trap 'rm -f "$payload_file"' EXIT
+python3 -c '
+import json, sys, base64, os
+frm, to, subj, body, outfile = sys.argv[1:6]
+atts = sys.argv[6:]
+tos = [t.strip() for t in to.split(",") if t.strip()]
+p = {"from": frm, "to": tos, "subject": subj, "text": body}
+a = []
+for path in atts:
+    with open(path, "rb") as f:
+        a.append({"filename": os.path.basename(path),
+                  "content": base64.b64encode(f.read()).decode()})
+if a:
+    p["attachments"] = a
+open(outfile, "w").write(json.dumps(p))
+' "$from" "$to" "$subject" "$body" "$payload_file" "${attachments[@]}"
 
 # Pass the API key via a curl config on stdin so it never appears in `ps`/argv.
 resp="$(printf 'header = "Authorization: Bearer %s"\n' "$key" | \
   curl -sS -w $'\n%{http_code}' -X POST https://api.resend.com/emails \
     -H "Content-Type: application/json" \
-    --data "$payload" \
+    --data-binary @"$payload_file" \
     -K -)"
 
 code="$(printf '%s' "$resp" | tail -n1)"
@@ -54,7 +84,9 @@ if [ "$code" = "200" ] || [ "$code" = "201" ]; then
   id="$(printf '%s' "$out" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("id",""))
 except Exception: pass' 2>/dev/null || true)"
-  echo "sent to $to (id=${id:-?})"
+  natt="${#attachments[@]}"
+  if [ "$natt" -gt 0 ]; then extra=" +${natt} attachment(s)"; else extra=""; fi
+  echo "sent to $to (id=${id:-?})${extra}"
 else
   echo "cg-mail: send failed (HTTP $code): $out" >&2
   exit 1

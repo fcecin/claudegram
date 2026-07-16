@@ -49,6 +49,14 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   **spoken audio** until **`bot voice off`** — a reliable toggle set at the keyboard, not a
   fragile per-message cue. The whole reply is spoken as one voice message, no text transcript.
   (TTS via Kokoro — offline; run `./fetch-kokoro.sh` once to get the model.)
+- **Email (optional)**: with a `resend.key` present, **just ask the bot to email someone**
+  ("email this file to …") and it sends via [Resend](https://resend.com) using `cg-mail`
+  (`cg-mail [-a FILE]... <to> <subject> [body]` — `<to>` may be comma-separated, `-a` attaches a
+  file). The bot is taught it can do this **only when email is enabled**, and it uses the
+  recipient address **exactly as you type it** (never a voice-transcription guess). The sender is
+  `instance.json`'s `resend_from` — a verified address on **your own** Resend domain (what lets
+  you reach anyone); unset, it falls back to Resend's test address (your own account email only).
+  No `resend.key` → the feature is simply off.
 - **Message batching**: fire several messages in a row and the bridge collapses the whole
   queue into **one** Claude turn (combined prompt) instead of answering each separately —
   including anything you send while it's mid-turn (batched into the next one).
@@ -204,6 +212,7 @@ flips live with `bot transcribe good|fast` (no restart).
 | `gui.py` | tray app: supervises `bot.py`, console, Unblock/Regress/Clear + 🛡 Intrusion Lock toggle | yes |
 | `cg-notify` | push a `[HARNESS]` message from this machine to your phone | yes |
 | `cg-inbox` | read messages you sent via `bot harness` (`--peek` / `--wait`) | yes |
+| `cg-mail` | send email via [Resend](https://resend.com) — optional, needs `resend.key` (`cg-mail [-a FILE]... <to> <subject> [body]`) | yes |
 | `run-harness.sh` | open a visible terminal running a Claude "harness" that operates claudegram | yes |
 | `harness-charter.md` | the standing prompt that turns that Claude into the harness | yes |
 | `run-gui.sh` / `run.sh` | launchers (`run.sh` runs the bot without the tray) | yes |
@@ -212,6 +221,7 @@ flips live with `bot transcribe good|fast` (no restart).
 | `CLAUDE.md` | dev notes for an AI working on this codebase | yes |
 | `HACKING_REGRESSIONS.md` | curated false positives the firewall must never block | yes |
 | `token.txt` | **the bot token** — a dedicated secret file (`chmod 600`) | no |
+| `resend.key` | **Resend API key** for optional email (`chmod 600`); sender = `instance.json` `resend_from` | no |
 | `instance.json` | per-install config (allowlist, identity, default_bot, whisper) | no |
 | `session.id`, `effort.level`, `cwd.path`, `compute.type`, `voice.mode`, `BLOCKED.flag`, `SLEEP.flag`, `INTRUSION_OFF.flag` | runtime state | no |
 | `outbox/`, `inbox/` | `[HARNESS]` message drop dirs (transient) | no |

@@ -189,6 +189,7 @@ SESSION_FILE = HERE / "session.id"   # persisted Claude session id (for resume)
 EFFORT_FILE = HERE / "effort.level"  # persisted reasoning effort
 CWD_FILE = HERE / "cwd.path"         # persisted working directory
 LOG_PATH = HERE / "claudegram.log"   # bridge log (written by the tray supervisor)
+RESEND_KEY_FILE = HERE / "resend.key"  # presence => optional email feature enabled (see cg-mail)
 AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # transient voice files (decoded, then deleted)
 VOICE_TMP = Path(tempfile.gettempdir()) / "claudegram_voiceback"  # transient TTS output (sent, then deleted)
 IMAGE_DIR = WORK / "incoming-images"  # incoming images: work pieces kept in the bot's work/ (persist, never auto-deleted)
@@ -783,6 +784,17 @@ SELFCONFIG_PREAMBLE = (
 )
 
 
+# Shown ONLY when email is enabled (a resend.key exists). Teaches the bot it can send email
+# on request via cg-mail — attachments supported; recipient used EXACTLY as the user typed it.
+EMAIL_PREAMBLE = (
+    f"[email is enabled here: to send an email when the user asks, run "
+    f"`{HERE / 'cg-mail'} [-a FILE]... <to> <subject> [body]` (repeat -a per attachment; <to> may "
+    "be a comma-separated list). Use the recipient address EXACTLY as the user typed it — never a "
+    "voice transcription of an email; if you don't have it, ask them to type it. To attach a file "
+    "the user sent you, pass its saved path with -a.]\n"
+)
+
+
 def bot_home(name: str):
     d = BOTS_DIR / name
     return d if (d / "main.md").is_file() else None
@@ -821,7 +833,8 @@ def build_prompt(user_text: str, source: str, voiceback: bool = False,
     guard = GUARD_AUDIO if source == "audio" else GUARD_TEXT
     boot = bot_boot_pointer(bot_name) if bot_name else ""
     pre = VOICEBACK_PREAMBLE if voiceback else ""
-    return f"{guard}\n{boot}{SELFCONFIG_PREAMBLE}{pre}{user_text}"
+    mail = EMAIL_PREAMBLE if RESEND_KEY_FILE.is_file() else ""
+    return f"{guard}\n{boot}{SELFCONFIG_PREAMBLE}{mail}{pre}{user_text}"
 
 
 def detect_tts_lang(text: str, default: str = "en") -> str:

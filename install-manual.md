@@ -76,10 +76,19 @@ echo 'PASTE-BOT-TOKEN' > token.txt && chmod 600 token.txt   # the token: its own
 # All other config is in instance.json (a FILE, never env). Put the allowlist there:
 #   {"allowed_user_ids": [<their numeric id>], "name":"...", "glyph":"...", "color":"#..."}
 # First id = MASTER. Absent/empty = the bot answers anyone. (whisper/default_bot optional.)
+
+# OPTIONAL — email (Resend). Only if this machine should SEND email; skip to leave it off.
+#   1) Get an API key at https://resend.com; to email ANYONE (not just yourself), verify your
+#      sending domain there so you can send from your own identity.
+echo 'PASTE-RESEND-API-KEY' > resend.key && chmod 600 resend.key
+#   2) Set the sender in instance.json:   "resend_from": "you@your-verified-domain"
+#      (omit it -> sends use Resend's test address, which only reaches your own account email.)
+# Send from the CLI:  ./cg-mail [-a FILE]... <to> <subject> [body]   (<to> may be comma-separated)
+# ...or just ask the bot in chat: "email this file to <typed address>" — it uses cg-mail itself.
 ```
-Confirm `.gitignore` already excludes `token.txt`, `instance.json`, `session.id`, `effort.level`,
-`cwd.path`, `compute.type`, `voice.mode`, `BLOCKED.flag`, `SLEEP.flag`, `INTRUSION_OFF.flag`,
-logs, and `.venv/`.
+Confirm `.gitignore` already excludes `token.txt`, `resend.key`, `instance.json`,
+`session.id`, `effort.level`, `cwd.path`, `compute.type`, `voice.mode`, `BLOCKED.flag`,
+`SLEEP.flag`, `INTRUSION_OFF.flag`, logs, and `.venv/`.
 
 ---
 
@@ -180,7 +189,8 @@ Per new clone (say at `~/cg/<name>/`):
 0. **Clone the code — but EXCLUDE per-instance identity, secrets, venv and runtime state** (so you
    don't inherit another bot's soul). From an existing install or the dev repo:
    ```
-   rsync -a --exclude='.venv/' --exclude='.env' --exclude='token.txt' --exclude='instance.json' \
+   rsync -a --exclude='.venv/' --exclude='.env' --exclude='token.txt' --exclude='resend.key' \
+     --exclude='instance.json' \
      --exclude='session*.id' --exclude='*.flag' --exclude='*.level' --exclude='cwd.path' \
      --exclude='compute.type' --exclude='voice.mode' --exclude='work/' --exclude='outbox/' \
      --exclude='media-outbox/' --exclude='cmd-inbox/' --exclude='*.log' --exclude='__pycache__/' \
