@@ -42,6 +42,12 @@ except Exception:  # older SDK without the exported constant
 TERMINAL_TASK_STATUSES = frozenset(_SDK_TERMINAL or {"completed", "failed", "stopped", "killed"})
 
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# ask()'s stuck-turn safety net: if the stream goes TOTALLY silent (no message at all) for
+# STUCK_SECS, the turn is released so the dispatcher isn't wedged forever. Module-level so
+# tests can shrink them; long foreground tools still produce stream activity well under this.
+STUCK_SECS = 900
+STUCK_POLL_SECS = 30
 # The SDK doesn't expose Claude Code's unset/default effort as a value, so we pin an
 # explicit default — "effort" is then always a concrete, known level (override: bot effort).
 DEFAULT_EFFORT = "high"
@@ -127,7 +133,9 @@ def sigkill_subtree(root: int | None) -> list[int]:
 def sigkill_claude_subtree() -> list[int]:
     """SIGKILL every 'claude' CLI child of THIS process and all their descendants. This is
     the process-WIDE nuke (all sessions at once); a single controller must NOT use it — it
-    kills its siblings too. Kept for an emergency/panic path only."""
+    kills its siblings too. Used only by the PANIC paths (`bot lock` and the intrusion
+    hard-lock in bot.py), as belt-and-suspenders after the per-session kills: it catches any
+    stray CLI child no live controller tracks."""
     me = os.getpid()
     cmap = _children_map()
     killed: list[int] = []
@@ -204,11 +212,10 @@ def _migrate_session(session_id: str, old_cwd: str, new_cwd: str) -> None:
 class ClaudeController:
     """A long-lived, multi-turn Claude Code session that resumes across restarts."""
 
-    def __init__(self, cwd: str, session_file: str, effort_file: str | None = None,
-                 cwd_file: str | None = None, model: str | None = None,
-                 max_budget_usd: float | None = None, effort: str | None = None) -> None:
+    def __init__(self, cwd: str, session_file: str, cwd_file: str | None = None,
+                 model: str | None = None, max_budget_usd: float | None = None,
+                 effort: str | None = None) -> None:
         self.session_file = Path(session_file)
-        self.effort_file = Path(effort_file) if effort_file else None
         self.cwd_file = Path(cwd_file) if cwd_file else None
         self._default_cwd = str(cwd)
         self.cwd = self._load_cwd() or str(cwd)
@@ -224,6 +231,8 @@ class ClaudeController:
         self._child_pid: int | None = None  # this session's OWN CLI subprocess (per-session kill)
         self._interrupted = False  # set by interrupt_turn(); the in-flight dispatch consumes it
                                    # so a user interrupt closes cleanly (not as a crash/error)
+        self._stuck_release = False  # set when ask() gives up on a silent turn (STUCK_SECS);
+                                     # consumed by the dispatch so it never claims "Done"
         self._lock = asyncio.Lock()  # serializes USER turns (not the reader)
         self._on_system = None  # async callback(kind:str, data:dict) for the active turn
 
@@ -265,27 +274,7 @@ class ClaudeController:
         except OSError:
             pass
 
-    # --- effort level (persisted; applied on connect) ------------------------
-    def _load_effort(self) -> str | None:
-        if not self.effort_file:
-            return None
-        try:
-            val = self.effort_file.read_text(encoding="utf-8").strip().lower()
-            return val if val in VALID_EFFORTS else None
-        except OSError:
-            return None
-
-    def _save_effort(self) -> None:
-        if not self.effort_file:
-            return
-        try:
-            if self.effort:
-                self.effort_file.write_text(self.effort, encoding="utf-8")
-            elif self.effort_file.exists():
-                self.effort_file.unlink()
-        except OSError:
-            pass
-
+    # --- effort level (process-lived; applied on connect) ---------------------
     def get_effort(self) -> str | None:
         return self.effort
 
@@ -570,23 +559,28 @@ class ClaudeController:
             try:
                 await self._ensure_connected()
                 self._segment_done.clear()
-                self._interrupted = False  # fresh turn — clear any stale interrupt flag
+                self._interrupted = False     # fresh turn — clear any stale interrupt flag
+                self._stuck_release = False   # ...and any stale stuck flag
                 self._awaiting_user_segment = True
                 await self._client.query(prompt)
                 # Wait for the turn to end — but never hang forever. If the stream goes
                 # totally silent (no message at all) for STUCK_SECS, give up and release
-                # the turn so the dispatcher isn't wedged. (Long foreground tools still
-                # produce stream activity / cap well under this.)
-                STUCK_SECS = 900
+                # the turn so the dispatcher isn't wedged. The release is FLAGGED
+                # (_stuck_release) so the dispatch reports it honestly instead of "Done".
                 loop = asyncio.get_event_loop()
+                # A dead-silent CLI on a fresh connection leaves last_activity at 0, which
+                # would read as "no idleness" forever — anchor the clock at query time.
+                if not self.last_activity:
+                    self.last_activity = loop.time()
                 while not self._segment_done.is_set():
                     try:
-                        await asyncio.wait_for(self._segment_done.wait(), 30)
+                        await asyncio.wait_for(self._segment_done.wait(), STUCK_POLL_SECS)
                     except asyncio.TimeoutError:
-                        idle = loop.time() - (self.last_activity or loop.time())
+                        idle = loop.time() - self.last_activity
                         if idle >= STUCK_SECS:
                             log.warning("ask: no stream activity for %.0fs and no result — "
                                         "releasing the turn (assumed stuck)", idle)
+                            self._stuck_release = True
                             break
             finally:
                 self._awaiting_user_segment = False
@@ -615,7 +609,11 @@ class ClaudeController:
         Returns True if a turn was actually interrupted, False if nothing was running.
         Deliberately does NOT take _lock (a live turn holds it), like stop()/kill()."""
         client = self._client
-        if client is None or not self.in_segment:
+        # A turn is interruptible from the moment its query() is sent — including the window
+        # BEFORE the CLI emits the init message (in_segment still False but a user turn is in
+        # flight, tracked by _awaiting_user_segment). The old in_segment-only check answered
+        # "nothing to interrupt" during that window while a turn was actually pending.
+        if client is None or not (self.in_segment or self._awaiting_user_segment):
             return False
         self._interrupted = True  # so the in-flight dispatch closes this turn cleanly, not as a crash
         try:
@@ -640,6 +638,13 @@ class ClaudeController:
         in-flight dispatch render it as a clean stop rather than a crash. Self-clearing."""
         was = self._interrupted
         self._interrupted = False
+        return was
+
+    def consume_stuck_flag(self) -> bool:
+        """True exactly once if the last turn was RELEASED AS STUCK by ask()'s silence net —
+        lets the dispatch report the release instead of claiming success. Self-clearing."""
+        was = self._stuck_release
+        self._stuck_release = False
         return was
 
     def _end_segment_locally(self) -> None:

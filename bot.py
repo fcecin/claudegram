@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-claudegram — a Telegram bot that transcribes the voice/audio you send it
-and echoes the text straight back into the chat.
+claudegram — a private Telegram bridge that drives persistent Claude Code instance(s)
+from your phone. Voice notes (transcribed locally with faster-whisper), text, images,
+and documents go in; Claude's live activity and answers stream back into the chat.
 
-Talk to it from your phone (open the chat with your bot, hold the mic, speak),
-and the desktop process running this script transcribes it locally with
-faster-whisper and replies with the text.
+This process is the bridge only: Telegram I/O, the firewall + intrusion lock, the `bot`
+commands, rendering, the watchdogs, and the IPC channels. The tray app (gui.py)
+supervises it; transcription runs in a killable subprocess (transcribe_worker.py); each
+Claude session is owned by a claude_driver.ClaudeController.
 
-Configuration (env vars, or a .env file in this directory):
-    TELEGRAM_BOT_TOKEN   required. The token @BotFather gave you.
-                         Alternatively, put it alone in a file named token.txt.
-    WHISPER_MODEL        whisper model size. default: small
-                         tiny | base | small | medium | large-v3
-                         bigger = more accurate + slower + bigger download.
-    WHISPER_LANGUAGE     force a language (e.g. en, pt). default: auto-detect.
-    WHISPER_DEVICE       cpu | cuda. default: cpu
-    WHISPER_COMPUTE_TYPE ctranslate2 compute type. default: int8 (cpu) / float16 (cuda)
+Configuration lives in FILES next to this script — never the environment:
+    token.txt        the bot token from @BotFather (chmod 600)
+    instance.json    per-install config: "allowed_user_ids" (first id = MASTER, rest =
+                     guests), install identity ("name"/"color"/"glyph"), optional
+                     "whisper" {model, device, language}, "default_bot", "resend_from",
+                     "allow_cron", "kokoro_model_dir"
+    bots/<name>/     the bot roster (config.json + optional main.md per bot)
 """
 
 import asyncio
@@ -61,6 +61,7 @@ from claude_driver import (
     ambient_default_model,
     default_model_guard,
     force_subscription_env,
+    sigkill_claude_subtree,
     summarize_tool,
 )
 
@@ -154,7 +155,7 @@ def is_authorized(update: Update) -> bool:
 
 
 def _master():
-    """The MASTER user = ALLOWED_USER_IDS[0] (FIRST as listed in .env). Every proactive
+    """The MASTER user = ALLOWED_USER_IDS[0] (FIRST in instance.json's list). Every proactive
     notification (status/watchdog/startup/harness/intrusion) goes here, and this user
     must open a chat with the bot. Everyone else in the allowlist is a GUEST: they may
     use the bot (their replies land in their own chat) but receive no notifications.
@@ -186,7 +187,6 @@ TRANSCRIBE_NODUR_BUDGET = 900.0     # hard cap when the clip's duration is unkno
 # copy is self-contained and nothing leaks into git).
 WORK = HERE / "work"
 SESSION_FILE = HERE / "session.id"   # persisted Claude session id (for resume)
-EFFORT_FILE = HERE / "effort.level"  # persisted reasoning effort
 CWD_FILE = HERE / "cwd.path"         # persisted working directory
 LOG_PATH = HERE / "claudegram.log"   # bridge log (written by the tray supervisor)
 RESEND_KEY_FILE = HERE / "resend.key"  # presence => optional email feature enabled (see cg-mail)
@@ -250,13 +250,12 @@ def resolve_session_name(raw: str):
 
 
 def _session_files(name: str):
-    """(session_file, effort_file, cwd_file) for a session. The DEFAULT reuses the original
+    """(session_file, cwd_file) for a session. The DEFAULT reuses the original
     single-session files, so an existing install's live conversation simply becomes 'claude';
     named sessions get namespaced siblings (session.<name>.id, …)."""
     if name == DEFAULT_SESSION:
-        return str(SESSION_FILE), str(EFFORT_FILE), str(CWD_FILE)
+        return str(SESSION_FILE), str(CWD_FILE)
     return (str(HERE / f"session.{name}.id"),
-            str(HERE / f"effort.{name}.level"),
             str(HERE / f"cwd.{name}.path"))
 
 
@@ -309,9 +308,9 @@ class Session:
         # Live transcription compute: config value at spawn, else None => the code default.
         # `bot transcribe` overrides this in-memory (process-lived); never persisted.
         self.compute = TRANSCRIBE_PRESETS.get((self.config.get("transcribe") or "").lower())
-        sf, ef, cf = _session_files(name)
+        sf, cf = _session_files(name)
         model = self.config.get("model")
-        self.controller = ClaudeController(str(WORK), sf, ef, cf,
+        self.controller = ClaudeController(str(WORK), sf, cf,
                                            model=MODEL_ALIASES.get(model, model),
                                            max_budget_usd=self.config.get("max_budget_usd"),
                                            effort=self.config.get("effort"))
@@ -487,16 +486,22 @@ def transcribe_end() -> None:
 # If you fire several messages, a single worker drains the whole queue and sends them to
 # Claude as one combined prompt — so it answers them together, not as N separate turns.
 BATCH_DEBOUNCE = 1.2  # s: after the first queued message, wait this long for more
-# After this many identical "idle + shells" watchdog ticks (~1/min => ~30 min), nudge
-# Claude to continue / check for stuck shells / clean up.
+# The idle thresholds below count QUIET WATCHDOG TICKS, not minutes: a tick happens only
+# after ~a minute of full Telegram silence, and all sessions' watchdogs share that one
+# silence budget — so with chat traffic or several live sessions, ×30 stretches well past
+# 30 wall-clock minutes (that's fine: they're "nothing has happened for ages" thresholds).
+# After this many identical "idle + shells" ticks, nudge Claude to continue / check for
+# stuck shells / clean up.
 IDLE_SHELLS_NUDGE_AT = 30
 IDLE_SHELLS_NUDGE = (
     "You seem to be idle for a long time but with running shells. If you have work, "
     "continue your work and check for stuck shells. Otherwise clean up your shells."
 )
-# After ~×30 idle ticks (~30 min) with NOTHING running, nudge Claude to continue or to
-# declare it's done. NO_MORE_WORK_MARKER is the agreed opt-out: detected ANYWHERE in the reply
-# (substring scan in SegmentRenderer.finalize) since a bot often buries it mid-paragraph.
+# After ×30 quiet idle ticks with NOTHING running, nudge Claude to continue or to declare
+# it's done. NO_MORE_WORK_MARKER is the agreed opt-out: detected ANYWHERE in the reply
+# (substring scan in SegmentRenderer.finalize) since a bot often buries it mid-paragraph —
+# but CASE-SENSITIVELY, exactly as the nudge demands it (uppercase), so ordinary prose like
+# "there is no more work needed here" can never trip it.
 NO_MORE_WORK_MARKER = "NO MORE WORK"
 IDLE_NO_SHELLS_NUDGE_AT = 30
 IDLE_AUTOEND_AT = 10  # a background (non-current, non-default) session idle+no-shells this many
@@ -619,14 +624,14 @@ def format_usage() -> str:
     return (" · " + " · ".join(parts)) if parts else ""
 
 
-def enqueue_for_claude(session, chat_id, reply_to, text: str, source: str, voiceback: bool) -> None:
+def enqueue_for_claude(session, chat_id, reply_to, text: str, source: str) -> None:
     """Queue a message onto a SPECIFIC session's batch (its worker drains it). Routing =
-    just picking the session; the current session is the usual target."""
+    just picking the session; the current session is the usual target. (Voiceback is not a
+    per-message property: the worker reads the global toggle at dispatch time.)"""
     if not session.pending:
         session.pending_since = time.monotonic()
     session.pending.append({
-        "chat_id": chat_id, "reply_to": reply_to, "text": text,
-        "source": source, "voiceback": voiceback,
+        "chat_id": chat_id, "reply_to": reply_to, "text": text, "source": source,
     })
     session.pending_event.set()
 
@@ -657,15 +662,26 @@ async def session_worker(session) -> None:
             await asyncio.sleep(BATCH_DEBOUNCE)  # gather the burst
             if not session.pending:
                 continue
-            batch, session.pending[:] = session.pending[:], []
-            session.pending_since = 0.0
+            # Drain ONE CHAT's burst per turn. The queue can hold messages from different
+            # chats (the master and a guest within the debounce window — or, much wider,
+            # anything that queued while a long turn was running). Merging across chats
+            # would fuse two people's prompts into one turn AND deliver the combined answer
+            # into whichever chat sent last — so take only the first sender's messages now
+            # and re-arm for the rest.
+            chat_id = session.pending[0]["chat_id"]
+            batch = [m for m in session.pending if m["chat_id"] == chat_id]
+            rest = [m for m in session.pending if m["chat_id"] != chat_id]
+            session.pending[:] = rest
+            session.pending_since = time.monotonic() if rest else 0.0
+            if rest:
+                session.pending_event.set()  # the other chat's burst drains next iteration
             parts = [m["text"].strip() for m in batch if m["text"].strip()]
             if not parts:
                 continue
             combined = "\n\n".join(parts)
-            voiceback = voice_mode_on() or any(m["voiceback"] for m in batch)
+            voiceback = voice_mode_on()
             source = "audio" if any(m["source"] == "audio" for m in batch) else "text"
-            chat_id, reply_to = batch[-1]["chat_id"], batch[-1]["reply_to"]
+            reply_to = batch[-1]["reply_to"]
             header = "🤖 Claude is working…"
             if len(batch) > 1:
                 header += f" · 📨 {len(batch)} msgs"
@@ -772,27 +788,26 @@ VOICEBACK_PREAMBLE = (
 )
 
 
-# Teaches every turn that the bot can reconfigure claudegram (when asked) and manage itself.
-# Small on purpose (rides every prompt). `cg-cmd` drops a command into cmd-inbox/, which a loop
-# here runs through the ordinary bot-command handler (safe subset only).
-SELFCONFIG_PREAMBLE = (
-    f"[self-config via `{HERE / 'cg-cmd'} <cmd>` — change a bridge setting when asked, or manage "
-    "yourself: effort low|medium|high|xhigh|max · model opus|sonnet|haiku|fable|default · voice on|off "
-    "· transcribe best|good|fast · cwd <path> · park (when you're done: end-state idle, stops "
-    "nudging) · status. Effect is next turn. To deliver a file (image/PDF/any document) to the "
-    f"user's phone: `{HERE / 'cg-send'} <file> [caption]`.]\n"
-)
-
-
-# Shown ONLY when email is enabled (a resend.key exists). Teaches the bot it can send email
-# on request via cg-mail — attachments supported; recipient used EXACTLY as the user typed it.
-EMAIL_PREAMBLE = (
-    f"[email is enabled here: to send an email when the user asks, run "
-    f"`{HERE / 'cg-mail'} [-a FILE]... <to> <subject> [body]` (repeat -a per attachment; <to> may "
-    "be a comma-separated list). Use the recipient address EXACTLY as the user typed it — never a "
-    "voice transcription of an email; if you don't have it, ask them to type it. To attach a file "
-    "the user sent you, pass its saved path with -a.]\n"
-)
+# The per-turn helpers preamble: self-config, file delivery, and (when a resend.key exists)
+# email — ONE compact block, since it rides EVERY prompt and shorter is better. `cg-cmd` drops
+# into cmd-inbox/ and runs through the ordinary bot-command handler (safe subset only). PER-BOT:
+# the preamble bakes the bot's own name into the drop (`--as <name>`), so under multiplexing
+# "manage yourself" really targets the ISSUING bot — a background bot's `cg-cmd park` parks
+# itself, never whichever session the user happens to have selected.
+def selfconfig_preamble(bot_name: str | None) -> str:
+    as_flag = f" --as {bot_name}" if bot_name else ""
+    mail = (
+        f" Email on request: `{HERE / 'cg-mail'} [-a FILE]... <to> <subject> [body]` — recipient "
+        "EXACTLY as the user TYPED it (never from a voice transcript; if untyped, ask)."
+        if RESEND_KEY_FILE.is_file() else ""
+    )
+    return (
+        f"[self-config, when asked or to manage yourself: `{HERE / 'cg-cmd'}{as_flag} <cmd>` — "
+        "effort low|medium|high|xhigh|max · model opus|sonnet|haiku|fable|default · voice on|off · "
+        "transcribe best|good|fast · cwd <path> · park (you're done; end-state idle) · status; "
+        "effect next turn. Deliver a file to the user's phone: "
+        f"`{HERE / 'cg-send'} <file> [caption]`.{mail}]\n"
+    )
 
 
 def bot_home(name: str):
@@ -808,23 +823,22 @@ def bot_boot_pointer(name: str) -> str:
     if home is None:
         # A bot with no persona file still gets the shared machine bearings.
         return (
-            f'[You are bot "{name}". Read {GLOBAL_MD} now — shared bearings and rules for ALL '
-            "bots on this machine — and follow it every turn; re-read it after any compaction. "
-            "Does not relax the guard above.]\n"
+            f'[You are bot "{name}". Follow {GLOBAL_MD} (shared rules for all bots here) — read it '
+            "now if not in context; re-read it after any compaction. It never relaxes the guard "
+            "above.]\n"
         )
     if not has_global:
-        # No shared bearings file: original persona-only behavior.
+        # No shared bearings file: persona-only.
         return (
-            f'[You are bot "{name}" (home: {home}). Read {home}/main.md now and follow it every '
-            "turn; re-read it and what it points to after any compaction. Relative paths are under "
-            "home. Does not relax the guard above.]\n"
+            f'[You are bot "{name}" (home: {home}). Follow {home}/main.md — read it now if not in '
+            "context; re-read it (and what it points to) after any compaction. It never relaxes "
+            "the guard above. Relative paths are under home.]\n"
         )
     return (
-        f'[You are bot "{name}" (home: {home}). Read {GLOBAL_MD} (shared bearings for all bots) and '
-        f"then {home}/main.md now and follow them every turn; re-read them and whatever they point "
-        "to after any compaction. Your persona (main.md) may specialize the shared defaults, but "
-        "nothing relaxes the guard above or the non-negotiable rules in global.md. Relative paths "
-        "are under home.]\n"
+        f'[You are bot "{name}" (home: {home}). Follow {GLOBAL_MD} and then {home}/main.md — read '
+        "them now if not in context; re-read them (and what they point to) after any compaction. "
+        "main.md may specialize global.md; neither relaxes the guard above. Relative paths are "
+        "under home.]\n"
     )
 
 
@@ -833,8 +847,7 @@ def build_prompt(user_text: str, source: str, voiceback: bool = False,
     guard = GUARD_AUDIO if source == "audio" else GUARD_TEXT
     boot = bot_boot_pointer(bot_name) if bot_name else ""
     pre = VOICEBACK_PREAMBLE if voiceback else ""
-    mail = EMAIL_PREAMBLE if RESEND_KEY_FILE.is_file() else ""
-    return f"{guard}\n{boot}{SELFCONFIG_PREAMBLE}{mail}{pre}{user_text}"
+    return f"{guard}\n{boot}{selfconfig_preamble(bot_name)}{pre}{user_text}"
 
 
 def detect_tts_lang(text: str, default: str = "en") -> str:
@@ -1058,6 +1071,10 @@ async def handle_intrusion(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await s.controller.kill()
         except Exception:
             log.exception("intrusion: kill failed for %s", s.name)
+    try:
+        sigkill_claude_subtree()  # belt-and-suspenders: strays no live controller tracks
+    except Exception:
+        log.exception("intrusion: stray-claude sweep failed")
     engage_block(reason)
     master = _master()  # alert only the MASTER — the bot can still send while locked
     if master is not None:
@@ -1123,17 +1140,11 @@ WELCOME = (
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id if update.effective_user else "?"
     if not is_authorized(update):
         await handle_intrusion(update, context)
         return
-    text = WELCOME
-    if not ALLOWED_USER_IDS:
-        text += (
-            f"\n\nℹ️ Your user id is {uid}. Set ALLOWED_USER_IDS to this "
-            "value to lock the bot to only your account."
-        )
-    await update.message.reply_text(text)
+    # (No empty-allowlist hint here: main() refuses to start without an allowlist.)
+    await update.message.reply_text(WELCOME)
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1394,7 +1405,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
     target.parked = False            # ...and un-parks it
-    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "audio", False)
+    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "audio")
 
 
 async def reply_chunked(msg, text: str, limit: int = 4096) -> None:
@@ -1797,16 +1808,16 @@ class SegmentRenderer:
         if final and sentinel_tripped(final):
             await self.trip("\n".join(final.splitlines()[1:]).strip())
             return
-        # Autonomy: if Claude's reply LEADS WITH the marker it's declaring it's out of work
-        # -> pause idle nudging (re-armed on the user's next message). Done BEFORE the
-        # voiceback branch (under voiceback the answer is collected, not streamed), startswith
-        # exactly as the nudge prompt instructs Claude.
+        # Autonomy: the marker ANYWHERE in the reply (bots often bury it mid-paragraph)
+        # declares it's out of work -> pause idle nudging (re-armed on the user's next
+        # message). CASE-SENSITIVE on purpose — the nudge demands the exact uppercase words,
+        # so prose that merely mentions "no more work" can't trip it. Done BEFORE the
+        # voiceback branch (under voiceback the answer is collected, not streamed).
         answer = "".join(self.answer_buf).strip() or final
         if answer and self.session is not None:
             self.session.recent_answers.append(answer)  # what the guard reviews if this bot stalls
             self.session.nostall_cleared = False        # new output — let the guard review again
-        clean = answer.lstrip()
-        if NO_MORE_WORK_MARKER in clean.upper():
+        if NO_MORE_WORK_MARKER in answer:
             set_no_more_work(self.session, True)
             log.info("watchdog: Claude declared NO MORE WORK — idle nudging paused")
         if self.voiceback:
@@ -1921,6 +1932,30 @@ class SegmentRenderer:
         except Exception:
             log.exception("interrupted_close: streamer finish failed")
 
+    async def stuck_close(self) -> None:
+        """Close a turn the controller RELEASED AS STUCK (its silence net fired): keep what
+        streamed, free the prompt ([[END]]), and say what actually happened — never the
+        "✅ Done" summary, which would pass off an abandoned turn as a success."""
+        if self.tripped:
+            return
+        answer = "".join(self.answer_buf).strip()
+        if answer and self.session is not None:
+            self.session.recent_answers.append(answer)
+            self.session.nostall_cleared = False
+        if not self.board.sealed:
+            try:
+                await self.board.finish("⚠️ turn went silent — released")
+            except Exception:
+                pass
+        try:
+            await self.streamer.finish()   # flush remainder + [[END]] (prompt free for input)
+        except Exception:
+            log.exception("stuck_close: streamer finish failed")
+        await self.alert(
+            "⚠️ That turn went silent (no stream activity for a long time) and was released "
+            "as stuck. The session is intact — resend or send new work to continue."
+        )
+
     async def rate_limited_notice(self, attempt: int, max_retries: int, mins: int) -> None:
         """Seal the board and tell the user we hit Anthropic throttling and will retry."""
         if not self.board.sealed:
@@ -1977,6 +2012,11 @@ async def dispatch_to_claude(
                 # `bot interrupt`: the turn ended by request (its ResultMessage is is_error, but
                 # that's not a crash) — close cleanly; the command already told the user.
                 await r.interrupted_close()
+                return
+            if ctrl.consume_stuck_flag():
+                # ask()'s silence net released the turn (no stream activity, no result) —
+                # report THAT, never a fake "Done" summary.
+                await r.stuck_close()
                 return
             if res.get("is_error"):
                 err = res.get("text") or f"ended: {res.get('subtype')}"
@@ -2104,9 +2144,11 @@ class SpontaneousRelay:
         kind = type(message).__name__
         if self.cur is None:
             # Leading task/ratelimit chatter isn't the start of a renderable turn; the
-            # shell set is already tracked by the controller before we get here.
+            # shell set is already tracked by the controller before we get here. A STRAY
+            # ResultMessage (a late turn-end after a stuck release) isn't one either —
+            # opening a board just to slam it shut posted a spurious "picked back up… Done".
             if kind in ("TaskStartedMessage", "TaskUpdatedMessage",
-                        "TaskNotificationMessage", "RateLimitEvent"):
+                        "TaskNotificationMessage", "RateLimitEvent", "ResultMessage"):
                 return
             chat = self._owner_chat()
             if chat is None:
@@ -2210,7 +2252,10 @@ class Watchdog:
                             mark_sent()
                         except Exception:
                             log.exception("auto-end notice failed")
-                        asyncio.create_task(end_session(self.session.name))
+                        # _spawn, not bare create_task: asyncio holds only a weak ref and a
+                        # GC'd teardown task would strand the session half-alive.
+                        _spawn(end_session(self.session.name),
+                               name=f"end_session[{self.session.name}]")
                         return
                     continue
                 policing = nostall_on() and not self.session.internal
@@ -2336,13 +2381,13 @@ class Watchdog:
         set_no_more_work(self.session, False)
         # The bot never converses with the guard — it just receives the order and acts on it.
         # Inject as a bare anti-stall directive (no persona to reply to) so it resumes.
-        enqueue_for_claude(self.session, chat, None,
-                           "[anti-stall] " + verdict, "text", False)
+        enqueue_for_claude(self.session, chat, None, "[anti-stall] " + verdict, "text")
         return False
 
     async def _nudge_idle_shells(self):
-        """~30 min idle with shells still running: ask Claude to continue, check for stuck
-        shells, or clean up. Goes through the normal queue so the reply reaches the phone."""
+        """×IDLE_SHELLS_NUDGE_AT quiet ticks idle with shells still running: ask Claude to
+        continue, check for stuck shells, or clean up. Goes through the normal queue so the
+        reply reaches the phone."""
         log.warning("watchdog[%s]: idle+shells ×%d — auto-nudging Claude",
                     self.session.name, IDLE_SHELLS_NUDGE_AT)
         chat = self._chat()
@@ -2355,12 +2400,13 @@ class Watchdog:
             mark_sent()
         except Exception:
             log.exception("nudge notice failed")
-        enqueue_for_claude(self.session, chat, None, IDLE_SHELLS_NUDGE, "text", False)
+        enqueue_for_claude(self.session, chat, None, IDLE_SHELLS_NUDGE, "text")
 
     async def _nudge_idle_no_shells(self):
-        """~30 min idle with NOTHING running: ask Claude to continue or declare done (reply
-        leading with NO MORE WORK). Goes through the normal queue so the reply reaches the
-        phone; if Claude declares done, finalize() pauses these nudges until you send work."""
+        """×IDLE_NO_SHELLS_NUDGE_AT quiet ticks idle with NOTHING running: ask Claude to
+        continue or declare done (the uppercase NO MORE WORK marker anywhere in its reply).
+        Goes through the normal queue so the reply reaches the phone; if Claude declares
+        done, finalize() pauses these nudges until you send work."""
         log.warning("watchdog[%s]: idle+no-shells ×%d — nudging Claude (continue or NO MORE WORK)",
                     self.session.name, IDLE_NO_SHELLS_NUDGE_AT)
         chat = self._chat()
@@ -2373,7 +2419,7 @@ class Watchdog:
             mark_sent()
         except Exception:
             log.exception("idle-no-shells nudge notice failed")
-        enqueue_for_claude(self.session, chat, None, IDLE_NO_SHELLS_NUDGE, "text", False)
+        enqueue_for_claude(self.session, chat, None, IDLE_NO_SHELLS_NUDGE, "text")
 
     async def _show(self, body):
         chat = self._chat()
@@ -2390,14 +2436,21 @@ class Watchdog:
                 self._touch()
                 return
             except Exception as e:
-                if "not modified" not in str(e).lower():
-                    log.info("watchdog edit failed: %r", e)
-                # fall through to a fresh message
-        # New/changed status (or no longer the newest) -> a fresh message at the bottom.
-        self.count = 1
+                if "not modified" in str(e).lower():
+                    # Identical text already on the wire — the balloon is right as-is.
+                    # Falling through here would re-post the same status as a new message.
+                    self._touch()
+                    return
+                log.info("watchdog edit failed: %r", e)
+                # Fall through to a fresh message, KEEPING the accumulated ×N — a failed
+                # edit is a delivery hiccup, not a status change, and resetting the count
+                # would push out the idle thresholds the nudges/auto-end key on.
+        else:
+            # New/changed status (or no longer the newest) -> restart the ×N count.
+            self.count = 1
         self.body = body
         try:
-            m = await self.app.bot.send_message(chat, self._compose(body, 1))
+            m = await self.app.bot.send_message(chat, self._compose(body, self.count))
             self.msg_id = m.message_id
             self._touch()
         except Exception as e:
@@ -2470,7 +2523,7 @@ BOT_HELP = (
     "• bot stop — interrupt + reset the connection (drops background work); session resumes\n"
     "• bot drop — discard messages queued but not yet sent to Claude\n"
     "• bot kill — force-kill the Claude process (kill -9), then respawn\n"
-    "• bot lock — kill Claude AND lock the bridge (unlock at the machine)\n"
+    "• bot lock — PANIC: kill EVERY Claude session AND lock the bridge (unlock at the machine)\n"
     "• bot sleep — pause Telegram input (Claude keeps running); wake at the machine\n"
     "• bot effort [level] — show/set reasoning effort (low|medium|high|xhigh|max)\n"
     "• bot cwd [path] — show/set THIS bot's working directory (each bot is independent)\n"
@@ -2522,8 +2575,10 @@ def _model_label(ctrl) -> str:
     return f"default ({actual})" if actual else "default"
 
 
-async def _status_text() -> str:
-    cur = registry.current()
+async def _status_text(cur=None) -> str:
+    """Status for a session — the CURRENT one by default; self-config passes the issuing
+    bot so `cg-cmd status` from a background bot reports THAT bot, not the selected one."""
+    cur = cur or registry.current()
     ctrl = cur.controller
     busy = "working" if ctrl.busy else "idle"
     sid = ctrl.session_id
@@ -2531,7 +2586,8 @@ async def _status_text() -> str:
     sc = session_compute(cur)
     lines = []
     if registry.multiplexing():
-        lines.append(f"🤖 current bot: {cur.emoji} {cur.name} ({busy})")
+        role = "current bot" if cur is registry.current() else "bot"
+        lines.append(f"🤖 {role}: {cur.emoji} {cur.name} ({busy})")
     else:
         lines.append(f"🤖 Claude: {busy}")
     lines.append(f"🧠 model: {_model_label(ctrl)}")
@@ -2584,9 +2640,19 @@ def _tail_log(n: int) -> str:
     return text[-3500:]  # keep it within one Telegram message
 
 
+def _restart_mode() -> str:
+    """How `bot restart` restarts: 'exit' when the tray supervisor is watching (it sets
+    CLAUDEGRAM_SUPERVISED and respawns us — the proven path, unchanged), 'exec' when running
+    headless (./run.sh), where exiting would just stop the bridge for good."""
+    return "exit" if os.environ.get("CLAUDEGRAM_SUPERVISED") else "exec"
+
+
 async def _restart_bridge() -> None:
     await asyncio.sleep(1.0)  # let the reply flush
-    os._exit(0)  # the tray supervisor respawns us; the session resumes
+    if _restart_mode() == "exit":
+        os._exit(0)  # the tray supervisor respawns us; the session resumes
+    log.warning("restart: unsupervised (no tray) — re-exec'ing bot.py in place")
+    os.execv(sys.executable, [sys.executable, str(HERE / "bot.py")])
 
 
 def _sessions_overview() -> str:
@@ -2610,13 +2676,21 @@ def _sessions_overview() -> str:
     return "🗂 Sessions:\n" + body
 
 
-async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> bool:
+async def maybe_handle_bot_command(context, chat_id, reply_to, text: str, session=None) -> bool:
     """Returns True if the message was a 'bot' harness command (and handled it),
     so the caller does NOT forward it to Claude."""
     rest = parse_bot_command(text)
     if rest is None:
         return False
     bot = context.bot
+    # THE session accessor for every per-session command below — exactly one spelling on
+    # purpose (the old mix of the module-global `controller` and registry.current() is how a
+    # per-session bug hid in `bot lock`): `cur`/`ctrl` is the CURRENT session by default, or
+    # the session self-config passes so a bot's own cg-cmd targets ITSELF, not whichever bot
+    # the user has selected. Genuinely global commands (voice, nostall, sleep, lock, restart,
+    # select/end, logs, issues, harness, echo) don't touch them.
+    cur = session or registry.current()
+    ctrl = cur.controller
 
     async def reply(t):
         await bot.send_message(chat_id, t, reply_to_message_id=reply_to)
@@ -2656,15 +2730,15 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         raw = m.group(1).strip().strip(" .!?,;:")
         log.info("bot command: effort %r", raw)
         if not raw:
-            cur = controller.get_effort() or "default"
+            level_now = ctrl.get_effort() or "default"
             await reply(
-                f"⚙️ Claude effort: {cur}\n"
+                f"⚙️ Claude effort: {level_now}\n"
                 f"Levels: {', '.join(VALID_EFFORTS)}\n"
                 "Set with: bot effort <level>"
             )
         else:
             level = EFFORT_SYNONYMS.get(raw.lower(), raw.lower())
-            if await controller.set_effort(level):
+            if await ctrl.set_effort(level):
                 await reply(f"⚙️ Claude effort set to: {level} (applies going forward).")
             else:
                 await reply(
@@ -2678,16 +2752,16 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         raw = m.group(1).strip().strip(" .!?,;:")
         log.info("bot command: model %r", raw)
         if not raw:
-            await reply(f"🧠 Model: {_model_label(controller)}\n"
+            await reply(f"🧠 Model: {_model_label(ctrl)}\n"
                         "Set with: bot model <opus|sonnet|haiku|fable|default>")
         else:
             name = raw.lower()
             if name in MODEL_RESET:
-                await controller.set_model(None)
+                await ctrl.set_model(None)
                 await reply("🧠 Model → default (applies going forward).")
             elif name in VALID_MODELS or name.startswith("claude-"):
                 name = MODEL_ALIASES.get(name, name)
-                await controller.set_model(name)
+                await ctrl.set_model(name)
                 await reply(f"🧠 Model set to: {name} (applies going forward).")
             else:
                 await reply(f'🧠 Unknown model "{raw}". Try: opus, sonnet, haiku, fable, or default.')
@@ -2699,11 +2773,10 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         verb, target = m.group(1).lower(), m.group(2).strip().strip(" '\"")
         if verb == "pwd" or not target:
             hint = "" if verb == "pwd" else "\nSet with: bot cwd <path>"
-            await reply(f"📂 Working dir: {controller.get_cwd()}{hint}")
-        elif await controller.set_cwd(target):
-            cur = registry.current()
+            await reply(f"📂 Working dir: {ctrl.get_cwd()}{hint}")
+        elif await ctrl.set_cwd(target):
             who = f"{cur.emoji} {cur.name}: " if registry.multiplexing() else ""
-            await reply(f"📂 {who}Working dir → {controller.get_cwd()} — "
+            await reply(f"📂 {who}Working dir → {ctrl.get_cwd()} — "
                         "this bot's conversation moved here.")
         else:
             await reply(f"📂 Couldn't switch to: {target}")
@@ -2717,26 +2790,25 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
     if m:
         raw = m.group(1).strip().strip(" .!?,;:").lower()
         log.info("bot command: transcribe %r", raw)
-        cur_sess = registry.current()
-        who = f"{cur_sess.emoji} {cur_sess.name}: " if registry.multiplexing() else ""
-        cur = session_compute(cur_sess)
-        cur_name = _PRESET_BY_COMPUTE.get(cur, cur)
+        who = f"{cur.emoji} {cur.name}: " if registry.multiplexing() else ""
+        comp = session_compute(cur)
+        comp_name = _PRESET_BY_COMPUTE.get(comp, comp)
         menu = ("best — float32, most accurate (slowest)\n"
                 "good — int8_float32, ~2× faster, near-best\n"
                 "fast — int8, ~3-4× faster, slight accuracy loss")
         if not raw:
             await reply(
-                f"🎚 {who}Transcription quality: {cur_name} ({cur})\n{menu}\n"
+                f"🎚 {who}Transcription quality: {comp_name} ({comp})\n{menu}\n"
                 "Set with: bot transcribe <best|good|fast>"
             )
         elif raw in TRANSCRIBE_PRESETS:
-            cur_sess.compute = TRANSCRIBE_PRESETS[raw]
+            cur.compute = TRANSCRIBE_PRESETS[raw]
             await reply(
                 f"🎚 {who}Quality → {raw} ({TRANSCRIBE_PRESETS[raw]}) for this bot. "
                 "Applies to its next voice message."
             )
         elif raw in _PRESET_BY_COMPUTE:  # they typed the raw compute type itself
-            cur_sess.compute = raw
+            cur.compute = raw
             await reply(
                 f"🎚 {who}Quality → {_PRESET_BY_COMPUTE[raw]} ({raw}) for this bot. "
                 "Applies to its next voice message."
@@ -2793,7 +2865,7 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         if state:
             ensure_nostall_bot()
         elif NOSTALL_BOT in registry.sessions:
-            asyncio.create_task(end_session(NOSTALL_BOT))
+            _spawn(end_session(NOSTALL_BOT), name=f"end_session[{NOSTALL_BOT}]")
         log.info("bot command: nostall -> %s", "on" if state else "off")
         await reply(
             "🐕 Anti-stalling guard is ON — a bot that stops with nothing running gets reviewed "
@@ -2807,10 +2879,9 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
     # Cleared automatically the moment you send it anything. Doesn't interrupt a running turn —
     # it takes effect once the bot next goes idle (use `bot stop` to halt active work first).
     if re.match(r"^park\b", rest.strip(), re.IGNORECASE):
-        target = registry.current()
-        target.parked = True
-        log.info("bot command: park -> %s", target.name)
-        who = f"{target.emoji} {target.name}" if registry.multiplexing() else "Claude"
+        cur.parked = True
+        log.info("bot command: park -> %s", cur.name)
+        who = f"{cur.emoji} {cur.name}" if registry.multiplexing() else "Claude"
         await reply(f"🅿️ Parked {who} — end-state idle, no nudging and no anti-stall policing. "
                     "Send it anything to wake it up.")
         return True
@@ -2867,7 +2938,7 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
     # "bot drop" — discard messages queued but not yet sent to Claude. Does NOT touch a turn
     # already running (that's `bot stop`); only clears the CURRENT session's waiting batch.
     if re.match(r"^drop\b", rest.strip(), re.IGNORECASE):
-        dropped = drop_pending(registry.current())
+        dropped = drop_pending(cur)
         n = len(dropped)
         log.info("bot command: drop -> %d queued message(s)", n)
         if not n:
@@ -2898,13 +2969,12 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
     log.info("bot command: %r -> %s", rest, action)
 
     if action == "new":
-        await controller.reset()
+        await ctrl.reset()
         await reply("🆕 Fresh conversation (new session).")
     elif action == "interrupt":
         # Bare Esc/Ctrl-C: stop the current turn but keep the CLI connected — background shells
         # and session context survive (unlike stop(), which disconnects and drops bg work).
-        cur = registry.current()
-        interrupted = await cur.controller.interrupt_turn()
+        interrupted = await ctrl.interrupt_turn()
         ensure_worker(cur)           # mirror stop's dispatcher-revive safety
         cur.pending_event.set()
         badge = registry.badge(cur)
@@ -2914,14 +2984,13 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         else:
             await reply(badge + "⏸ Nothing to interrupt — Claude is idle.")
     elif action == "stop":
-        cur = registry.current()
-        await cur.controller.stop()  # interrupt + clean reset (no post-interrupt wedge)
+        await ctrl.stop()            # interrupt + clean reset (no post-interrupt wedge)
         ensure_worker(cur)           # revive the dispatcher if the interrupt killed it
         cur.pending_event.set()
         await reply("✋ Stopped — turn interrupted + connection reset (background work dropped); "
                     "session resumes on your next message.")
     elif action == "kill":
-        killed = await controller.kill()
+        killed = await ctrl.kill()
         if killed:
             await reply(
                 f"💀 Killed the Claude process (kill -9, pids {killed}). "
@@ -2930,11 +2999,23 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
         else:
             await reply("💀 No running Claude process to kill. (It respawns on your next message.)")
     elif action == "lock":
-        killed = await controller.kill()
+        # PANIC: under multiplexing "the" Claude is N of them — kill EVERY session's CLI
+        # (exactly like the intrusion hard-lock), then sweep any stray claude child no live
+        # controller tracks, then lock the bridge.
+        killed = []
+        for s in list(registry.sessions.values()):
+            try:
+                killed += await s.controller.kill()
+            except Exception:
+                log.exception("lock: kill failed for %s", s.name)
+        try:
+            killed += sigkill_claude_subtree()   # strays (leftovers of dead controllers)
+        except Exception:
+            log.exception("lock: stray-claude sweep failed")
         engage_block("manual lock via 'bot lock'")
         extra = f" (killed pids {killed})" if killed else ""
         await reply(
-            f"🔒 LOCKED{extra}. Claude killed and the bridge is locked. "
+            f"🔒 LOCKED{extra}. Every Claude session killed and the bridge is locked. "
             "Unblock it from the tray app on the machine."
         )
     elif action == "sleep":
@@ -2944,20 +3025,20 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str) -> boo
             "ignore Telegram until you press WAKE UP on the tray app at the machine."
         )
     elif action == "compact":
-        # Send a raw /compact (no guard prefix) to the CURRENT session and stream the outcome.
+        # Send a raw /compact (no guard prefix) to the session and stream the outcome.
         await dispatch_to_claude(
-            context, registry.current(), chat_id, reply_to, "/compact", "command",
+            context, cur, chat_id, reply_to, "/compact", "command",
             raw=True, header="🗜 Compacting context…",
         )
     elif action == "context":
-        await reply(_format_context(await controller.context_usage()))
+        await reply(_format_context(await ctrl.context_usage()))
     elif action == "restart":
         await reply("♻️ Restarting the bridge… (back in a few seconds, session resumes)")
         _spawn(_restart_bridge(), name="restart_bridge")
     elif action == "status":
-        await reply(await _status_text())
+        await reply(await _status_text(cur))
     elif action == "session":
-        await reply(f"🧵 session: {controller.session_id or 'new (none yet)'}")
+        await reply(f"🧵 session: {ctrl.session_id or 'new (none yet)'}")
     elif action == "help":
         await reply(BOT_HELP)
     elif action == "ping":
@@ -2996,6 +3077,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     log.info("Image from %s (%s): file_id=%s caption=%r",
              user.full_name if user else "?", user.id if user else "?",
              media.file_id, caption)
+    # A photo-message rendition is always small, but an image sent AS A FILE (Document.IMAGE)
+    # can exceed Telegram's 20 MB bot-download cap — reject it up front with guidance, like
+    # handle_document, instead of failing deep inside get_file with a generic error.
+    size = int(getattr(media, "file_size", 0) or 0)
+    if size > TG_BOT_DL_LIMIT:
+        await msg.reply_text(
+            f"⚠️ That image is ~{size // (1024 * 1024)} MB — I can only receive files up to "
+            f"{TG_BOT_DL_LIMIT // (1024 * 1024)} MB. Please send a smaller version (or send it "
+            "as a compressed photo instead of a file)."
+        )
+        return
     if is_blocked():
         await msg.reply_text(BLOCKED_MSG)
         return
@@ -3025,7 +3117,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     target = registry.current()
     set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
     target.parked = False            # ...and un-parks it
-    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "image", False)
+    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "image")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3100,7 +3192,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     target = registry.current()
     set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
     target.parked = False            # ...and un-parks it
-    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "document", False)
+    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "document")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3126,7 +3218,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     target = registry.current()
     set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
     target.parked = False            # ...and un-parks it
-    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "text", False)
+    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "text")
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3220,16 +3312,35 @@ SELFCONFIG_ALLOWED = {
 
 async def _run_selfconfig(bot, chat, cmd: str) -> None:
     """Run ONE self-config command (from the driven Claude) through the ordinary
-    bot-command handler, gated to the safe subset and attributed visibly to the bot."""
+    bot-command handler, gated to the safe subset and attributed visibly to the bot.
+
+    A drop may lead with `@<botname> ` — the ISSUING bot's identity, baked into its own
+    preamble (`cg-cmd --as <name>`). The command then acts on THAT session, so "manage
+    yourself" is literal: a background bot's `cg-cmd park` parks itself, never whichever
+    session the user currently has selected. A bare drop (legacy/manual) still targets the
+    current session; an identity that names no LIVE session is refused rather than let a
+    gone bot's command land on somebody else."""
+    target = None
+    m = re.match(r"^@(\S+)\s+(.*)$", cmd, re.DOTALL)
+    if m:
+        name, cmd = m.group(1).strip().lower(), m.group(2).strip()
+        target = registry.get(name)
+        if target is None:
+            log.warning("SELFCONFIG from unknown/ended session %r: %s", name, _oneline(cmd, 120))
+            await bot.send_message(
+                chat, f"🔧 self-config: ignored `{cmd}` from '{name}' — no such live session.")
+            return
     verb = cmd.split(None, 1)[0].lower() if cmd else ""
     if verb not in SELFCONFIG_ALLOWED:
         log.warning("SELFCONFIG refused: %s", _oneline(cmd, 120))
         await bot.send_message(chat, f"🔧 self-config: refused `{cmd}` — not a settable config.")
         return
-    log.info("SELFCONFIG <- claude: %s", _oneline(cmd, 200))
-    await bot.send_message(chat, f"🔧 self-config (by the bot): `{cmd}`")
+    who = f"by {target.emoji} {target.name}" if target is not None else "by the bot"
+    log.info("SELFCONFIG <- claude (%s): %s", who, _oneline(cmd, 200))
+    await bot.send_message(chat, f"🔧 self-config ({who}): `{cmd}`")
     try:
-        await maybe_handle_bot_command(types.SimpleNamespace(bot=bot), chat, None, f"bot {cmd}")
+        await maybe_handle_bot_command(types.SimpleNamespace(bot=bot), chat, None,
+                                       f"bot {cmd}", session=target)
     except Exception:
         log.exception("self-config command failed: %s", cmd)
         await bot.send_message(chat, "🔧 self-config: that command errored.")
@@ -3333,7 +3444,7 @@ def _drain_wake_inbox(chat) -> list[str]:
         except OSError:
             pass
         if text:
-            enqueue_for_claude(registry.current(), chat, None, text, "wake", False)
+            enqueue_for_claude(registry.current(), chat, None, text, "wake")
             log.info("wake -> %s: %s", registry.current().name, _oneline(text, 120))
             injected.append(text)
     return injected
@@ -3488,9 +3599,10 @@ def main() -> None:
     # allowlist is mandatory — we refuse to start open (no fail-open for code exec).
     if not ALLOWED_USER_IDS:
         raise SystemExit(
-            "Refusing to start: ALLOWED_USER_IDS is empty, but this build drives a "
-            "Claude Code instance that can run commands. Set ALLOWED_USER_IDS in .env "
-            "to your Telegram user id to lock the bridge to your account."
+            "Refusing to start: no allowed Telegram user ids, but this build drives a "
+            "Claude Code instance that can run commands (no fail-open). Put your Telegram "
+            'user id in instance.json next to this script: {"allowed_user_ids": [<your id>]} '
+            "— the FIRST id is the master (gets notifications), any others are guests."
         )
 
     removed = force_subscription_env()

@@ -90,7 +90,9 @@ capability" — realized as a **bot-API proxy**, not a user account.
 
 1. **`api_id` + `api_hash`** — free, one pair per machine, from
    <https://my.telegram.org> → "API development tools". These are **secrets**:
-   keep them out of git (use `.env` / environment), same as the bot token.
+   keep them out of git, in gitignored FILES like the rest of the config
+   (`instance.json` fields or a dedicated secret file à la `token.txt` — never
+   the environment, per the repo's config doctrine).
 2. **The `telegram-bot-api` binary** — build from source (C++/CMake + TDLib) or
    use a prebuilt/Docker image (e.g. `aiogram/telegram-bot-api`).
 3. **A place for the daemon to run** as a long-lived service (systemd system or
@@ -177,8 +179,8 @@ large-attachment support isn't installed.
 - `bot.py` `handle_document` — same local-path handling for PDFs/office files.
 - `bot.py` outbound media / `cg-send` path (`media-outbox`) — send local paths;
   the 50 MB cap no longer applies.
-- `.env.example` / `install-manual.md` — document the new env vars and the
-  install step.
+- `INSTALL_MANUAL.md` — document the new `instance.json` fields / secret files
+  and the install step.
 
 ### Testing plan (do this before rollout)
 
@@ -200,8 +202,8 @@ the other instances stay on cloud, so a mistake can't take everyone down.
 - **Token migration is stateful:** a token is bound to one server at a time;
   `logOut` is required to switch. Don't migrate a token you can't afford to take
   offline briefly.
-- **Secrets:** `api_id`/`api_hash` and the token must never be committed. `.env`
-  only.
+- **Secrets:** `api_id`/`api_hash` and the token must never be committed —
+  gitignored secret files only (never env).
 - **Disk:** the daemon stores downloaded files under `--dir`. Add retention /
   cleanup so it doesn't grow unbounded (mirror the existing temp-sweep logic).
 - **Networking:** bind the daemon to localhost; never expose the API port.

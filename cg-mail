@@ -52,13 +52,16 @@ except Exception: pass' "$INSTANCE_JSON" 2>/dev/null || true)"
 from="${from:-onboarding@resend.dev}"
 
 # Build the JSON payload (python: safe escaping + base64 attachments). Write it to a temp
-# file so a large attachment doesn't hit argv limits and the body isn't visible in `ps`.
+# file so a large attachment doesn't hit argv limits. The BODY goes to the builder via
+# stdin (argv is world-readable in `ps`; recipient/subject remain in argv — they're also
+# visible on the wire envelope anyway).
 payload_file="$(mktemp)"; chmod 600 "$payload_file"
 trap 'rm -f "$payload_file"' EXIT
-python3 -c '
+printf '%s' "$body" | python3 -c '
 import json, sys, base64, os
-frm, to, subj, body, outfile = sys.argv[1:6]
-atts = sys.argv[6:]
+frm, to, subj, outfile = sys.argv[1:5]
+atts = sys.argv[5:]
+body = sys.stdin.read()
 tos = [t.strip() for t in to.split(",") if t.strip()]
 p = {"from": frm, "to": tos, "subject": subj, "text": body}
 a = []
@@ -69,7 +72,7 @@ for path in atts:
 if a:
     p["attachments"] = a
 open(outfile, "w").write(json.dumps(p))
-' "$from" "$to" "$subject" "$body" "$payload_file" "${attachments[@]}"
+' "$from" "$to" "$subject" "$payload_file" "${attachments[@]}"
 
 # Pass the API key via a curl config on stdin so it never appears in `ps`/argv.
 resp="$(printf 'header = "Authorization: Bearer %s"\n' "$key" | \

@@ -63,8 +63,9 @@ Ask for, and help them obtain:
    auto-created). Each copy is self-contained; incoming images/documents are kept here too.
 4. **Transcription** — default `large-v3` / `float32` (max accuracy, CPU-heavy); quality is
    also a live toggle, `bot transcribe best|good|fast` (float32 / int8_float32 ~2× / int8
-   ~3-4×), no restart. Offer a forced `WHISPER_LANGUAGE` if they speak one language. Decoding
-   runs in a killable subprocess, so a bad clip can't freeze the bridge.
+   ~3-4×), no restart. Offer a forced language if they speak one (instance.json:
+   `"whisper": {"language": "pt"}`). Decoding runs in a killable subprocess, so a bad clip
+   can't freeze the bridge.
 5. **Autostart at login?** — yes/no.
 
 ---
@@ -75,7 +76,8 @@ Ask for, and help them obtain:
 echo 'PASTE-BOT-TOKEN' > token.txt && chmod 600 token.txt   # the token: its own secret file
 # All other config is in instance.json (a FILE, never env). Put the allowlist there:
 #   {"allowed_user_ids": [<their numeric id>], "name":"...", "glyph":"...", "color":"#..."}
-# First id = MASTER. Absent/empty = the bot answers anyone. (whisper/default_bot optional.)
+# First id = MASTER. Absent/empty = the bridge REFUSES TO START (no fail-open — it drives a
+# Claude that runs commands). (whisper/default_bot optional.)
 
 # OPTIONAL — email (Resend). Only if this machine should SEND email; skip to leave it off.
 #   1) Get an API key at https://resend.com; to email ANYONE (not just yourself), verify your
@@ -87,8 +89,8 @@ echo 'PASTE-RESEND-API-KEY' > resend.key && chmod 600 resend.key
 # ...or just ask the bot in chat: "email this file to <typed address>" — it uses cg-mail itself.
 ```
 Confirm `.gitignore` already excludes `token.txt`, `resend.key`, `instance.json`,
-`session.id`, `effort.level`, `cwd.path`, `compute.type`, `voice.mode`, `BLOCKED.flag`,
-`SLEEP.flag`, `INTRUSION_OFF.flag`, logs, and `.venv/`.
+`session.id`, `cwd.path`, `voice.mode`, `BLOCKED.flag`, `SLEEP.flag`,
+`INTRUSION_OFF.flag`, logs, and `.venv/`.
 
 ---
 
@@ -121,8 +123,12 @@ If the user wants it on every login:
    `instance.json` `allowed_user_ids`). If it's empty or wrong, fix `instance.json`.
 2. **Subscription, not API**: confirm no `ANTHROPIC_API_KEY` in the environment
    (`env | grep -i anthropic` → empty). The bridge also strips it at boot.
-3. **Private**: from a *different* Telegram account (or ask the user), message the bot —
-   it must reply "🚫 This is a private bot" and do nothing.
+3. **Private (intrusion tripwire)**: from a *different* Telegram account (or ask the user),
+   message the bot. With the 🛡 Intrusion Lock ON (the default) the stranger gets **no reply
+   at all**, the bridge **hard-locks** (Claude killed, `BLOCKED.flag`), and the master gets a
+   "🚨 LOCKED — someone who isn't you tried to use the bot" alert. That IS the pass result —
+   then unlock at the tray (**Unblock**). If the tripwire was toggled OFF at the tray, the
+   stranger is silently ignored and only logged.
 4. **Benign works**: the user sends a normal request → it transcribes, echoes, streams
    an answer ending in `[[END]]`.
 5. **Firewall locks**: the user sends a genuinely malicious-sounding request (e.g.
@@ -140,9 +146,10 @@ If the user wants it on every login:
 Tell the user:
 - **One persistent session**, resumed across reboots; only `bot new` / `bot clear` /
   `bot compact` reset/manage it.
-- **`bot` commands** (voice or text, first word `bot`): new, clear, compact, stop, kill,
-  lock, sleep, effort, cwd, transcribe, voice, drop, issues, context, logs, restart, echo,
-  harness, status, session, help.
+- **`bot` commands** (voice or text, first word `bot`): new, clear, compact, interrupt,
+  stop, kill, lock (panic: kills EVERY session + locks), sleep, effort, model, cwd,
+  transcribe, voice, nostall, park, drop, issues, context, logs, restart, echo, harness,
+  status, session, sessions, select, end, help.
 - **Sleep**: `bot sleep` pauses ALL Telegram input (Claude keeps running); the only way
   back is the **WAKE UP** button on the tray. Distinct from lock (security) and kill.
 - **Voiceback**: `bot voice on` → every reply comes back as spoken audio until `bot voice

@@ -39,10 +39,10 @@ async def test_runtime_transcribe_is_per_bot_and_not_persisted(tmp_path=None):
 
 
 async def test_runtime_effort_does_not_persist():
-    c = bot.ClaudeController("/tmp/cg-effort-test", "/tmp/cg-effort-test.id", None, None)
+    c = bot.ClaudeController("/tmp/cg-effort-test", "/tmp/cg-effort-test.id")
     assert c.effort == "high"                            # code default at spawn
     assert await c.set_effort("low")
     assert c.effort == "low"                             # in-memory change
     # a fresh controller (== a restart) is back to the default, not "low"
-    c2 = bot.ClaudeController("/tmp/cg-effort-test", "/tmp/cg-effort-test.id", None, None)
+    c2 = bot.ClaudeController("/tmp/cg-effort-test", "/tmp/cg-effort-test.id")
     assert c2.effort == "high"

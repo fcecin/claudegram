@@ -62,3 +62,33 @@ async def test_error_result_reports_crash_not_answer():
     await bot.dispatch_to_claude(_ctx(fb), sess, 1, None, "do a thing", "text")
     assert any("crashed" in s.lower() for s in fb.sent)
     assert bot.is_blocked() is False                           # a crash is NOT a lock
+
+
+async def test_stuck_release_reports_stuck_not_done():
+    # ask()'s silence net released the turn (no result). The old path fell through to
+    # finalize() and posted "✅ Done · ? turns · 0s" — a fake success. It must instead free
+    # the prompt and say the turn went silent.
+    fb = FakeBot()
+    sess = make_fake_session("claude", script=[stream_text("partial answer, then silence")])
+    sess.controller._stuck_release = True     # as if the 900s net fired
+    await bot.dispatch_to_claude(_ctx(fb), sess, 1, None, "hi", "text")
+    allmsgs = fb.sent + fb.edited
+    assert not any(s.startswith("✅ Done") for s in fb.sent), fb.sent   # never a fake Done
+    assert "[[END]]" in fb.sent                                        # prompt still freed
+    assert any("silent" in s.lower() or "stuck" in s.lower() for s in allmsgs), allmsgs
+
+
+async def test_spontaneous_stray_result_is_ignored():
+    # A stray ResultMessage with no open segment (e.g. a late turn-end after a stuck
+    # release) must not open a board just to slam it shut ("picked back up… ✅ Done").
+    saved = bot.ALLOWED_USER_IDS
+    bot.ALLOWED_USER_IDS = [123]
+    try:
+        app = FakeApp()
+        sess = make_fake_session("claude")
+        relay = bot.SpontaneousRelay(app, sess)
+        sess.controller.set_spontaneous_handler(relay.on_message)
+        await sess.controller.push_spontaneous([result_msg()])
+        assert app.bot.sent == [], app.bot.sent
+    finally:
+        bot.ALLOWED_USER_IDS = saved

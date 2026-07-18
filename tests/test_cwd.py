@@ -24,7 +24,7 @@ async def test_cwd_relative_paths_resolve_absolute():
     import shutil
     root = "/tmp/cg-cwd-test"
     shutil.rmtree(root, ignore_errors=True)
-    c = bot.ClaudeController(f"{root}/a/b", f"{root}/s.id", None, None)
+    c = bot.ClaudeController(f"{root}/a/b", f"{root}/s.id")
     try:
         assert c.get_cwd() == f"{root}/a/b"
         assert await c.set_cwd("..")

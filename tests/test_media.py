@@ -62,3 +62,30 @@ async def test_voiceback_opt_out_config():
         assert fb.voices == 0
     finally:
         bot.synthesize_voice = orig
+
+
+async def test_oversized_image_document_rejected_up_front():
+    # An image sent AS A FILE can exceed Telegram's 20 MB bot-download cap. It must be
+    # rejected with guidance BEFORE get_file (which would fail with a generic error) —
+    # the same pre-check handle_document and handle_audio already do.
+    replies = []
+
+    async def reply_text(text, **kw):
+        replies.append(text)
+
+    doc = types.SimpleNamespace(mime_type="image/png", file_size=bot.TG_BOT_DL_LIMIT + 1,
+                                file_id="f-big", file_name="big.png")
+    msg = types.SimpleNamespace(photo=[], document=doc, caption=None,
+                                from_user=types.SimpleNamespace(id=123, full_name="T"),
+                                chat_id=1, message_id=9, reply_text=reply_text)
+    upd = types.SimpleNamespace(message=msg,
+                                effective_user=types.SimpleNamespace(id=123, full_name="T"))
+    ctx = types.SimpleNamespace(bot=FakeBot())   # FakeBot has no get_file: a download attempt = loud failure
+    saved = bot.ALLOWED_USER_IDS
+    bot.ALLOWED_USER_IDS = [123]
+    try:
+        await bot.handle_photo(upd, ctx)
+    finally:
+        bot.ALLOWED_USER_IDS = saved
+    assert replies and "MB" in replies[0], replies    # clear size guidance, not a generic error
+    assert bot.registry.current().pending == []       # and nothing was enqueued for Claude

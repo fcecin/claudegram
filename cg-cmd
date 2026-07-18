@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
 # Drop a claudegram self-config command into the bridge's command inbox.
-# Usage: cg-cmd <command>     e.g.  cg-cmd effort high   |   cg-cmd voice on
+# Usage: cg-cmd [--as <botname>] <command>
+#   e.g.  cg-cmd effort high   |   cg-cmd voice on   |   cg-cmd --as gil park
 # The bridge runs it through the ordinary bot-command handler (safe config subset only).
+# --as <botname> is the ISSUING bot's identity (each bot's preamble bakes its own name in):
+# the command then acts on THAT session, so a background bot managing "itself" can never
+# reconfigure whichever bot the user currently has selected. Without --as, the command
+# targets the current session (legacy/manual use).
 set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 INBOX="$HERE/cmd-inbox"
 mkdir -p "$INBOX"
+AS=""
+if [ "${1:-}" = "--as" ]; then
+  AS="${2:-}"
+  [ -n "$AS" ] || { echo "cg-cmd: --as needs a bot name" >&2; exit 1; }
+  shift 2
+fi
 cmd="$*"
 if [ -z "$cmd" ]; then
-  echo "usage: cg-cmd <command>   (e.g. cg-cmd effort high)" >&2
+  echo "usage: cg-cmd [--as <botname>] <command>   (e.g. cg-cmd effort high)" >&2
   exit 1
 fi
+[ -n "$AS" ] && cmd="@$AS $cmd"   # identity prefix, parsed by the bridge's _run_selfconfig
 stamp="$(date +%s%N)"
 tmp="$INBOX/.$stamp.tmp"
 printf '%s' "$cmd" > "$tmp"

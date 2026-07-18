@@ -72,3 +72,11 @@ async def test_no_more_work_detected_mid_reply():
     sess, r = _renderer(False, "Deployed and verified on cg2/cg3. NO MORE WORK — standing down.")
     await r.finalize()
     assert sess.no_more_work is True
+
+
+async def test_no_more_work_is_case_sensitive():
+    # The nudge demands the exact UPPERCASE words. Ordinary prose that merely mentions
+    # "no more work" (the old .upper() scan tripped on this) must NOT silence the nudger.
+    sess, r = _renderer(False, "There is no more work needed on the parser; it's solid.")
+    await r.finalize()
+    assert sess.no_more_work is False

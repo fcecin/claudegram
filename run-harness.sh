@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch the claudegram HARNESS: a VISIBLE terminal running a Claude Code instance,
-# pre-prompted (harness-charter.md) to operate this claudegram install and serve the
+# pre-prompted (HARNESS_CHARTER.md) to operate this claudegram install and serve the
 # `bot harness` inbox from your phone.
 #
 # By design this is standalone and UNSUPERVISED — it's just "a Claude that understands the
@@ -15,12 +15,12 @@ if ! command -v claude >/dev/null 2>&1; then
   echo "claude CLI not found on PATH. Install/login Claude Code first." >&2
   exit 1
 fi
-if [ ! -f "$DIR/harness-charter.md" ]; then
-  echo "Missing $DIR/harness-charter.md" >&2
+if [ ! -f "$DIR/HARNESS_CHARTER.md" ]; then
+  echo "Missing $DIR/HARNESS_CHARTER.md" >&2
   exit 1
 fi
 
-KICK='You are the claudegram harness. Read ./harness-charter.md now and follow it exactly, then begin your inbox monitor loop.'
+KICK='You are the claudegram harness. Read ./HARNESS_CHARTER.md now and follow it exactly, then begin your inbox monitor loop.'
 # The command the terminal will run: cd into the install dir, then start an interactive,
 # autonomous Claude with the kickoff prompt (it reads the charter and starts its loop).
 CMD="cd \"$DIR\" && exec claude --dangerously-skip-permissions \"$KICK\""

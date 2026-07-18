@@ -39,7 +39,7 @@ def test_guard_stays_out_of_the_way_otherwise():
 
 def test_unforced_session_never_spawns_with_fable_default():
     with _ambient("fable"):
-        c = bot.ClaudeController("/tmp/cg-guard-test", "/tmp/cg-guard-test.id", None, None)
+        c = bot.ClaudeController("/tmp/cg-guard-test", "/tmp/cg-guard-test.id")
         assert c._build_options().model == FABLE_GUARD_FALLBACK
         # ...and the status label reports the effective default, not the ambient one
         assert bot.default_model() == FABLE_GUARD_FALLBACK
@@ -47,7 +47,7 @@ def test_unforced_session_never_spawns_with_fable_default():
 
 async def test_explicit_fable_passes_through_the_guard():
     with _ambient("fable"):
-        c = bot.ClaudeController("/tmp/cg-guard-test", "/tmp/cg-guard-test.id", None, None,
+        c = bot.ClaudeController("/tmp/cg-guard-test", "/tmp/cg-guard-test.id",
                                  model="claude-fable-5")
         assert c._build_options().model == "claude-fable-5"
         # reverting to default re-engages the guard

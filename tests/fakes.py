@@ -106,6 +106,8 @@ class FakeController:
         self.asked: list[str] = []
         self._spontaneous = None
         self._interrupted = False
+        self._stuck_release = False   # set by a test to simulate ask()'s stuck-turn release
+        self.kill_calls = 0           # how many times kill() ran (e.g. `bot lock` kills ALL)
         self._scripts = list(scripts) if scripts is not None else None
         self._script = list(script) if script is not None else []
 
@@ -147,7 +149,13 @@ class FakeController:
         self._interrupted = False
         return was
 
+    def consume_stuck_flag(self) -> bool:
+        was = self._stuck_release
+        self._stuck_release = False
+        return was
+
     async def kill(self):
+        self.kill_calls += 1
         return []
 
     async def stop(self):

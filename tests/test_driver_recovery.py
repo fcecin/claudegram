@@ -137,3 +137,30 @@ async def test_reader_death_does_not_clobber_a_reconnected_client():
     c._client = _SwappingDeadClient()           # this is what _read_loop captures as `client`
     await c._read_loop()
     assert c._client is fresh                    # the live client is preserved (identity guard)
+
+
+# --- 3. stuck-turn release is flagged, not silent --------------------------------
+
+async def test_ask_stuck_release_sets_consumable_flag():
+    # When the silence net fires, ask() must FLAG the release so the dispatch can report
+    # it honestly (the old silent break let the turn render as "✅ Done").
+    c = _bare_controller()
+    c._lock = asyncio.Lock()
+    c._on_system = None
+    c._user_sink = None
+    c._interrupted = False
+    c._stuck_release = False
+
+    class _SilentClient:
+        async def query(self, prompt):
+            pass                                     # accepts the prompt, then says nothing
+
+    c._client = _SilentClient()
+    old_secs, old_poll = claude_driver.STUCK_SECS, claude_driver.STUCK_POLL_SECS
+    claude_driver.STUCK_SECS, claude_driver.STUCK_POLL_SECS = 0.05, 0.01
+    try:
+        await c.ask("hello", on_event=None)          # returns via the stuck release
+    finally:
+        claude_driver.STUCK_SECS, claude_driver.STUCK_POLL_SECS = old_secs, old_poll
+    assert c.consume_stuck_flag() is True
+    assert c.consume_stuck_flag() is False           # self-clearing, like the interrupt flag

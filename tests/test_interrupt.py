@@ -159,3 +159,16 @@ async def test_interrupted_turn_closes_cleanly_not_as_a_crash():
     assert not any("crash" in s.lower() for s in allmsgs), allmsgs    # NOT reported as a crash
     assert "[[END]]" in fb.sent                                        # prompt freed
     assert any("interrupted" in s.lower() for s in allmsgs), allmsgs   # closed as interrupted
+
+
+async def test_interrupts_pending_turn_before_init():
+    # The blind window: query() sent, but the CLI hasn't emitted the init message yet —
+    # in_segment is still False while a user turn IS in flight (_awaiting_user_segment).
+    # The old in_segment-only check answered "Nothing to interrupt" here.
+    c = _controller(in_segment=False)
+    c._awaiting_user_segment = True
+    client = _CleanClient(c)
+    c._client = client
+    ok = await c.interrupt_turn(settle=0.5)
+    assert ok is True                         # the pending turn IS interruptible
+    assert client.interrupted is True         # interrupt() actually reached the CLI

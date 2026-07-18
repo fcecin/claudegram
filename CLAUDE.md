@@ -10,7 +10,7 @@ install-local, gitignored `work/`.)
 > Claude extends itself on request — so the optional **harness** (an external Claude that
 > watches the owner's `bot harness` inbox and operates the bridge) is *not* required. Don't
 > push it. If the user asks for a harness, the role is just this repo's knowledge — read
-> [`harness-charter.md`](harness-charter.md) and run the `cg-inbox --wait → cg-notify ack → act`
+> [`HARNESS_CHARTER.md`](HARNESS_CHARTER.md) and run the `cg-inbox --wait → cg-notify ack → act`
 > loop, obeying its security rules. Otherwise carry on as a normal dev session.
 
 ## What it is
@@ -72,9 +72,11 @@ multiplexing broke — see `tests/test_driver_recovery.py`):
   every NEW message (edits don't count). **3-state idle handling:** `×IDLE_SHELLS_NUDGE_AT`
   (30) idle+shells ticks → `enqueue_for_claude(IDLE_SHELLS_NUDGE)` (continue / check stuck
   shells / clean up); `×IDLE_NO_SHELLS_NUDGE_AT` (30) idle+**no**-shells ticks →
-  `IDLE_NO_SHELLS_NUDGE` ("continue, or reply starting with `NO MORE WORK`"); if Claude's reply
-  leads with `NO_MORE_WORK_MARKER` (detected in `SegmentRenderer.finalize` → `set_no_more_work`,
-  cleared on the next user message) → **IDLE_DONE** (one-shot terminal notice, no more nudging).
+  `IDLE_NO_SHELLS_NUDGE` ("continue, or include `NO MORE WORK` anywhere in your reply"); if
+  Claude's reply CONTAINS `NO_MORE_WORK_MARKER` — case-SENSITIVE substring, anywhere (bots bury
+  it mid-paragraph; lowercase prose like "no more work needed" can't trip it) — detected in
+  `SegmentRenderer.finalize` → `set_no_more_work`, cleared on the next user message →
+  **IDLE_DONE** (one-shot terminal notice, no more nudging).
   With the **anti-stall guard** on (`bot nostall`), the guard OWNS the idle+no-shells intervention
   instead of the canned nudge (see *Anti-stall guard*). **`bot park`** forces a session into terminal
   idle — no nudging AND no anti-stall policing — cleared on the next user message (`session.parked`).
@@ -131,7 +133,7 @@ a `bot` command**, so it can't be disabled remotely over Telegram (like physical
 ## Multi-session multiplexing (ONE Telegram bot, N concurrent sessions)
 One bot can drive several independent Claude sessions in the same channel — an alternative to the
 single default session. `SessionRegistry`/`Session` give each its own `ClaudeController` (own
-`session.<name>.id`/`cwd`/`effort` files; the DEFAULT `claude` reuses the original `session.id`),
+`session.<name>.id`/`cwd` files; the DEFAULT `claude` reuses the original `session.id`),
 its own dispatch queue+worker, watchdog, and spontaneous relay — so sessions run **concurrently**.
 - **Roster is filesystem-driven (no hardcoded palette):** the bot set is scanned from `bots/*/` on
   boot (`discover_bots`). Each bot's DIRECTORY is its definition — its icon, aliases, model, effort,
@@ -188,10 +190,14 @@ its `var/`:
 ## Message batching
 Handlers don't call `dispatch_to_claude` directly — they `enqueue_for_claude(session, …)`. A
 per-session `session_worker` (started via `_activate_session` in on_startup / on `bot select`)
-drains that session's queue after a `BATCH_DEBOUNCE` window and sends the WHOLE burst as ONE
-combined prompt (`\n\n`-joined). voiceback/source are OR'd across the batch. This also serializes
-that session's user turns (one at a time); messages arriving mid-turn batch into the next. `bot
-compact` still dispatches directly to the current session (serialized by the controller lock).
+drains that session's queue after a `BATCH_DEBOUNCE` window and sends the burst as ONE combined
+prompt (`\n\n`-joined) — but only ONE CHAT's messages per drain: the queue can hold the master's
+and a guest's messages (debounce window, or anything queued during a long turn), and merging
+across chats would fuse two people's prompts AND deliver the answer into the last sender's chat.
+The remainder re-arms and drains next. source is OR'd across the batch; voiceback is the global
+toggle read at dispatch. This also serializes that session's user turns (one at a time); messages
+arriving mid-turn batch into the next. `bot compact` still dispatches directly to the current
+session (serialized by the controller lock).
 
 **Dispatcher robustness (hard-won):** the worker can wedge/vanish after `bot stop`
 (interrupt) — py-spy showed the loop healthy but the `dispatch_worker` task gone. Defenses:
@@ -209,14 +215,20 @@ via the USR1 dump + the "dispatch_worker got CancelledError" log.
 - **machine → phone (files)**: drop any file in `media-outbox/` → `media_outbox_loop` sends
   it to the owner chat (photo if Telegram accepts it, else document; optional
   `<name>.caption` sidecar, paired via `with_suffix(".caption")`). Helper:
-  `./cg-send <file> [caption]` — taught to every bot via `SELFCONFIG_PREAMBLE`, so
+  `./cg-send <file> [caption]` — taught to every bot via `selfconfig_preamble()`, so
   "make a PDF and send it to me" works on any bot (nyx keeps its own `tools/send`).
+- **bot → bridge (self-config)**: `./cg-cmd [--as <bot>] <cmd>` drops into `cmd-inbox/`;
+  `cmd_inbox_loop` runs it through the ordinary bot-command handler, gated to
+  `SELFCONFIG_ALLOWED`. Each bot's preamble bakes in its OWN `--as <name>`, and
+  `_run_selfconfig` routes the command to THAT session — so a background bot's "park myself" /
+  "model haiku" configures itself, never whichever bot the user has selected. A drop naming a
+  non-live session is refused; a bare drop (no `--as`) targets the current session.
 - **machine → world (email, optional)**: `./cg-mail [-a FILE]... <to> <subject> [body]` sends via
   Resend **iff** a `resend.key` file exists (sender = `instance.json` `resend_from`; `<to>` may be
-  comma-separated; `-a` attaches a base64'd file). Taught to the bot via `EMAIL_PREAMBLE`, which
-  `build_prompt` adds to the prompt **only when the key exists**, so "email this to X" works on any
-  bot (recipient used exactly as typed). Absent the key, email is off. Direct API send — not
-  routed through Telegram.
+  comma-separated; `-a` attaches a base64'd file). Taught to the bot inside the merged
+  `selfconfig_preamble()` block, which includes the email line **only when the key exists**, so
+  "email this to X" works on any bot (recipient used exactly as typed). Absent the key, email is
+  off. Direct API send — not routed through Telegram.
 - **phone → machine/AI**: `bot harness <msg>` / `bot h <msg>` writes to `inbox/`. Helper:
   `./cg-inbox` (drain), `--peek`, or `--wait` (block until one; loop primitive).
 
@@ -230,14 +242,14 @@ the firewall lock) and doesn't kill anything (unlike `bot kill`).
 ## Harness (external operator — OPTIONAL/dispensable)
 The bridge is self-sufficient, so the harness is **optional** (the owner may run without one;
 don't assume there is one). `run-harness.sh` opens a visible terminal running a Claude Code
-instance pre-prompted by `harness-charter.md` to operate/improve claudegram and serve the
+instance pre-prompted by `HARNESS_CHARTER.md` to operate/improve claudegram and serve the
 `bot harness` inbox
 (loop: `cg-inbox --wait` → `cg-notify` ack → act → repeat). It is **decoupled**: `bot.py`
 has no knowledge of it; it's just an external Claude that understands this directory and
 talks through the `outbox/`+`inbox/` files. Not autostarted, unsupervised (closing it
 stops it; inbox accumulates harmlessly). Charter rules: bypass + confirm-before-destructive,
 never weaken the firewall/allowlist/hard-lock, one harness at a time. If you're reading this
-as the harness, follow `harness-charter.md`.
+as the harness, follow `HARNESS_CHARTER.md`.
 
 ## Firewall
 Lean guard preamble per prompt; a genuine malicious request makes Claude reply leading
@@ -245,6 +257,13 @@ with `HACKING ATTEMPT BLOCKED` + reason → bridge writes `BLOCKED.flag` (hard l
 cleared at the tray. **Keep the guard small** (no prompt bloat). False positives go to
 `HACKING_REGRESSIONS.md` (read on demand, not injected). Allowlist is the real access
 control; subscription is forced (`force_subscription_env` strips `ANTHROPIC_API_KEY`).
+**Known caveat — forwarded content is a prompt-injection surface**: every prompt teaches the
+bot `cg-send`/`cg-cmd` (and `cg-mail` when enabled) and it runs with `bypassPermissions`, so
+a forwarded document/voice note containing instructions ("email X to …") is mediated only by
+the guard — which targets hacking attempts, not instruction-following exfiltration. The
+design assumes input is owner-intended; README's *Security model & caveats* states this for
+users. The hard lock gates TELEGRAM input only — wake/cmd inboxes stay open by design
+(local trust boundary).
 
 ## Multiple installs (N bot processes, N trays) — the OTHER scaling axis
 Orthogonal to *Multi-session multiplexing* (one bot process, N Claude sessions): you can also
@@ -283,6 +302,9 @@ covered by `test_instance`) is the identity behind it; `gui.py` wraps it in Qt:
   child**: find its PID (`ps -eo pid,cmd | grep '[/]claudegram/bot.py'`) and `kill <pid>`; the
   tray supervisor respawns it and the session resumes (`session.id`). (`transcribe_worker.py` is
   re-read per spawn, so its changes apply on the next voice message even without a restart.)
+- `bot restart` self-detects its launch path: under the tray (`CLAUDEGRAM_SUPERVISED=1`, set by
+  gui.py) it exits and the supervisor respawns it — the proven path; headless (`./run.sh`) it
+  re-execs bot.py in place instead of exiting into nothing.
 - `gui.py` / `instance_id.py` change → **full tray restart**: kill the tray + bot child, then
   `./run-gui.sh`. It **self-backgrounds** (re-execs via `setsid`, survives terminal close) and
   gui.py is single-instance **per directory** (see *Multiple installs*). From a non-graphical

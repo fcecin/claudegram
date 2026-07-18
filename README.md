@@ -30,7 +30,7 @@ phone ──voice/text──▶  your bot  ──▶  transcribe (local) ──�
 Runs in your system tray, starts at login, locked to your Telegram account only.
 
 > **Installing this for someone?** If you are an AI assistant setting this up for a
-> user, follow [`install-manual.md`](install-manual.md) — it walks the secure
+> user, follow [`INSTALL_MANUAL.md`](INSTALL_MANUAL.md) — it walks the secure
 > install and lockdown step by step.
 
 ## Features
@@ -59,7 +59,8 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   No `resend.key` → the feature is simply off.
 - **Message batching**: fire several messages in a row and the bridge collapses the whole
   queue into **one** Claude turn (combined prompt) instead of answering each separately —
-  including anything you send while it's mid-turn (batched into the next one).
+  including anything you send while it's mid-turn (batched into the next one). Batches never
+  mix chats: with guests, each sender's burst is its own turn, answered in their own chat.
 - **Streaming answers**: the answer arrives as paragraph messages as Claude writes
   them, with a ~3 s coalescing window (adjacent paragraphs batch into one message;
   long answers still flow instead of dumping at the end). Clean paragraph breaks are
@@ -82,8 +83,8 @@ Runs in your system tray, starts at login, locked to your Telegram account only.
   After ~30 identical **idle + shells** ticks (`×30`, ~30 min), it **auto-nudges Claude**
   to continue, check for stuck shells, or clean them up — so a forgotten shell can't park
   the session forever. And after ~30 identical **idle + no-shells** ticks it **nudges Claude
-  to continue or to declare it's done**: if Claude replies starting with `NO MORE WORK` the
-  watchdog goes quiet until you send something again — so it can work autonomously through a
+  to continue or to declare it's done**: if Claude's reply includes the exact uppercase
+  words `NO MORE WORK` (anywhere in it) the watchdog goes quiet until you send something again — so it can work autonomously through a
   task list without babysitting, yet won't pester you once it's genuinely finished. (While a
   transcription is decoding, the watchdog freezes its counters — that's work, not idleness.)
 - **Reports its own background work**: when Claude finishes a turn with a background
@@ -143,7 +144,7 @@ itself and is **never sent to Claude**. Unknown ones reply
 | `bot compact` | compact the conversation (summarize to free context) |
 | `bot stop` | interrupt the current task (Esc/Ctrl-C — graceful) |
 | `bot kill` | `kill -9` the Claude process; it respawns (resuming the session) |
-| `bot lock` | `bot kill` **and** lock the bridge — unlock only at the machine |
+| `bot lock` | PANIC: kill **every** Claude session (plus any stray CLI child) **and** lock the bridge — unlock only at the machine |
 | `bot sleep` | pause **all Telegram input** (Claude keeps running); wake only at the machine |
 | `bot effort [level]` | show, or set, reasoning effort: `low\|medium\|high\|xhigh\|max` |
 | `bot cwd [path]` | show, or switch, Claude's working directory (the conversation **migrates** with you — same id) |
@@ -214,10 +215,10 @@ flips live with `bot transcribe good|fast` (no restart).
 | `cg-inbox` | read messages you sent via `bot harness` (`--peek` / `--wait`) | yes |
 | `cg-mail` | send email via [Resend](https://resend.com) — optional, needs `resend.key` (`cg-mail [-a FILE]... <to> <subject> [body]`) | yes |
 | `run-harness.sh` | open a visible terminal running a Claude "harness" that operates claudegram | yes |
-| `harness-charter.md` | the standing prompt that turns that Claude into the harness | yes |
+| `HARNESS_CHARTER.md` | the standing prompt that turns that Claude into the harness | yes |
 | `run-gui.sh` / `run.sh` | launchers (`run.sh` runs the bot without the tray) | yes |
 | `install-autostart.sh` / `uninstall-autostart.sh` | login autostart | yes |
-| `install-manual.md` | step-by-step secure install guide (for an AI assistant) | yes |
+| `INSTALL_MANUAL.md` | step-by-step secure install guide (for an AI assistant) | yes |
 | `CLAUDE.md` | dev notes for an AI working on this codebase | yes |
 | `HACKING_REGRESSIONS.md` | curated false positives the firewall must never block | yes |
 | `token.txt` | **the bot token** — a dedicated secret file (`chmod 600`) | no |
@@ -234,7 +235,7 @@ flips live with `bot transcribe good|fast` (no restart).
 > request. So the harness is **genuinely optional**; most installs never run one.
 
 `./run-harness.sh` opens a **visible terminal** running a Claude Code instance pre-prompted
-(`harness-charter.md`) to **operate and improve claudegram itself** and to serve your phone
+(`HARNESS_CHARTER.md`) to **operate and improve claudegram itself** and to serve your phone
 over the `[HARNESS]` channel: it loops on `cg-inbox --wait`, acks every `bot harness` message
 via `cg-notify`, and can investigate issues, deploy fixes, and answer meta-questions.
 
@@ -245,6 +246,32 @@ a harness runs again). Run only **one** at a time. Security posture: it inherits
 runs with autonomy but **confirms before destructive/security-affecting actions**, and **never
 weakens claudegram's own safety controls** (the hard-lock stays physical-unlock only) — and you
 can watch it the whole time, which is the point of the visible terminal.
+
+## Security model & caveats
+
+Beyond the warning at the top, three properties of the design are worth knowing explicitly:
+
+- **Forwarded content is a prompt-injection surface.** Every prompt teaches Claude the
+  delivery helpers (`cg-send`, self-config via `cg-cmd`, and — when a `resend.key` exists —
+  outbound email via `cg-mail`), and Claude runs with full autonomy. The bridge assumes
+  everything you send is something you *mean*: if you forward someone else's document, image,
+  or voice note, any instructions embedded in it ("email this file to …", "run this command")
+  reach Claude with your authority. The heuristic firewall targets *hacking attempts*, not
+  polite instruction-following, so it is not a reliable defense here. Treat forwarding
+  untrusted content to the bot like pasting it into a root shell: skim it first, or ask
+  Claude to summarize it *without acting on it*.
+- **The intrusion tripwire is a denial-of-service by design.** With the 🛡 Intrusion Lock on
+  (the default), *anyone* who discovers your bot's handle can hard-lock the bridge (killing
+  every session) just by messaging it. That is the intended paranoid tradeoff — an intruder
+  gets one silent probe and the machine locks until you physically unlock it — but it also
+  means a griefer can keep your bridge locked from afar. If that trade ever bites, the switch
+  on the tray turns the tripwire off (unauthorized users are then just ignored and logged).
+- **The local machine is inside the trust boundary.** Any process on the machine can inject
+  turns (`wake-inbox/`), send files to your phone (`media-outbox/`), or adjust safe-subset
+  settings (`cmd-inbox/`) — that's what makes cron heartbeats and bot self-management work.
+  The firewall's hard lock gates **Telegram input only**; these local channels stay open by
+  design. If the machine itself is compromised, the bridge is too — which is one more reason
+  it must be a dedicated, expendable box.
 
 ## Operating notes
 

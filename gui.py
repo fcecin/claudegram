@@ -444,6 +444,9 @@ class Supervisor(QMainWindow):
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUNBUFFERED", "1")  # don't buffer the bot's logs
+        # Tells `bot restart` a supervisor is watching: it may just exit (we respawn it).
+        # Headless (./run.sh) lacks this, so the bot re-execs itself instead of dying.
+        env.insert("CLAUDEGRAM_SUPERVISED", "1")
         self.proc.setProcessEnvironment(env)
         self.proc.readyReadStandardOutput.connect(self._on_output)
         self.proc.started.connect(lambda: self.set_status("running"))
