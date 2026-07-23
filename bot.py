@@ -190,10 +190,11 @@ SESSION_FILE = HERE / "session.id"   # persisted Claude session id (for resume)
 CWD_FILE = HERE / "cwd.path"         # persisted working directory
 LOG_PATH = HERE / "claudegram.log"   # bridge log (written by the tray supervisor)
 RESEND_KEY_FILE = HERE / "resend.key"  # presence => optional email feature enabled (see cg-mail)
-AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # transient voice files (decoded, then deleted)
+AUDIO_TMP = Path(tempfile.gettempdir()) / "claudegram_audio"  # legacy /tmp voice dir (pre-work/ era) — no longer written; swept at startup to clear old leftovers
 VOICE_TMP = Path(tempfile.gettempdir()) / "claudegram_voiceback"  # transient TTS output (sent, then deleted)
 IMAGE_DIR = WORK / "incoming-images"  # incoming images: work pieces kept in the bot's work/ (persist, never auto-deleted)
 DOC_DIR = WORK / "incoming-docs"  # incoming documents (PDF/office/text): work pieces kept in work/ (persist, never auto-deleted)
+AUDIO_DIR = WORK / "incoming-audio"  # incoming voice/audio: work pieces kept in work/ (persist, never auto-deleted) so the original recording stays reusable (e.g. as narration)
 TG_BOT_DL_LIMIT = 20 * 1024 * 1024  # Telegram Bot API hard-caps bot file DOWNLOADS at 20 MB (getFile); larger files can't be pulled by a bot and need out-of-band handling
 HARNESS_OUTBOX = HERE / "outbox"     # drop dir: any program leaves a msg -> sent to phone
 HARNESS_INBOX = HERE / "inbox"       # drop dir: "bot harness <msg>" -> read by the AI here
@@ -1206,10 +1207,12 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         reply_to_message_id=msg.message_id)
     mark_sent()
 
-    # Download to a dedicated temp dir, transcribe, then DELETE the audio right away.
-    AUDIO_TMP.mkdir(parents=True, exist_ok=True)
+    # Download into the bot's work/ as a persistent WORK PIECE (like incoming images/docs): the
+    # original recording stays reusable afterward (e.g. as video narration), not deleted post-decode.
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
     with tempfile.NamedTemporaryFile(
-        suffix=".oga" if msg.voice else ".bin", dir=AUDIO_TMP, delete=False
+        prefix=f"voice-{stamp}-", suffix=".oga" if msg.voice else ".bin", dir=AUDIO_DIR, delete=False
     ) as tmp:
         tmp_path = tmp.name
     await _transcribe_lock.acquire()
@@ -1237,7 +1240,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     badge + note, chat_id=msg.chat_id, message_id=prog.message_id)
             except Exception:
                 pass
-            return  # the outer `finally` releases the lock and removes tmp_path
+            try:
+                os.remove(tmp_path)  # a failed download left only an empty/partial junk file
+            except OSError:
+                pass
+            return  # the outer `finally` just releases the lock (we already cleaned up)
 
         audio_dur = float(getattr(media, "duration", 0) or 0)
         budget = (max(TRANSCRIBE_MIN_BUDGET, audio_dur * TRANSCRIBE_BUDGET_FACTOR)
@@ -1369,10 +1376,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 log.warning("could not delete progress bubble", exc_info=True)
     finally:
         _transcribe_lock.release()
-        try:
-            os.remove(tmp_path)  # delete the audio as soon as transcription ends
-        except OSError:
-            pass
+        # KEEP tmp_path: on a successful download the recording persists in AUDIO_DIR
+        # (work/incoming-audio) as a reusable work piece, like incoming images/docs. Only a
+        # FAILED download removes its junk file (in the except above).
 
     if stalled:
         await msg.reply_text(
@@ -1405,7 +1411,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     set_no_more_work(target, False)  # new work from the user re-arms the idle nudger
     target.parked = False            # ...and un-parks it
-    enqueue_for_claude(target, msg.chat_id, msg.message_id, text, "audio")
+    audio_note = (f"\n[The original voice recording is saved at {tmp_path} — use that file "
+                  "directly if you need the audio itself (e.g. as narration); otherwise work "
+                  "from the transcript above.]")
+    enqueue_for_claude(target, msg.chat_id, msg.message_id, text + audio_note, "audio")
 
 
 async def reply_chunked(msg, text: str, limit: int = 4096) -> None:

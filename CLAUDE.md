@@ -118,8 +118,11 @@ froze a live transcription. Diagnose with the bot's logging + `kill -USR1 <pid>`
 (`work/incoming-images`) and `enqueue_for_claude`s a prompt pointing Claude at the path
 (+ caption if any) — Claude reads it with the `Read` tool (multimodal in; no transcription).
 Incoming images are **work pieces** kept under `work/`: never auto-deleted, pruned, or swept.
-Documents (`handle_document`) mirror this into `DOC_DIR` (`work/incoming-docs`). Only truly
-transient media (voice decode `AUDIO_TMP`, TTS `VOICE_TMP`) stays in `/tmp` and is swept.
+Documents (`handle_document`) mirror this into `DOC_DIR` (`work/incoming-docs`), and voice/audio
+(`handle_audio`) into `AUDIO_DIR` (`work/incoming-audio`) — the original recording is kept as a
+reusable work piece (e.g. as narration) and its path is handed to Claude alongside the transcript
+(a failed download cleans up its placeholder; `AUDIO_TMP` is now just legacy /tmp leftover-sweep).
+Only truly transient media (TTS `VOICE_TMP`) stays in `/tmp` and is swept.
 `source="image"` collapses to the text guard.
 
 ## Intrusion lock (paranoid tripwire — default ON, GUI-only)
