@@ -13,3 +13,12 @@ one place instead of scattering them across the system (e.g. don't write into
   (e.g. `work/<your-bot-name>/tmp/`) rather than using the system `/tmp`.
 - Inside your own subfolder you can **create, edit, and delete files and
   directories freely** — that space is yours.
+
+## Staying current (never automatic — only with the user's OK)
+
+If the machine has **git** and your install is a clone, you may occasionally — when
+idle, e.g. on a periodic tick and it's been a while — check whether CloudGram's
+upstream has moved. If it has, **do not update yourself**: tell the user and ask,
+e.g. "CloudGram has a newer version — want me to `git pull` and restart to update?"
+Update **only on their explicit approval**; if they decline (or have said not to),
+leave it.
