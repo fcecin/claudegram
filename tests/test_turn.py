@@ -78,6 +78,55 @@ async def test_stuck_release_reports_stuck_not_done():
     assert any("silent" in s.lower() or "stuck" in s.lower() for s in allmsgs), allmsgs
 
 
+def test_usage_limit_vs_rate_limit_discrimination():
+    # The two states must never be confused: a HARD usage cap parks; a transient 429 retries.
+    assert bot.is_usage_limited("You've hit your weekly limit · resets 7pm (America/Sao_Paulo)")
+    assert bot.is_usage_limited("You've hit your limit · resets 3pm (America/Sao_Paulo)")
+    assert bot.is_usage_limited("Claude usage limit reached — try later")
+    assert not bot.is_usage_limited("overloaded_error: upstream is busy")
+    assert not bot.is_usage_limited("here is my normal answer, no limits hit")
+    assert not bot.is_usage_limited(None)
+    # A transient marker must NOT read as a hard cap, and the hard-cap text must NOT read as transient.
+    assert bot.is_rate_limited("overloaded_error") and not bot.is_usage_limited("overloaded_error")
+    assert (bot.is_usage_limited("You've hit your weekly limit")
+            and not bot.is_rate_limited("You've hit your weekly limit"))
+
+
+async def test_hard_usage_limit_parks_and_does_not_retry():
+    # The reported bug: a weekly-cap crash was (a) retried 5x with a false "NOT your usage limit"
+    # notice, then (b) re-driven by the idle nudger every ~30 min into an all-day crash loop.
+    # Now it must PARK on the first hit — no retry, no generic crash notice.
+    fb = FakeBot()
+    sess = make_fake_session("claude", script=[
+        result_msg(is_error=True, subtype="success",
+                   result="You've hit your weekly limit · resets 7pm (America/Sao_Paulo)")])
+    await bot.dispatch_to_claude(_ctx(fb), sess, 1, None, "do a thing", "text")
+    assert sess.parked is True                                          # parked, not looping
+    joined = "\n".join(fb.sent)
+    assert "weekly limit" in joined                                     # the reason is shown
+    assert "PARKED" in joined                                           # and that we parked
+    assert not any("Retrying" in s or "attempt" in s for s in fb.sent), fb.sent   # never a retry
+    assert not any("That turn crashed" in s for s in fb.sent), fb.sent            # not the generic crash
+
+
+async def test_transient_throttle_retries_not_parks():
+    # The other side of the fork: a genuine transient 429/overload still retries and recovers,
+    # and must NOT be mistaken for a hard cap (no park).
+    fb = FakeBot()
+    saved = bot.RATE_LIMIT_RETRY_SECS
+    bot.RATE_LIMIT_RETRY_SECS = 0          # don't actually wait 5 min in a test
+    try:
+        sess = make_fake_session("claude", scripts=[
+            [result_msg(is_error=True, subtype="error", result="overloaded_error: upstream overloaded")],
+            [stream_text("recovered"), result_msg(result="recovered")]])
+        await bot.dispatch_to_claude(_ctx(fb), sess, 1, None, "hi", "text")
+        assert sess.parked is False                                     # transient is not a park
+        assert any("Retrying" in s for s in fb.sent), fb.sent           # it announced a retry
+        assert "recovered" in fb.sent                                   # and eventually succeeded
+    finally:
+        bot.RATE_LIMIT_RETRY_SECS = saved
+
+
 async def test_spontaneous_stray_result_is_ignored():
     # A stray ResultMessage with no open segment (e.g. a late turn-end after a stuck
     # release) must not open a board just to slam it shut ("picked back up… ✅ Done").

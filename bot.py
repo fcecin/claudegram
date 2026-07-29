@@ -534,6 +534,30 @@ def is_rate_limited(text) -> bool:
         return False
     t = str(text).lower()
     return any(m in t for m in _RATE_LIMIT_MARKERS)
+
+
+# A HARD subscription usage limit (the 5-hour session window or the weekly cap) is a DIFFERENT
+# beast from transient throttling: a retry can never clear it — it clears only when its window
+# resets (the wire message carries the reset time). Worse, the SDK can flag it with the SAME
+# RateLimitEvent as a transient 429 (rate_event=True), so it MUST be recognized and handled
+# before the retry path — otherwise the bridge (a) burns 5 pointless retries insisting "NOT your
+# usage limit" when it IS, and (b) after giving up, lets the idle nudger re-drive the same turn
+# every ~30 min into an all-day crash loop (seen in the log: one crash per idle-nudge cycle from
+# the moment the cap is hit until it resets). Detection is an ipsis-literis match on Anthropic's
+# exact exhaustion wording ("You've hit your weekly limit · resets 7pm", "You've hit your limit
+# · resets 3pm"), checked ONLY against an error result / exception, never a successful answer —
+# same discipline as is_rate_limited.
+_USAGE_LIMIT_RE = re.compile(r"you['’]ve hit your\b.*?\blimit", re.I)
+_USAGE_LIMIT_MARKERS = ("usage limit reached",)   # alternate Anthropic phrasing for the same state
+
+
+def is_usage_limited(text) -> bool:
+    if not text:
+        return False
+    t = str(text)
+    if _USAGE_LIMIT_RE.search(t):
+        return True
+    return any(m in t.lower() for m in _USAGE_LIMIT_MARKERS)
 # Each Session owns its OWN pending queue / event / worker (see class Session) so sessions
 # run concurrently. What stays GLOBAL is genuinely shared: ONE whisper decode at a time (CPU),
 # and the Telegram Application handle.
@@ -1977,6 +2001,21 @@ class SegmentRenderer:
             f"Retrying in {mins} min… (attempt {attempt}/{max_retries})"
         )
 
+    async def usage_limited_notice(self, err: str) -> None:
+        """Seal the board and report a HARD subscription usage limit. Unlike rate_limited_notice
+        this promises NO retry — the limit holds until its window resets, so the caller parks. The
+        wire text (`err`) already carries the reset time; pass it through verbatim."""
+        if not self.board.sealed:
+            try:
+                await self.board.finish("🛑 usage limit — parked")
+            except Exception:
+                pass
+        await self.alert(
+            f"🛑 {_oneline(err, 200)}\n"
+            "That's your subscription usage limit, not transient throttling — retrying can't clear "
+            "it, so I've PARKED until it resets. Send anything after that and I'll pick right back up."
+        )
+
 
 async def dispatch_to_claude(
     context, session, chat_id, reply_to, user_text: str, source: str,
@@ -2039,7 +2078,19 @@ async def dispatch_to_claude(
         if ctrl.consume_interrupt_flag():
             await r.interrupted_close()
             return
-        # An error occurred. Is it throttling? (clear marker OR verbatim — not the answer.)
+        # A HARD usage limit (5h session or weekly cap) is permanent until it resets: catch it
+        # BEFORE the throttle/retry path (the wire may still flag rate_event=True) so we neither
+        # retry it nor let the idle nudger re-drive it into a crash loop. Report + PARK; new user
+        # input after the reset un-parks and resumes.
+        if is_usage_limited(err):
+            await r.usage_limited_notice(err)
+            session.parked = True
+            if session.watchdog is not None:
+                session.watchdog.done_declared = True  # our notice explained it; skip the generic parked bubble
+            log.warning("DISPATCH[%s] hard usage limit — parking until reset: %s",
+                        session.name, _oneline(err, 200))
+            return
+        # An error occurred. Is it TRANSIENT throttling? (clear marker OR verbatim — not the answer.)
         throttled = r.rate_limited or is_rate_limited(err)
         if throttled and attempt <= RATE_LIMIT_MAX_RETRIES:
             await r.rate_limited_notice(attempt, RATE_LIMIT_MAX_RETRIES, RATE_LIMIT_RETRY_SECS // 60)
