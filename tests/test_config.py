@@ -24,8 +24,12 @@ def test_forced_model_is_per_session():
     for name, model in (("sno", "haiku"), ("ily", "sonnet"), ("ava", "opus"),
                         ("nyx", "opus"), ("max", "opus")):
         assert bot.Session(name).controller.forced_model == model
-    assert bot.Session("claude").controller.forced_model is None
-    assert bot.Session("claude").controller.max_budget_usd is None
+    # A bot with no config inherits the code defaults: no forced model, no budget. Assert against
+    # a synthetic config-less name, NOT the default bot — an install may give 'claude' its own
+    # model/effort/transcribe config (this one pins it to opus/xhigh/fast).
+    naked = bot.Session("__noconfig__")
+    assert naked.controller.forced_model is None
+    assert naked.controller.max_budget_usd is None
 
 
 def test_forced_effort_from_config():

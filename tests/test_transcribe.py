@@ -10,16 +10,18 @@ def test_config_bot_pins_its_codec_at_spawn():
 
 
 def test_default_bot_inherits_the_code_default_best():
-    # No config => inherit the immutable code default (best/float32), NOT a persisted file.
+    # No config => inherit the immutable code default (best/float32), NOT a persisted file. Use a
+    # synthetic config-less name, not the default bot: an install may configure 'claude' (this one
+    # sets transcribe=fast), so it is not a reliable stand-in for "unconfigured".
     assert bot.get_compute_type() == bot.DEFAULT_COMPUTE == "float32"
-    assert bot.session_compute(bot.Session("claude")) == "float32"
+    assert bot.session_compute(bot.Session("__noconfig__")) == "float32"
 
 
 def test_spawn_values_come_from_config_or_code_defaults():
-    claude = bot.Session("claude")          # no config
-    assert claude.controller.effort == "high"          # code default
-    assert claude.controller.forced_model is None      # Claude's own default
-    assert claude.compute is None                       # inherit => best at read time
+    naked = bot.Session("__noconfig__")     # no config on disk => pure code defaults
+    assert naked.controller.effort == "high"           # code default
+    assert naked.controller.forced_model is None       # no model configured
+    assert naked.compute is None                        # inherit => best at read time
     sno = bot.Session("sno")
     assert sno.controller.forced_model == "haiku"       # from config
 
