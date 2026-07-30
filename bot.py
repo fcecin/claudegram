@@ -230,6 +230,16 @@ NOSTALL_FEED_MSGS = 6                     # how many of a bot's latest answers t
 NOSTALL_COOLDOWN_SECS = 180              # min seconds between interventions on ONE bot
 NOSTALL_LEGIT_MARKER = "LEGIT STOP"      # verdict meaning "release it — genuinely done"
 
+# --- BOINK: the dumb backstop -----------------------------------------------------------------
+# A mode toggle (global sticky, like voice/nostall). When ON, every time a bot actually STOPS
+# (goes idle with nothing running) it gets poked with a bare "BOINK" — no manual, no review,
+# no smart guard bot. It carries no instructions because the meaning lives in the bot, not the
+# poke: receiving BOINK means it drifted into a stop. Reuses the idle watchdog (NOT an external
+# poller); never disarmed reflexively. `nostall`'s dumber cousin — on purpose.
+BOINK_FILE = HERE / "boink.mode"         # presence = BOINK ON (global sticky, like nostall)
+BOINK_COOLDOWN_SECS = 30                 # min seconds between pokes on ONE bot (floor; the 55s
+                                         # Telegram-silence gate already spaces them naturally)
+
 
 def resolve_session_name(raw: str):
     """Map a raw (possibly mis-transcribed) token to a currently-available selectable bot, or
@@ -829,7 +839,8 @@ def selfconfig_preamble(bot_name: str | None) -> str:
     return (
         f"[self-config, when asked or to manage yourself: `{HERE / 'cg-cmd'}{as_flag} <cmd>` — "
         "effort low|medium|high|xhigh|max · model opus|sonnet|haiku|fable|default · voice on|off · "
-        "transcribe best|good|fast · cwd <path> · park (you're done; end-state idle) · status; "
+        "transcribe best|good|fast · cwd <path> · boink on|off (bare-poke backstop on every stop) · "
+        "park (you're done; end-state idle) · status; "
         "effect next turn. Deliver a file to the user's phone: "
         f"`{HERE / 'cg-send'} <file> [caption]`.{mail}]\n"
     )
@@ -1038,6 +1049,20 @@ def set_nostall(on: bool) -> None:
     else:
         try:
             NOSTALL_FILE.unlink()
+        except OSError:
+            pass
+
+
+def boink_on() -> bool:
+    return BOINK_FILE.exists()
+
+
+def set_boink(on: bool) -> None:
+    if on:
+        BOINK_FILE.write_text("on", encoding="utf-8")
+    else:
+        try:
+            BOINK_FILE.unlink()
         except OSError:
             pass
 
@@ -2247,6 +2272,7 @@ class Watchdog:
         self.is_latest = False    # is our status message still the newest in the chat?
         self.done_declared = False  # IDLE_DONE one-shot guard (Claude said NO MORE WORK)
         self._nostall_last = 0.0    # monotonic ts of the last anti-stall intervention (cooldown)
+        self._boink_last = 0.0      # monotonic ts of the last BOINK poke (cooldown)
         self._police_task = None    # in-flight anti-stall consult (kept OFF the loop's critical path)
 
     def _chat(self):
@@ -2318,6 +2344,12 @@ class Watchdog:
                                name=f"end_session[{self.session.name}]")
                         return
                     continue
+                if idle_no_shells and boink_on() and not self.session.internal:
+                    # BOINK owns this tick (dumb + relentless): poke and skip nostall/nudge. It
+                    # fires REGARDLESS of a declared NO-MORE-WORK — the point is a mind does not
+                    # stop, so any real stop earns the poke; its own cooldown stops per-tick spray.
+                    await self._boink_poke()
+                    continue
                 policing = nostall_on() and not self.session.internal
                 if idle_no_shells and is_no_more_work(self.session):
                     # IDLE_DONE: Claude declared it's out of work. One-shot + terminal — no
@@ -2355,6 +2387,23 @@ class Watchdog:
                     await self._nudge_idle_shells()
             except Exception:
                 log.exception("watchdog error")
+
+    async def _boink_poke(self) -> bool:
+        """BOINK: the dumb backstop. On a real stop (idle, nothing running) poke the bot with a
+        bare "BOINK" — no manual, no guard bot, no review, never disarmed. The meaning lives in
+        the bot, not the poke: receiving BOINK means it drifted into a stop. Own cooldown so one
+        stop = one poke, not a per-tick spray while the poked turn spins up. Returns True iff it
+        actually poked this call (cooldown not elapsed, or no chat yet -> False, no poke)."""
+        now = time.monotonic()
+        if (now - self._boink_last) < BOINK_COOLDOWN_SECS:
+            return False
+        chat = self._chat()
+        if chat is None:
+            return False
+        self._boink_last = now
+        await self._show("👊 BOINK")
+        enqueue_for_claude(self.session, chat, None, "BOINK", "text")
+        return True
 
     def _spawn_police(self, reason: str) -> None:
         """Run the anti-stall consult OFF the watchdog's critical path. The guard's review can
@@ -2595,6 +2644,7 @@ BOT_HELP = (
     "• bot echo <text> — echo text back (not sent to Claude)\n"
     "• bot voice [on|off] — spoken replies for EVERYTHING (toggle)\n"
     "• bot nostall [on|off] — anti-stall guard: forces idle bots back to work if they stall\n"
+    "• bot boink [on|off] — dumb backstop: pokes a bare BOINK every time a bot stops\n"
     "• bot park — force THIS bot into intentional end-state idle (no nudging, no anti-stall)\n"
     "• bot harness <text> (or bot h) — message the AI working on this machine\n"
     "• bot status — bridge, effort, session & context\n"
@@ -2660,6 +2710,8 @@ async def _status_text(cur=None) -> str:
     lines.append(f"🔊 voice replies: {'on' if voice_mode_on() else 'off'}")
     if nostall_on():
         lines.append("🐕 anti-stall: on")
+    if boink_on():
+        lines.append("👊 boink: on")
     if cur.parked:
         lines.append("🅿️ parked (end-state idle)")
     if registry.multiplexing():
@@ -2931,6 +2983,32 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str, sessio
             "🐕 Anti-stalling guard is ON — a bot that stops with nothing running gets reviewed "
             "and forced back to work if it's stalling. Turn off with: bot nostall off"
             if state else "🐕 Anti-stalling guard is OFF."
+        )
+        return True
+
+    # "bot boink [on|off]" — the dumb backstop. While ON, any bot that goes idle with nothing
+    # running gets poked with a bare "BOINK" (no manual, no guard bot). Global sticky like
+    # `bot nostall`; a bare `bot boink` QUERIES (never toggles — repeated sends would flip it).
+    # There is deliberately no "unavailable" case: BOINK needs no companion bot installed.
+    m = re.match(r"^boink\b\s*(.*)$", rest.strip(), re.IGNORECASE)
+    if m:
+        arg = m.group(1).strip().strip(" .!?,;:").lower()
+        if arg in ("on", "yes"):
+            state = True
+        elif arg in ("off", "no", "stop"):
+            state = False
+        else:
+            await reply(
+                f"👊 BOINK is currently {'ON' if boink_on() else 'OFF'}.\n"
+                "This is a query — to change it: bot boink on  |  bot boink off"
+            )
+            return True
+        set_boink(state)
+        log.info("bot command: boink -> %s", "on" if state else "off")
+        await reply(
+            "👊 BOINK is ON — every time a bot actually stops (idle, nothing running) it gets "
+            "poked with a bare BOINK. It means you drifted. Turn off with: bot boink off"
+            if state else "👊 BOINK is OFF."
         )
         return True
 
@@ -3366,7 +3444,7 @@ async def deliver_harness(application, body: str) -> None:
 # (firewall/intrusion) isn't a bot command at all, so it's untouchable regardless.
 SELFCONFIG_ALLOWED = {
     "effort", "model", "voice", "transcribe", "transcription", "quality", "tx",
-    "cwd", "chdir", "workdir", "pwd", "status", "context", "ctx", "park",
+    "cwd", "chdir", "workdir", "pwd", "status", "context", "ctx", "park", "boink",
 }
 
 

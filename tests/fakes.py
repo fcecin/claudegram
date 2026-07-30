@@ -29,6 +29,7 @@ from claude_agent_sdk import (
 # is total. Read-only assets (bots/, configs) still resolve to the real repo.
 _TMP_STATE = pathlib.Path(tempfile.mkdtemp(prefix="cg-test-flags-"))
 bot.NOSTALL_FILE = _TMP_STATE / "nostall.mode"
+bot.BOINK_FILE = _TMP_STATE / "boink.mode"
 bot.BLOCK_FILE = _TMP_STATE / "BLOCKED.flag"
 bot.SLEEP_FILE = _TMP_STATE / "SLEEP.flag"
 bot.VOICE_MODE_FILE = _TMP_STATE / "voice.mode"
@@ -242,7 +243,7 @@ def reset_registry():
 
 def clear_flags():
     """Remove any lock/sleep/mode flags a test may have written (worktree-local, gitignored)."""
-    for f in (bot.BLOCK_FILE, bot.SLEEP_FILE, bot.VOICE_MODE_FILE, bot.NOSTALL_FILE):
+    for f in (bot.BLOCK_FILE, bot.SLEEP_FILE, bot.VOICE_MODE_FILE, bot.NOSTALL_FILE, bot.BOINK_FILE):
         try:
             f.unlink()
         except OSError:
