@@ -568,6 +568,24 @@ def is_usage_limited(text) -> bool:
     if _USAGE_LIMIT_RE.search(t):
         return True
     return any(m in t.lower() for m in _USAGE_LIMIT_MARKERS)
+
+
+# Fable (the cheap, credit-metered model) runs out of capacity LONG before Opus does. When a turn
+# running on Fable exhausts it, the CLI returns an error result worded "You've reached your Fable 5
+# limit. Run /usage-credits to continue or switch models with /model." That is NOT a transient 429
+# (is_rate_limited misses it) and NOT a subscription cap a retry can't clear (is_usage_limited misses
+# it too — it says "reached", not "hit") — so before this it just crashed the turn every idle-nudge
+# cycle. We detect it (ipsis-literis, self-identifying: it names Fable) and the dispatcher auto-
+# switches the session to Opus and retries. Same discipline as the other detectors: only ever checked
+# against an error result / exception, never a successful answer.
+FABLE_FALLBACK_MODEL = "opus"   # where a Fable-exhausted session is auto-switched (Opus has its own capacity)
+_FABLE_EXHAUSTED_RE = re.compile(r"reached your fable\b.*?\blimit", re.I)
+
+
+def is_fable_exhausted(text) -> bool:
+    if not text:
+        return False
+    return bool(_FABLE_EXHAUSTED_RE.search(str(text)))
 # Each Session owns its OWN pending queue / event / worker (see class Session) so sessions
 # run concurrently. What stays GLOBAL is genuinely shared: ONE whisper decode at a time (CPU),
 # and the Telegram Application handle.
@@ -2041,6 +2059,20 @@ class SegmentRenderer:
             "it, so I've PARKED until it resets. Send anything after that and I'll pick right back up."
         )
 
+    async def fable_fallback_notice(self, to_model: str) -> None:
+        """Seal the board and tell the user Fable is out of capacity, so we're auto-switching this
+        session's model and retrying. Unlike usage_limited_notice this DOES retry (Opus has its own,
+        larger capacity); unlike rate_limited_notice there is no wait — we switch and go."""
+        if not self.board.sealed:
+            try:
+                await self.board.finish("⏳ Fable exhausted — switching model")
+            except Exception:
+                pass
+        await self.alert(
+            f"⚠️ Fable is out of capacity (not your subscription limit) — auto-switching this bot "
+            f"to {to_model} and retrying now. It stays on {to_model} for the rest of this run."
+        )
+
 
 async def dispatch_to_claude(
     context, session, chat_id, reply_to, user_text: str, source: str,
@@ -2068,6 +2100,7 @@ async def dispatch_to_claude(
     # A rate-limit is recognized ONLY from the structured RateLimitEvent (r.rate_limited)
     # or an ipsis-literis match on the EXCEPTION / error result — never a successful answer.
     attempt = 0
+    fell_back_from_fable = False   # one-shot: auto-switch off an exhausted Fable at most once per turn
     while True:
         attempt += 1
         r = SegmentRenderer(bot, chat_id, reply_to, header, user_text=user_text,
@@ -2103,6 +2136,17 @@ async def dispatch_to_claude(
         if ctrl.consume_interrupt_flag():
             await r.interrupted_close()
             return
+        # Fable ran out of capacity (it exhausts long before Opus). This is neither transient
+        # throttling nor a subscription cap a retry can't clear — Opus has its own capacity — so
+        # auto-switch this session to Opus and retry IMMEDIATELY (no wait). One-shot: if Opus then
+        # errors too, fall through to the normal park/throttle/crash handling below (never a loop).
+        if is_fable_exhausted(err) and not fell_back_from_fable:
+            fell_back_from_fable = True
+            log.warning("DISPATCH[%s] Fable exhausted — auto-switching to %s and retrying: %s",
+                        session.name, FABLE_FALLBACK_MODEL, _oneline(err, 160))
+            await ctrl.set_model(FABLE_FALLBACK_MODEL)
+            await r.fable_fallback_notice(FABLE_FALLBACK_MODEL)
+            continue
         # A HARD usage limit (5h session or weekly cap) is permanent until it resets: catch it
         # BEFORE the throttle/retry path (the wire may still flag rate_event=True) so we neither
         # retry it nor let the idle nudger re-drive it into a crash loop. Report + PARK; new user

@@ -92,6 +92,20 @@ def test_usage_limit_vs_rate_limit_discrimination():
             and not bot.is_rate_limited("You've hit your weekly limit"))
 
 
+def test_fable_exhaustion_detection():
+    # Fable exhaustion is its OWN state: it must be recognized, yet must NOT read as either a
+    # transient throttle (would wait 5 min) or a hard subscription cap (would park) — so the
+    # dispatcher falls back to Opus instead of waiting or parking.
+    fable = ("You've reached your Fable 5 limit. Run /usage-credits to continue or "
+             "switch models with /model.")
+    assert bot.is_fable_exhausted(fable)
+    assert not bot.is_fable_exhausted("here is a fable with a moral, no limits involved")
+    assert not bot.is_fable_exhausted("You've hit your weekly limit · resets 7pm")
+    assert not bot.is_fable_exhausted(None)
+    assert not bot.is_rate_limited(fable)       # not transient throttling
+    assert not bot.is_usage_limited(fable)      # not a hard subscription cap
+
+
 async def test_hard_usage_limit_parks_and_does_not_retry():
     # The reported bug: a weekly-cap crash was (a) retried 5x with a false "NOT your usage limit"
     # notice, then (b) re-driven by the idle nudger every ~30 min into an all-day crash loop.
@@ -125,6 +139,37 @@ async def test_transient_throttle_retries_not_parks():
         assert "recovered" in fb.sent                                   # and eventually succeeded
     finally:
         bot.RATE_LIMIT_RETRY_SECS = saved
+
+
+async def test_fable_exhausted_autoswitches_to_opus_and_retries():
+    # The feature: a turn running on Fable that hits Fable's capacity cap must auto-switch the
+    # session's model to Opus and retry IMMEDIATELY (no 5-min wait, no park), then recover — so a
+    # Fable-exhausted bot heals itself instead of crash-looping every idle-nudge cycle.
+    fb = FakeBot()
+    sess = make_fake_session("claude", scripts=[
+        [result_msg(is_error=True, subtype="success",
+                    result="You've reached your Fable 5 limit. Run /usage-credits to continue "
+                           "or switch models with /model.")],
+        [stream_text("recovered on opus"), result_msg(result="recovered on opus")]])
+    await bot.dispatch_to_claude(_ctx(fb), sess, 1, None, "hi", "text")
+    assert sess.parked is False                                          # fallback, not a park
+    assert sess.controller.model_switches == ["opus"], sess.controller.model_switches  # switched to Opus
+    assert any("Fable" in s and "opus" in s.lower() for s in fb.sent), fb.sent   # user told why
+    assert "recovered on opus" in fb.sent                               # retried and recovered
+    assert not any("crashed" in s.lower() for s in fb.sent), fb.sent    # never surfaced as a crash
+
+
+async def test_fable_fallback_is_one_shot_no_loop():
+    # Guard rail: if Opus ALSO errors right after the fallback, we must NOT keep switching/looping —
+    # exactly one switch, then normal crash handling takes over.
+    fb = FakeBot()
+    sess = make_fake_session("claude", scripts=[
+        [result_msg(is_error=True, subtype="success",
+                    result="You've reached your Fable 5 limit. Switch models with /model.")],
+        [result_msg(is_error=True, subtype="error", result="opus kaboom")]])
+    await bot.dispatch_to_claude(_ctx(fb), sess, 1, None, "hi", "text")
+    assert sess.controller.model_switches == ["opus"], sess.controller.model_switches  # exactly one switch
+    assert any("crashed" in s.lower() for s in fb.sent), fb.sent        # the Opus error surfaces normally
 
 
 async def test_spontaneous_stray_result_is_ignored():

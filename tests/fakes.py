@@ -111,6 +111,7 @@ class FakeController:
         self.kill_calls = 0           # how many times kill() ran (e.g. `bot lock` kills ALL)
         self._scripts = list(scripts) if scripts is not None else None
         self._script = list(script) if script is not None else []
+        self.model_switches: list = []   # records set_model() calls (model-fallback tests)
 
     def set_spontaneous_handler(self, handler):
         self._spontaneous = handler
@@ -161,6 +162,12 @@ class FakeController:
 
     async def stop(self):
         pass
+
+    async def set_model(self, model):
+        """Record a model switch (e.g. the Fable→Opus auto-fallback) and reflect it live."""
+        self.model_switches.append(model)
+        self.model = model
+        return True
 
     async def reset(self):
         self.session_id = None
