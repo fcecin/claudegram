@@ -12,6 +12,10 @@ Keys:
     Esc     wipe the transcript AND the clipboard, start fresh
     Ctrl+C  quit; the terminal comes back and the clipboard keeps the text
 
+Closing the terminal window also quits cleanly (clipboard keeps the text):
+SIGHUP/SIGTERM are handled, and a pty that is torn down WITHOUT a signal is
+detected in the input loop — either way the mic capture dies with the app.
+
 Config (env vars, or the matching --flags, flags win):
     CLIPVOICE_MODEL        whisper model size (default: small)
     CLIPVOICE_LANGUAGE     force a language code like en/pt (default: autodetect)
@@ -32,6 +36,7 @@ import locale
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
@@ -112,18 +117,31 @@ class Pipeline:
         self.stop_evt = threading.Event()
         self.threads = []
 
+    @staticmethod
+    def _die_with_parent():
+        # Linux: SIGKILL the capture child the instant clipvoice dies, even
+        # by kill -9 — an open mic must never outlive the app.
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+                1, signal.SIGKILL)  # 1 = PR_SET_PDEATHSIG
+        except Exception:
+            pass  # non-Linux/odd libc: EPIPE on the dead pipe still ends it
+
     def start(self):
         capture_env = os.environ.get("CLIPVOICE_CAPTURE_CMD", "").strip()
         try:
             if capture_env:
                 self.proc = subprocess.Popen(
                     capture_env, shell=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    preexec_fn=self._die_with_parent)
             else:
                 self.proc = subprocess.Popen(
                     ["parecord", "--rate=16000", "--channels=1",
                      "--format=s16le", "--raw"],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    preexec_fn=self._die_with_parent)
         except FileNotFoundError as e:
             self.shared.error = f"cannot start audio capture: {e}"
             return
@@ -356,13 +374,29 @@ def main_tui(args, shared, pipe):
         stdscr.keypad(True)
         stdscr.timeout(80)
         tick = 0
+        dead_reads = 0
         while True:
             draw(stdscr, shared, args, tick)
             tick += 1
+            t0 = time.monotonic()
             try:
                 ch = stdscr.getch()
             except KeyboardInterrupt:
                 return
+            if ch == -1:
+                # With timeout(80) a live tty takes ~80 ms to return ERR; a
+                # burst of INSTANT ERRs means stdin is gone — the terminal
+                # tore the pty down without sending SIGHUP. Without this
+                # check the loop becomes a 100%-CPU full-screen redraw
+                # strobe that outlives the window (the 2026-08-11 incident).
+                if time.monotonic() - t0 < 0.03:
+                    dead_reads += 1
+                    if dead_reads >= 25:
+                        return
+                else:
+                    dead_reads = 0
+                continue
+            dead_reads = 0
             if ch == 3:            # Ctrl+C (raw mode)
                 return
             if ch == 27:           # Esc
@@ -372,6 +406,8 @@ def main_tui(args, shared, pipe):
         curses.wrapper(run)
     except KeyboardInterrupt:
         pass
+    except curses.error:
+        pass  # endwin() on an already-dead tty — nothing left to restore
 
 
 def main_headless(args, shared, pipe):
@@ -408,6 +444,16 @@ def main():
 
     shared = Shared()
     pipe = Pipeline(args, shared)
+
+    # A well-behaved terminal close (or a plain kill) lands here: unwind
+    # through the finally so the capture process dies too. The handler runs
+    # in the main thread, which getch()'s 80 ms timeout wakes promptly.
+    def _bail(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGHUP, _bail)
+    signal.signal(signal.SIGTERM, _bail)
+
     pipe.start()
     try:
         if args.headless:
