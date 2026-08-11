@@ -217,6 +217,7 @@ flips live with `bot transcribe good|fast` (no restart).
 | `run-harness.sh` | open a visible terminal running a Claude "harness" that operates claudegram | yes |
 | `HARNESS_CHARTER.md` | the standing prompt that turns that Claude into the harness | yes |
 | `run-gui.sh` / `run.sh` | launchers (`run.sh` runs the bot without the tray) | yes |
+| `clipvoice.py` / `run-clipvoice.sh` | bundled extra: open-mic dictation TUI, live transcript mirrored into the clipboard (same whisper stack, shared venv) | yes |
 | `install-autostart.sh` / `uninstall-autostart.sh` | login autostart | yes |
 | `INSTALL_MANUAL.md` | step-by-step secure install guide (for an AI assistant) | yes |
 | `CLAUDE.md` | dev notes for an AI working on this codebase | yes |
@@ -227,6 +228,21 @@ flips live with `bot transcribe good|fast` (no restart).
 | `session.id`, `effort.level`, `cwd.path`, `compute.type`, `voice.mode`, `BLOCKED.flag`, `SLEEP.flag`, `INTRUSION_OFF.flag` | runtime state | no |
 | `outbox/`, `inbox/` | `[HARNESS]` message drop dirs (transient) | no |
 | `claudegram.log` | full per-turn transcript (Clear-logs button truncates) | no |
+
+## clipvoice — dictation straight to the clipboard (bundled extra)
+
+A standalone fullscreen terminal TUI, unrelated to the Telegram bridge except that it
+reuses the same venv and faster-whisper stack. Run `./run-clipvoice.sh`, talk, and every
+pause becomes text: the whole transcript on screen is mirrored live into both the
+CLIPBOARD and PRIMARY selections, ready to Ctrl+Shift+V or middle-click into any
+terminal (say, a Claude Code prompt). **Esc** wipes transcript + clipboard; **Ctrl+C**
+quits and leaves the text in the clipboard. Fully local — audio never leaves the machine.
+
+Needs PulseAudio/PipeWire (`parecord`) for the mic and `wl-clipboard` (Wayland) or
+`xclip` (X11) for the clipboard. Defaults to the `small` whisper model for real-time
+latency; configure with `CLIPVOICE_MODEL` / `CLIPVOICE_LANGUAGE` (default: autodetect)
+or the matching flags (e.g. `--model large-v3 --lang pt`). `--headless` prints
+utterances instead of drawing the TUI (tests, dictation over ssh).
 
 ## Harness (optional)
 

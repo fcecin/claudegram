@@ -27,6 +27,11 @@ from a phone. Four Python files, one venv:
   process per voice message (a thread can't be killed; a process can).
 - `claude_driver.py` — `ClaudeController`: owns the Claude Agent SDK client.
 
+(Plus one **bundled extra that is NOT part of the bridge**: `clipvoice.py` +
+`run-clipvoice.sh`, an open-mic dictation TUI that mirrors the live transcript into the
+clipboard. It shares the venv and the faster-whisper dep; nothing in the bridge imports
+it, and it must stay that way — standalone, zero side effects on `bot.py`.)
+
 ## Core model: the bridge is a MONITOR of the Claude instance
 `ClaudeController` runs **one always-on reader** (`receive_messages()`), never stopping
 at a `ResultMessage`. It routes each *segment* (a turn, delimited by `SystemMessage`
