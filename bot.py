@@ -3667,11 +3667,35 @@ async def _drain_media_outbox(tgbot, chat) -> int:
     photo still falls back to document (the universal container: oversized/odd images
     arrive as files), but a failed document send is NEVER retried as a photo — a
     rasterized first page masquerading as the file is worse than a loud failure."""
+    # Reap claims abandoned by a crashed drain (see the rename below). Safe: an in-flight upload
+    # holds the file's fd, so the inode survives deletion — we only drop stale dirents, and only
+    # ones far older than any real upload (media_write_timeout is 120s), so we never touch an
+    # active claim. Prevents a slow disk leak without ever re-sending (which could duplicate).
+    now = time.time()
+    for stale in MEDIA_OUTBOX.glob(".sending-*"):
+        try:
+            if now - stale.stat().st_mtime > 600:
+                stale.unlink()
+        except OSError:
+            pass
     n = 0
     for f in sorted(MEDIA_OUTBOX.iterdir()):
         if (not f.is_file()) or f.name.startswith(".") or f.suffix in (".tmp", ".caption"):
             continue
-        cap_file = f.with_suffix(".caption")
+        # CLAIM the file atomically BEFORE the (possibly long) upload await: rename it to a
+        # dot-prefixed sibling the scan skips. os.rename is atomic on one filesystem, so if a
+        # second drain races us — a concurrent loop, or a stale/duplicate bot.py sharing this
+        # dir — exactly ONE wins the rename; the loser gets an error and skips. THIS is what
+        # makes delivery exactly-once regardless of how many relays run (the cg-send dup bug):
+        # the old code opened + sent before deleting, so a slow (big-file) upload left a window
+        # for a second relay to grab and re-send the same file.
+        orig_name = f.name
+        claimed = f.with_name(f".sending-{orig_name}")
+        try:
+            f.rename(claimed)
+        except OSError:
+            continue  # already claimed by another drain (or it vanished) — never re-send
+        cap_file = f.with_suffix(".caption")  # caption pairs off the ORIGINAL name
         caption = None
         if cap_file.exists():
             try:
@@ -3681,27 +3705,27 @@ async def _drain_media_outbox(tgbot, chat) -> int:
         sent = False
         is_image = f.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
         try:
-            with open(f, "rb") as fh:
+            with open(claimed, "rb") as fh:
                 if is_image:
                     await tgbot.send_photo(chat, photo=fh, caption=caption)
                 else:
-                    await tgbot.send_document(chat, document=fh, caption=caption)
+                    await tgbot.send_document(chat, document=fh, filename=orig_name, caption=caption)
             sent = True
         except Exception:
             if is_image:
-                log.warning("send_photo failed for %s — trying document", f.name, exc_info=True)
+                log.warning("send_photo failed for %s — trying document", orig_name, exc_info=True)
                 try:
-                    with open(f, "rb") as fh:
-                        await tgbot.send_document(chat, document=fh, caption=caption)
+                    with open(claimed, "rb") as fh:
+                        await tgbot.send_document(chat, document=fh, filename=orig_name, caption=caption)
                     sent = True
                 except Exception:
-                    log.exception("send_document also failed for %s", f.name)
+                    log.exception("send_document also failed for %s", orig_name)
             else:
-                log.exception("send_document failed for %s", f.name)
+                log.exception("send_document failed for %s", orig_name)
         if sent:
             n += 1
-            log.info("media sent: %s", f.name)
-        for g in (f, cap_file):
+            log.info("media sent: %s", orig_name)
+        for g in (claimed, cap_file):
             try:
                 g.unlink()
             except OSError:
@@ -3774,7 +3798,41 @@ async def on_startup(application) -> None:
     log.info("usage collector started (refresh %ss via usage_worker.py)", USAGE_REFRESH_SECS)
 
 
+def _arm_orphan_protection() -> None:
+    """Tie our lifetime to the tray supervisor so a second bot.py can never form. gui.py launches
+    us via Qt QProcess with CLAUDEGRAM_SUPERVISED=1, but QProcess does NOT kill its child when it
+    dies — so if gui.py crashes or is torn down with the GNOME session, we'd reparent to
+    `systemd --user` and keep running headless. The next login's autostart then spawns a SECOND
+    bot.py; the two fight over getUpdates and both drain media-outbox/ (the true source of the
+    cg-send duplicate-file bug). Ask the kernel to SIGTERM us the instant our supervisor dies
+    (PR_SET_PDEATHSIG), so an orphan is impossible. Linux-only and gated on the supervised flag —
+    headless (./run.sh, no flag) is left alone so the bot can outlive its launching shell."""
+    if os.environ.get("CLAUDEGRAM_SUPERVISED") != "1":
+        return
+    launcher = os.getppid()
+    try:
+        import ctypes
+        import signal
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+            log.warning("orphan protection: PR_SET_PDEATHSIG failed (errno=%s) — not armed",
+                        ctypes.get_errno())
+            return
+    except Exception:
+        log.warning("orphan protection: prctl unavailable — not armed", exc_info=True)
+        return
+    # Race: if the supervisor already died between our spawn and this call, the death signal was
+    # missed and we've been reparented. Detect that and exit rather than linger as an orphan.
+    if os.getppid() != launcher:
+        log.warning("orphan protection: supervisor gone at startup (ppid %s→%s) — exiting",
+                    launcher, os.getppid())
+        raise SystemExit(0)
+    log.info("orphan protection armed (die-with-supervisor, launcher pid %s)", launcher)
+
+
 def main() -> None:
+    _arm_orphan_protection()   # never outlive the tray supervisor — kills the duplicate-bot source
     token = load_token()
 
     # This build drives a Claude Code instance that can RUN COMMANDS, so an

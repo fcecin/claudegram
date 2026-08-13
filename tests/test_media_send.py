@@ -109,6 +109,30 @@ async def test_failed_document_send_is_never_retried_as_photo():
         assert fb.photos == []
 
 
+async def test_concurrent_drains_deliver_each_file_once():
+    """The cg-send DUPLICATE bug: when two relays drain the same media-outbox (a stale +
+    supervised bot.py, or two loop tasks), a big-file upload used to leave a window for the
+    second relay to grab and re-send the SAME file. The atomic claim-by-rename closes it —
+    exactly-once delivery even with concurrent drains."""
+    import asyncio
+
+    class SlowBot(FakeBot):
+        # Widen the upload window so a naive relay WOULD double-send; the claim must still win.
+        async def send_document(self, chat_id, document=None, caption=None, **kw):
+            await asyncio.sleep(0.05)
+            return await super().send_document(chat_id, document=document, caption=caption, **kw)
+
+    with tempfile.TemporaryDirectory() as td, _outbox(td) as outbox:
+        (outbox / "1-report.pdf").write_bytes(b"%PDF")
+        (outbox / "1-report.caption").write_text("once")
+        fb = SlowBot()
+        counts = await asyncio.gather(bot._drain_media_outbox(fb, 1),
+                                      bot._drain_media_outbox(fb, 1))
+        assert sum(counts) == 1, counts             # delivered exactly ONCE across both drains
+        assert fb.documents == ["once"], fb.documents
+        assert list(outbox.iterdir()) == []         # consumed; no leftover .sending- claim
+
+
 async def test_failed_photo_send_falls_back_to_document():
     """An image Telegram rejects as a photo (huge/odd) still arrives — as a file."""
     class PhotosFail(FakeBot):
