@@ -3226,7 +3226,14 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str, sessio
     elif action == "ping":
         await reply("🏓 pong")
     else:
-        await reply(f'[claudegram] "bot" command unknown: {rest}')
+        # `action` is None → not a recognized command. Only flag a genuine command ATTEMPT (short +
+        # single line — e.g. a typo like "bot slect"); ordinary prose that merely opens with "bot" —
+        # extremely common by voice ("Bot, can you…") — must NOT be swallowed with an error. Let it
+        # fall through so the message actually reaches Claude instead of silently vanishing.
+        if "\n" not in rest and len(rest.split()) <= 3:
+            await reply(f'[claudegram] "bot" command unknown: {rest}')
+            return True
+        return False
     return True
 
 
