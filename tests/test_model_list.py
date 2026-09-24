@@ -82,7 +82,7 @@ def test_format_model_list_always_offers_the_family_aliases():
 
 
 async def test_bot_list_models_command_variants():
-    for cmd in ("bot list models", "bot models", "bot list"):
+    for cmd in ("bot list models", "bot models", "bot list", "bot model list", "bot model models"):
         fb = FakeBot()
         assert await bot.maybe_handle_bot_command(types.SimpleNamespace(bot=fb), 1, None, cmd)
         joined = "\n".join(fb.sent)

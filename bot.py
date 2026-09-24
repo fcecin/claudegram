@@ -3027,7 +3027,9 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str, sessio
                         "(or 'bot list models' for exact versions)")
         else:
             name = raw.lower()
-            if name in MODEL_RESET:
+            if name in ("list", "models", "list models"):
+                await reply(_format_model_list())
+            elif name in MODEL_RESET:
                 await ctrl.set_model(None)
                 await reply(f"🧠 Model → {_model_label(ctrl)} (applies going forward).")
             elif name in VALID_MODELS or name.startswith("claude-"):
