@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -297,12 +298,11 @@ def ensure_default_bot() -> None:
         log.info("bootstrap: regenerated %s", cfg)
 
 
-# Shorthands resolved to an exact model ID before reaching the CLI (which may not
-# know the bare alias). Defined here because Session() runs at import time.
-# fable is safe to expose (incl. self-config): it draws usage credits, and with
-# credits disabled it just stops — it can no longer bill overage (old 4daac98
-# exclusion is obsolete).
-MODEL_ALIASES = {"fable": "claude-fable-5"}
+# Family aliases (fable/opus/sonnet/haiku) pass through to the CLI unchanged: it
+# resolves each bare alias to the latest model of that family, so a self-config
+# `model fable` tracks new releases the same way `/model fable` does in the CLI.
+# Kept as an override hook for any name the CLI cannot resolve bare.
+MODEL_ALIASES = {}
 
 
 class Session:
@@ -2679,6 +2679,8 @@ BOT_HELP = (
     "• bot lock — PANIC: kill EVERY Claude session AND lock the bridge (unlock at the machine)\n"
     "• bot sleep — pause Telegram input (Claude keeps running); wake at the machine\n"
     "• bot effort [level] — show/set reasoning effort (low|medium|high|xhigh|max)\n"
+    "• bot model [name] — show/set the model (opus|sonnet|haiku|fable|default); shows exact version\n"
+    "• bot list models — list selectable models (family aliases + exact CLI versions)\n"
     "• bot cwd [path] — show/set THIS bot's working directory (each bot is independent)\n"
     "• bot transcribe [best|good|fast] — show/set voice transcription quality\n"
     "• bot context — detailed context-window usage\n"
@@ -2722,11 +2724,116 @@ def default_model():
     return default_model_guard() or ambient_default_model()
 
 
+_MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
+
+
+def _model_family(model: str) -> str:
+    """Clean family word for a model string ('claude-opus-4-8-…' -> 'opus'), matching the CLI's
+    own latest-aliases. Unknown strings pass through unchanged."""
+    m = (model or "").lower()
+    for fam in _MODEL_FAMILIES:
+        if fam in m:
+            return fam
+    return model
+
+
 def _model_label(ctrl) -> str:
-    if ctrl.forced_model:
-        return ctrl.forced_model
-    actual = ctrl.model or default_model()
-    return f"default ({actual})" if actual else "default"
+    # Family word plus the exact resolved version when known:  opus (claude-opus-4-8-…).
+    # A bare alias with no turn yet shows just the family; an unforced session is prefixed
+    # 'default:'. The exact id is the one the SDK init message resolved to (ctrl.model), used
+    # only when it belongs to the selected family (else it is stale from a prior family).
+    forced = ctrl.forced_model
+    resolved = ctrl.model
+    if forced:
+        fam = _model_family(forced)
+        exact = None
+        if resolved and resolved != fam and _model_family(resolved) == fam:
+            exact = resolved
+        elif forced != fam:                 # operator pinned a full id directly
+            exact = forced
+        return f"{fam} ({exact})" if exact else fam
+    fam = _model_family(default_model() or "")
+    if not fam:
+        return "default"
+    exact = resolved if (resolved and resolved != fam and _model_family(resolved) == fam) else None
+    return f"default: {fam} ({exact})" if exact else f"default: {fam}"
+
+
+_FAMILY_ORDER = {"opus": 0, "sonnet": 1, "haiku": 2, "fable": 3}
+_MODEL_ID_RE = r"claude-(opus|sonnet|haiku|fable)-[0-9][0-9a-z-]*"
+_model_ids_cache: dict = {"key": None, "ids": []}
+
+
+def _model_sort_key(mid: str):
+    ver = tuple(int(n) for n in re.findall(r"\d+", mid))
+    return (_FAMILY_ORDER.get(_model_family(mid), 9), ver, mid)
+
+
+def _claude_binary() -> str | None:
+    """Best-effort path to the installed Claude Code executable (symlinks resolved), or None."""
+    cand = shutil.which("claude")
+    if cand:
+        cand = os.path.realpath(cand)
+        if os.path.isfile(cand):
+            return cand
+    vers = Path.home() / ".local" / "share" / "claude" / "versions"
+    try:
+        files = [p for p in vers.iterdir() if p.is_file()]
+        if files:
+            return str(max(files, key=lambda p: p.stat().st_mtime))
+    except OSError:
+        pass
+    return None
+
+
+def _installed_model_ids() -> list[str]:
+    """Concrete model ids the installed CLI knows, scraped from its own binary (a local file
+    read, never a metered-API call). Cached by (path, size, mtime). Internal -v1 and codename
+    builds are dropped. Best-effort: [] when the binary cannot be read."""
+    path = _claude_binary()
+    key = None
+    if path:
+        try:
+            st = os.stat(path)
+            key = (path, st.st_size, st.st_mtime_ns)
+        except OSError:
+            key = None
+    if key is not None and _model_ids_cache["key"] == key:
+        return _model_ids_cache["ids"]
+    ids: list[str] = []
+    if path:
+        try:
+            out = subprocess.run(["grep", "-aoE", _MODEL_ID_RE, path],
+                                 capture_output=True, timeout=15)
+            found = {ln for ln in out.stdout.decode("ascii", "ignore").split("\n") if ln}
+            ids = sorted((i for i in found if not i.endswith("-v1") and "mythos" not in i),
+                         key=_model_sort_key)
+        except (OSError, subprocess.SubprocessError):
+            ids = []
+    _model_ids_cache["key"] = key
+    _model_ids_cache["ids"] = ids
+    return ids
+
+
+def _format_model_list() -> str:
+    fams = ("opus", "sonnet", "haiku", "fable")
+    lines = [
+        "🧠 Selectable models",
+        "",
+        "Family aliases — recommended, always the latest of that family:",
+        "  " + "  ".join(fams) + "  opusplan",
+    ]
+    ids = _installed_model_ids()
+    if ids:
+        lines += ["", "Specific versions the installed CLI knows",
+                  "(availability depends on your account):"]
+        for fam in fams:
+            fam_ids = [i for i in ids if _model_family(i) == fam]
+            if fam_ids:
+                lines.append(f"  {fam}: " + ", ".join(fam_ids))
+    lines += ["", "Set with: bot model <alias|full-name>  "
+              "(e.g. bot model opus, bot model claude-opus-5-5, bot model default)"]
+    return "\n".join(lines)
 
 
 async def _status_text(cur=None) -> str:
@@ -2902,6 +3009,13 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str, sessio
                 )
         return True
 
+    # "bot list models" / "bot models" / "bot list" — enumerate selectable models.
+    m = re.match(r"^(?:list(?:\s+models?)?|models)\s*$", rest.strip(), re.IGNORECASE)
+    if m:
+        log.info("bot command: list models")
+        await reply(_format_model_list())
+        return True
+
     # "bot model [name]" — show or override the model for this session (applies next turn).
     m = re.match(r"^model\b\s*(.*)$", rest.strip(), re.IGNORECASE)
     if m:
@@ -2909,18 +3023,20 @@ async def maybe_handle_bot_command(context, chat_id, reply_to, text: str, sessio
         log.info("bot command: model %r", raw)
         if not raw:
             await reply(f"🧠 Model: {_model_label(ctrl)}\n"
-                        "Set with: bot model <opus|sonnet|haiku|fable|default>")
+                        "Set with: bot model <opus|sonnet|haiku|fable|default> "
+                        "(or 'bot list models' for exact versions)")
         else:
             name = raw.lower()
             if name in MODEL_RESET:
                 await ctrl.set_model(None)
-                await reply("🧠 Model → default (applies going forward).")
+                await reply(f"🧠 Model → {_model_label(ctrl)} (applies going forward).")
             elif name in VALID_MODELS or name.startswith("claude-"):
                 name = MODEL_ALIASES.get(name, name)
                 await ctrl.set_model(name)
-                await reply(f"🧠 Model set to: {name} (applies going forward).")
+                await reply(f"🧠 Model set to: {_model_label(ctrl)} (applies going forward).")
             else:
-                await reply(f'🧠 Unknown model "{raw}". Try: opus, sonnet, haiku, fable, or default.')
+                await reply(f'🧠 Unknown model "{raw}". Try: opus, sonnet, haiku, fable, '
+                            "default, or 'bot list models'.")
         return True
 
     # "bot cwd [path]" / "bot pwd" — show or set Claude's working directory.

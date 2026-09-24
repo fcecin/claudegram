@@ -46,12 +46,12 @@ async def test_bot_model_command_sets_shows_and_resets():
     assert any("Unknown model" in s for s in fb3.sent), fb3.sent
 
 
-async def test_bot_model_fable_maps_to_pinned_id():
+async def test_bot_model_fable_passes_bare_alias():
     fb = FakeBot()
     ctx = types.SimpleNamespace(bot=fb)
     assert await bot.maybe_handle_bot_command(ctx, 1, None, "bot model fable")
-    assert bot.controller.forced_model == "claude-fable-5"
-    assert any("Model set to: claude-fable-5" in s for s in fb.sent), fb.sent
+    assert bot.controller.forced_model == "fable"
+    assert any("Model set to: fable" in s for s in fb.sent), fb.sent
     # leave the module controller on the default model for later tests
     assert await bot.maybe_handle_bot_command(types.SimpleNamespace(bot=FakeBot()), 1, None, "bot model default")
     assert bot.controller.forced_model is None
