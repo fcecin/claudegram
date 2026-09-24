@@ -2738,10 +2738,8 @@ def _model_family(model: str) -> str:
 
 
 def _model_label(ctrl) -> str:
-    # Family word plus the exact resolved version when known:  opus (claude-opus-4-8-…).
-    # A bare alias with no turn yet shows just the family; an unforced session is prefixed
-    # 'default:'. The exact id is the one the SDK init message resolved to (ctrl.model), used
-    # only when it belongs to the selected family (else it is stale from a prior family).
+    # Family word plus the exact resolved version when known:  opus (claude-opus-5-5).
+    # The exact id is the one the SDK init message resolved to (ctrl.model).
     forced = ctrl.forced_model
     resolved = ctrl.model
     if forced:
@@ -2752,11 +2750,15 @@ def _model_label(ctrl) -> str:
         elif forced != fam:                 # operator pinned a full id directly
             exact = forced
         return f"{fam} ({exact})" if exact else fam
-    fam = _model_family(default_model() or "")
-    if not fam:
+    # Unforced: lead with the actually-resolved model (never the useless bare 'default' when we
+    # know what ran), falling back to any configured default; mark [default] so it stays
+    # distinct from an explicit pick. Bare 'default' only when nothing has resolved yet.
+    actual = resolved or default_model()
+    if not actual:
         return "default"
-    exact = resolved if (resolved and resolved != fam and _model_family(resolved) == fam) else None
-    return f"default: {fam} ({exact})" if exact else f"default: {fam}"
+    fam = _model_family(actual)
+    exact = actual if actual != fam else None
+    return f"{fam} ({exact}) [default]" if exact else f"{fam} [default]"
 
 
 _FAMILY_ORDER = {"opus": 0, "sonnet": 1, "haiku": 2, "fable": 3}

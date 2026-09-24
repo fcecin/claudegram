@@ -59,9 +59,22 @@ def test_label_forced_full_id_shows_family_and_the_pinned_id():
 
 def test_label_unforced_shows_default_family():
     with _ambient("opus"):
-        assert bot._model_label(_ctrl()) == "default: opus"
+        assert bot._model_label(_ctrl()) == "opus [default]"
         assert bot._model_label(_ctrl(model="claude-opus-4-8-20250101")) \
-            == "default: opus (claude-opus-4-8-20250101)"
+            == "opus (claude-opus-4-8-20250101) [default]"
+
+
+def test_label_unforced_uses_resolved_model_when_no_configured_default():
+    # ambient/config default unknown (default_model() -> None), but a turn resolved the model:
+    # the label must show that model, never a bare useless 'default'.
+    orig = bot.default_model
+    bot.default_model = lambda: None
+    try:
+        assert bot._model_label(_ctrl(model="claude-opus-5-5")) == "opus (claude-opus-5-5) [default]"
+        assert bot._model_label(_ctrl(model="claude-opus-5-5[1m]")) == "opus (claude-opus-5-5[1m]) [default]"
+        assert bot._model_label(_ctrl()) == "default"   # genuinely nothing known yet
+    finally:
+        bot.default_model = orig
 
 
 def test_installed_model_ids_are_clean_family_ids():
